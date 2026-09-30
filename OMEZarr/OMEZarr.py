@@ -143,6 +143,9 @@ class OMEZarr(ScriptedLoadableModule):
             "slice view shows at a finer level."
         )
         self.parent.acknowledgementText = _("Built on ngff-zarr (https://github.com/fideus-labs/ngff-zarr).")
+        # Streaming readers must be idle before Python is finalized, or a decoder thread still
+        # returning a chunk crashes the application on exit.
+        slicer.app.connect("aboutToQuit()", lambda: OMEZarrLogic.stopStreaming(wait=True))
 
 
 #
@@ -1402,12 +1405,14 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         return streamer
 
     @classmethod
-    def stopStreaming(cls, path=None):
+    def stopStreaming(cls, path=None, wait=False):
+        """Stop streaming ``path`` (all stores without one). ``wait``: also let the reader threads
+        finish the chunk they are reading, as Python must not be finalized under them."""
         keys = [str(path)] if path is not None else list(cls._streamers)
         for key in keys:
             streamer = cls._streamers.pop(key, None)
             if streamer is not None:
-                streamer.stop()
+                streamer.stop(wait)
 
     @classmethod
     def streamer(cls, path):
@@ -2329,8 +2334,10 @@ class Streamer:
         self.setVolume3D(block, ijkToRas, level)
         self.shown3D = (level, region)
 
-    def stop(self):
+    def stop(self, wait=False):
         if self.stopped:
+            if wait:
+                self.joinReaders()
             return
         self.disable3D(stopWhenDone=False)
         self.stopped = True
@@ -2347,6 +2354,12 @@ class Streamer:
             if not self.complete:  # the buffer was never handed to the node
                 self.targetArray = None
                 self.targetImageData = None
+        if wait:
+            self.joinReaders()
+
+    def joinReaders(self, timeoutSeconds=30.0):
+        for thread in self.threads:
+            thread.join(timeoutSeconds)
 
 
 #
