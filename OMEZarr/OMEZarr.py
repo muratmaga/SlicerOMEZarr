@@ -8,15 +8,21 @@ Registers:
 * ``OMEZarrFileDialog`` - drop target for OME-Zarr directories.
 * ``OMEZarrLogic`` - level selection, NGFF -> RAS geometry, chunk-limited reads,
   labels, time series, view-driven refinement.
+* ``Streamer`` - shows a large store at once from its coarsest level, reads what the
+  slice views show at screen resolution first and the rest of the chosen level behind it.
 
 NGFF parsing, multiscales, store access and RFC-4 orientation come from ngff-zarr.
 """
 
+import collections
 import functools
+import itertools
 import json
 import logging
 import os
+import queue
 import re
+import threading
 import urllib.request
 
 import numpy as np
@@ -61,6 +67,12 @@ UNIT_SYMBOLS = {"micrometer": "µm", "micron": "µm", "nanometer": "nm", "millim
 DEFAULT_BUDGET_FRACTION = 0.25  # of available RAM when the budget setting is "auto"
 FALLBACK_MAX_BYTES = 1 << 30
 
+# Streaming: chunks of levels other than the one being filled are kept in a bounded cache;
+# a view whose visible plane needs more chunks than the limit is shown one level coarser.
+STREAM_CACHE_BYTES = 512 << 20
+STREAM_MAX_CHUNKS_PER_VIEW = 512
+STREAM_READERS = 8
+
 # Slicer core lookup tables used to colour separate microscopy channels.
 CHANNEL_COLOR_NODE_IDS = {
     "red": "vtkMRMLColorTableNodeRed",
@@ -87,6 +99,7 @@ class Settings:
     LABELS_AS_SEGMENTATION = "OMEZarr/LabelsAsSegmentation"  # load labels as Segmentation nodes
     STORAGE_OPTIONS = "OMEZarr/StorageOptions"  # JSON passed to ngff-zarr for remote stores
     DETECT_LABEL_MAPS = "OMEZarr/DetectLabelMaps"  # integer stores with few values load as label maps
+    STREAM = "OMEZarr/Stream"  # show the coarsest level at once and stream the chosen level behind it
 
     @staticmethod
     def get(key, default):
@@ -817,12 +830,15 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         timeMode=None,
         progress=None,
         asLabelMap=None,
+        announceLevel=True,
     ):
         """Load a store into volume nodes. Returns the created nodes (volumes, proxies, label maps).
 
         ``region``: spatial dim -> (start, stop) at the chosen level (partial read).
         ``timeIndex``: a single time point; otherwise the setting decides between a
         Sequence of all time points and index 0. ``labels``: also load the ``labels`` groups.
+        ``announceLevel``: warn when a downsampled level is loaded (off while streaming,
+        where the coarse level is only the first thing shown).
         """
         if multiscales is None and isBioformats2rawRoot(path):
             series = bioformats2rawSeries(path)
@@ -876,6 +892,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         if (
             region is None
             and userMessages
+            and announceLevel
             and cls.volumeBytes(image) * copies > (maxBytes or cls.maxBytesFromSettings())
         ):
             userMessages.AddMessage(
@@ -883,7 +900,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 f"No resolution level fits the memory budget; loading level {level} "
                 f"({cls.volumeBytes(image) * copies / 2**30:.2f} GiB). Use a region of interest for large stores.",
             )
-        if level > 0 and region is None and userMessages:
+        if level > 0 and region is None and userMessages and announceLevel:
             full = cls.volumeBytes(multiscales.images[0]) * copies
             factor = cls.levelInfo(multiscales)[level]["downsample"]
             userMessages.AddMessage(
@@ -1350,6 +1367,48 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     def autoRefiner(cls, path):
         return cls._autoRefiners.get(str(path))
 
+    # ---- streaming ----
+
+    _streamers = {}
+
+    @classmethod
+    def streamingLevels(cls, multiscales, maxBytes=None, timeMode=None):
+        """(coarsest, target) levels when the store should be streamed, else None.
+
+        Streaming covers one 3D channel and one time point: it pays off when the level the
+        budget allows is finer than the coarsest one, so there is something to wait for.
+        """
+        base = multiscales.images[0]
+        dims = list(base.dims)
+        if "z" not in dims or len(cls.channelDescriptions(multiscales, base)) != 1:
+            return None
+        if cls.axisLength(base, "t") > 1 and (timeMode or Settings.get(Settings.TIME_MODE, "sequence")) == "sequence":
+            return None
+        coarsest = len(multiscales.images) - 1
+        target = cls.selectLevel(multiscales, maxBytes or cls.maxBytesFromSettings())
+        return (coarsest, target) if target < coarsest else None
+
+    @classmethod
+    def startStreaming(cls, path, node, targetLevel, sliceViewNames=DEFAULT_AUTO_REFINE_VIEWS, timeIndex=0):
+        """Stream ``targetLevel`` of ``path`` into ``node`` (which shows a coarser level). Returns the Streamer."""
+        cls.stopStreaming(path)
+        cls.stopAutoRefine(path)
+        streamer = Streamer(str(path), node, cls.openMultiscales(path), int(targetLevel), sliceViewNames, timeIndex)
+        cls._streamers[str(path)] = streamer
+        return streamer
+
+    @classmethod
+    def stopStreaming(cls, path=None):
+        keys = [str(path)] if path is not None else list(cls._streamers)
+        for key in keys:
+            streamer = cls._streamers.pop(key, None)
+            if streamer is not None:
+                streamer.stop()
+
+    @classmethod
+    def streamer(cls, path):
+        return cls._streamers.get(str(path))
+
     # ---- display units ----
 
     @staticmethod
@@ -1674,6 +1733,410 @@ class AutoRefiner:
 
 
 #
+# Streaming
+#
+
+
+class LevelChunks:
+    """Chunk grid of one level, for one time point and channel, in (z, y, x) order."""
+
+    def __init__(self, image, timeIndex, channelIndex):
+        self.image = image
+        self.timeIndex = timeIndex
+        self.channelIndex = channelIndex
+        dims = list(image.dims)
+        self.edges = [
+            np.concatenate([[0], np.cumsum(image.data.chunks[dims.index(d)])]).astype(int) for d in ("z", "y", "x")
+        ]
+        self.shape = tuple(int(edges[-1]) for edges in self.edges)
+
+    def keys(self, region=None):
+        """Chunk indices intersecting ``region`` ((start, stop) per z, y, x); all of them without one."""
+        ranges = []
+        for axis, edges in enumerate(self.edges):
+            start, stop = region[axis] if region else (0, self.shape[axis])
+            first = int(np.searchsorted(edges, start, side="right")) - 1
+            last = int(np.searchsorted(edges, stop - 1, side="right")) - 1
+            ranges.append(range(first, last + 1))
+        return list(itertools.product(*ranges))
+
+    def bounds(self, key):
+        return [(int(self.edges[axis][k]), int(self.edges[axis][k + 1])) for axis, k in enumerate(key)]
+
+    def read(self, key):
+        region = dict(zip(("z", "y", "x"), self.bounds(key)))
+        sub, _addZ = OMEZarrLogic.spatialDaskArray(self.image, self.timeIndex, self.channelIndex, region)
+        return np.asarray(sub.compute(scheduler="synchronous"))
+
+
+class Streamer:
+    """Shows a store at once and reads it in behind the slice views.
+
+    The volume node starts with the coarsest level. Each observed slice view then gets, as
+    its foreground, the plane it shows at the coarsest level whose voxels are no larger than
+    a screen pixel: only the chunks that plane crosses are read, before anything else. Behind
+    that, the whole target level is read chunk by chunk into the buffer the node will use
+    (a chunk a view already read is not read again). When the buffer is complete the node
+    switches to it, and a view keeps a block of its own only where it asks for more detail
+    than the target level has.
+    """
+
+    RETRIES = 3
+
+    def __init__(
+        self,
+        path,
+        node,
+        multiscales,
+        targetLevel,
+        sliceViewNames,
+        timeIndex=0,
+        readers=STREAM_READERS,
+        cacheBytes=STREAM_CACHE_BYTES,
+    ):
+        from vtk.util import numpy_support
+
+        self.path = path
+        self.node = node
+        self.target = targetLevel
+        self.shownLevel = int(node.GetAttribute("OMEZarr.Level"))
+        self.sliceViewNames = list(sliceViewNames)
+        images = multiscales.images
+        self.levels = [LevelChunks(image, timeIndex, 0) for image in images]
+        self.ijkToRas = [OMEZarrLogic.ijkToRasMatrix(image)[0] for image in images]
+        self.spacing = [float(np.linalg.norm(m[:3, :3], axis=0).max()) for m in self.ijkToRas]
+        self.dtype = OMEZarrLogic.vtkCompatibleDtype(images[0].data.dtype)
+        self.cacheBytes = cacheBytes
+        self.cache = collections.OrderedDict()  # (level, key) -> array, for levels other than the target
+        self.cachedBytes = 0
+        self.lock = threading.Lock()
+        self.requests = queue.PriorityQueue()  # (0 = a view needs it, 1 = background), order, level, key
+        self.order = itertools.count()
+        self.inFlight = set()
+        self.attempts = collections.Counter()
+        self.failed = set()
+        self.wanted = set()  # (level, key) the views need now
+        self.views = {}  # view name -> {"level", "region", "keys", "shown"}
+        self.overlays = {}  # view name -> volume node
+        self.stopped = False
+        self.complete = False
+        self.lastPercent = -1
+
+        shape = self.levels[targetLevel].shape
+        self.targetImageData = vtk.vtkImageData()
+        self.targetImageData.SetDimensions(shape[2], shape[1], shape[0])
+        self.targetImageData.AllocateScalars(numpy_support.get_vtk_array_type(self.dtype), 1)
+        self.targetArray = numpy_support.vtk_to_numpy(self.targetImageData.GetPointData().GetScalars()).reshape(shape)
+        grid = self.levels[targetLevel]
+        center = np.array(shape) / 2.0
+        self.targetKeys = sorted(
+            grid.keys(), key=lambda key: float(np.linalg.norm([np.mean(b) for b in grid.bounds(key)] - center))
+        )
+        self.targetHave = set()
+        for key in self.targetKeys:
+            self.enqueue(1, targetLevel, key)
+
+        self.observers = []
+        layoutManager = slicer.app.layoutManager()
+        for viewName in self.sliceViewNames:
+            sliceWidget = layoutManager.sliceWidget(viewName) if layoutManager else None
+            if sliceWidget is not None:
+                sliceNode = sliceWidget.mrmlSliceNode()
+                self.observers.append(
+                    (sliceNode, sliceNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onViewChanged))
+                )
+        display = node.GetDisplayNode()
+        if display is not None:
+            self.observers.append((display, display.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onDisplayChanged)))
+        self.observers.append(
+            (slicer.mrmlScene, slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.EndCloseEvent, self.onSceneClosed))
+        )
+
+        self.threads = [threading.Thread(target=self.readLoop, daemon=True) for _ in range(readers)]
+        for thread in self.threads:
+            thread.start()
+        self.viewTimer = qt.QTimer()
+        self.viewTimer.setSingleShot(True)
+        self.viewTimer.setInterval(50)
+        self.viewTimer.timeout.connect(self.updateViews)
+        self.pollTimer = qt.QTimer()
+        self.pollTimer.setInterval(100)
+        self.pollTimer.timeout.connect(self.poll)
+        self.pollTimer.start()
+        self.viewTimer.start()
+
+    # -- reading (worker threads) --
+
+    def enqueue(self, priority, level, key):
+        self.requests.put((priority, next(self.order), level, key))
+
+    def has(self, item):
+        level, key = item
+        return key in self.targetHave if level == self.target else item in self.cache
+
+    def readLoop(self):
+        while not self.stopped:
+            try:
+                priority, _order, level, key = self.requests.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            item = (level, key)
+            with self.lock:
+                if self.has(item) or item in self.inFlight or item in self.failed:
+                    continue
+                if priority == 0 and item not in self.wanted:
+                    continue  # the view has moved on
+                self.inFlight.add(item)
+            try:
+                block = self.levels[level].read(key)
+            except Exception:  # noqa: BLE001 - retried, then reported and left empty
+                block = None
+                logging.warning(f"OME-Zarr streaming: reading chunk {key} of level {level} failed", exc_info=True)
+            with self.lock:
+                self.inFlight.discard(item)
+                if block is None:
+                    self.attempts[item] += 1
+                    if self.attempts[item] < self.RETRIES:
+                        self.enqueue(priority, level, key)
+                        continue
+                    self.failed.add(item)
+                    logging.error(f"OME-Zarr streaming: chunk {key} of level {level} left empty")
+                    block = np.zeros([stop - start for start, stop in self.levels[level].bounds(key)], self.dtype)
+                self.store(item, block)
+
+    def store(self, item, block):
+        """Keep a chunk that was read (lock held)."""
+        if self.stopped:
+            return
+        level, key = item
+        if level == self.target:
+            (z0, z1), (y0, y1), (x0, x1) = self.levels[level].bounds(key)
+            self.targetArray[z0:z1, y0:y1, x0:x1] = block
+            self.targetHave.add(key)
+            return
+        self.cache[item] = block
+        self.cachedBytes += block.nbytes
+        for old in list(self.cache):
+            if self.cachedBytes <= self.cacheBytes:
+                break
+            if old not in self.wanted:
+                self.cachedBytes -= self.cache.pop(old).nbytes
+
+    def chunk(self, item):
+        """A chunk that was read (lock held)."""
+        level, key = item
+        if level == self.target:
+            (z0, z1), (y0, y1), (x0, x1) = self.levels[level].bounds(key)
+            return self.targetArray[z0:z1, y0:y1, x0:x1]
+        self.cache.move_to_end(item)
+        return self.cache[item]
+
+    # -- views (main thread) --
+
+    def onViewChanged(self, caller=None, event=None):
+        if not self.stopped:
+            self.viewTimer.start()
+
+    def onDisplayChanged(self, caller=None, event=None):
+        for node in self.overlays.values():
+            self.copyDisplay(node)
+
+    def onSceneClosed(self, caller=None, event=None):
+        OMEZarrLogic.stopStreaming(self.path)
+
+    def planeRegion(self, level, ras):
+        """(start, stop) per z, y, x of the voxels of ``level`` around the plane through the RAS ``ras`` corners."""
+        ijk = np.linalg.inv(self.ijkToRas[level]) @ ras
+        region = []
+        for row, size in zip((2, 1, 0), self.levels[level].shape):
+            start = max(0, int(np.floor(ijk[row].min())) - 1)  # one voxel more on each side for interpolation
+            stop = min(size, int(np.ceil(ijk[row].max())) + 2)
+            if stop <= start:
+                return None
+            region.append((start, stop))
+        return tuple(region)
+
+    def viewRequest(self, sliceNode):
+        """What a slice view needs: the plane it shows at screen resolution, or None."""
+        fov = sliceNode.GetFieldOfView()
+        dims = sliceNode.GetDimensions()
+        if dims[0] <= 0 or dims[1] <= 0:
+            return None
+        pixel = min(fov[0] / dims[0], fov[1] / dims[1])
+        level = next((lv for lv in reversed(range(len(self.levels))) if self.spacing[lv] <= pixel * 1.001), 0)
+        sliceToRas = slicer.util.arrayFromVTKMatrix(sliceNode.GetSliceToRAS())
+        corners = np.array([[x, y, 0.0, 1.0] for x in (-fov[0] / 2, fov[0] / 2) for y in (-fov[1] / 2, fov[1] / 2)])
+        ras = sliceToRas @ corners.T
+        while level < self.shownLevel:
+            region = self.planeRegion(level, ras)
+            if region is None:
+                return None
+            keys = self.levels[level].keys(region)
+            if len(keys) <= STREAM_MAX_CHUNKS_PER_VIEW:
+                return {"level": level, "region": region, "keys": keys, "shown": False}
+            level += 1
+        return None  # the volume node already shows this much detail
+
+    def updateViews(self):
+        if self.stopped:
+            return
+        layoutManager = slicer.app.layoutManager()
+        wanted = set()
+        for viewName in self.sliceViewNames:
+            sliceWidget = layoutManager.sliceWidget(viewName) if layoutManager else None
+            request = self.viewRequest(sliceWidget.mrmlSliceNode()) if sliceWidget is not None else None
+            if request is None:
+                self.views.pop(viewName, None)
+                self.removeOverlay(viewName)
+                continue
+            previous = self.views.get(viewName)
+            if previous and (previous["level"], previous["region"]) == (request["level"], request["region"]):
+                request = previous
+            else:
+                self.views[viewName] = request
+            wanted.update((request["level"], key) for key in request["keys"])
+        with self.lock:
+            self.wanted = wanted
+            missing = [item for item in wanted if not self.has(item) and item not in self.inFlight]
+        for level, key in missing:
+            self.enqueue(0, level, key)
+        self.poll()
+
+    def assemble(self, request):
+        """The request's region from its chunks (lock held), or None while one is missing."""
+        level, region = request["level"], request["region"]
+        if not all(self.has((level, key)) for key in request["keys"]):
+            return None
+        grid = self.levels[level]
+        block = np.zeros([stop - start for start, stop in region], self.dtype)
+        for key in request["keys"]:
+            target, source = [], []
+            for (regionStart, regionStop), (chunkStart, chunkStop) in zip(region, grid.bounds(key)):
+                start, stop = max(regionStart, chunkStart), min(regionStop, chunkStop)
+                target.append(slice(start - regionStart, stop - regionStart))
+                source.append(slice(start - chunkStart, stop - chunkStart))
+            block[tuple(target)] = self.chunk((level, key))[tuple(source)]
+        return block
+
+    def copyDisplay(self, node):
+        source, display = self.node.GetDisplayNode(), node.GetDisplayNode()
+        if source is None or display is None:
+            return
+        display.SetAutoWindowLevel(False)
+        display.SetWindowLevel(source.GetWindow(), source.GetLevel())
+        display.SetInterpolate(source.GetInterpolate())
+        if source.GetColorNodeID():
+            display.SetAndObserveColorNodeID(source.GetColorNodeID())
+
+    def showOverlay(self, viewName, request, block):
+        node = self.overlays.get(viewName)
+        if node is None or node.GetScene() is None:
+            name = slicer.mrmlScene.GenerateUniqueName(f"{self.node.GetName()}_{viewName}")
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", name)
+            node.SetHideFromEditors(True)
+            node.SetSaveWithScene(False)
+            node.SetAttribute("OMEZarr.Path", normalizeStorePath(self.path))
+            node.SetAttribute("OMEZarr.Channel", "0")
+            node.SetAttribute("OMEZarr.Refined", "1")
+            node.SetAttribute("OMEZarr.RefinedView", viewName)
+            node.SetAttribute("OMEZarr.Streamed", "1")
+            node.CreateDefaultDisplayNodes()
+            self.overlays[viewName] = node
+        level, region = request["level"], request["region"]
+        slicer.util.updateVolumeFromArray(node, block)
+        ijkToRas = self.ijkToRas[level].copy()
+        ijkToRas[:3, 3] = (ijkToRas @ np.array([region[2][0], region[1][0], region[0][0], 1.0]))[:3]
+        node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
+        node.SetAttribute("OMEZarr.Level", str(level))
+        self.copyDisplay(node)
+        composite = slicer.app.layoutManager().sliceWidget(viewName).sliceLogic().GetSliceCompositeNode()
+        composite.SetForegroundVolumeID(node.GetID())
+        composite.SetForegroundOpacity(1.0)
+
+    def removeOverlay(self, viewName):
+        node = self.overlays.pop(viewName, None)
+        if node is not None and node.GetScene() is not None:
+            slicer.mrmlScene.RemoveNode(node)
+
+    def poll(self):
+        if self.stopped:
+            return
+        if self.node.GetScene() is None:  # the volume was deleted
+            OMEZarrLogic.stopStreaming(self.path)
+            return
+        for viewName, request in list(self.views.items()):
+            if request["shown"]:
+                continue
+            with self.lock:
+                block = self.assemble(request)
+            if block is not None:
+                self.showOverlay(viewName, request, block)
+                request["shown"] = True
+        if not self.complete and len(self.targetHave) == len(self.targetKeys):
+            self.switchToTarget()
+            return
+        self.reportProgress()
+
+    def progress(self):
+        return len(self.targetHave) / max(1, len(self.targetKeys))
+
+    def reportProgress(self):
+        if self.complete:
+            return
+        percent = int(100 * self.progress())
+        if percent != self.lastPercent:
+            self.lastPercent = percent
+            slicer.util.showStatusMessage(
+                _("Reading level {level} of {name}: {percent}%").format(
+                    level=self.target, name=self.node.GetName(), percent=percent
+                ),
+                3000,
+            )
+
+    def switchToTarget(self):
+        self.complete = True
+        display = self.node.GetDisplayNode()
+        if display is not None:
+            display.SetAutoWindowLevel(False)  # keep the window/level the user sees
+        self.node.SetAndObserveImageData(self.targetImageData)
+        self.node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(self.ijkToRas[self.target]))
+        self.node.SetAttribute("OMEZarr.Level", str(self.target))
+        self.shownLevel = self.target
+        if self.failed:
+            message = _("{count} chunks of {name} could not be read and are shown empty").format(
+                count=len(self.failed), name=self.node.GetName()
+            )
+            logging.error(message)
+            slicer.util.showStatusMessage(message, 10000)
+        else:
+            slicer.util.showStatusMessage(
+                _("{name}: level {level} loaded").format(name=self.node.GetName(), level=self.target), 3000
+            )
+        if self.target == 0:
+            OMEZarrLogic.stopStreaming(self.path)  # nothing finer to show
+        else:
+            self.updateViews()  # views keep blocks only where they need more than the target level
+
+    def stop(self):
+        if self.stopped:
+            return
+        self.stopped = True
+        self.viewTimer.stop()
+        self.pollTimer.stop()
+        for caller, tag in self.observers:
+            caller.RemoveObserver(tag)
+        self.observers = []
+        for viewName in list(self.overlays):
+            self.removeOverlay(viewName)
+        with self.lock:
+            self.cache.clear()
+            self.cachedBytes = 0
+            if not self.complete:  # the buffer was never handed to the node
+                self.targetArray = None
+                self.targetImageData = None
+
+
+#
 # File reader (drives Add Data, drag-and-drop, slicer.util.loadNodeFromFile)
 #
 
@@ -1713,18 +2176,25 @@ class OMEZarrFileReader:
                 value = properties.get(key)
                 return cast(value) if value not in (None, "") else None
 
+            level = optional("level", int)
+            timeIndex = optional("timeIndex", int)
+            maxBytes = optional("maxBytes", int)
+            timeMode = optional("timeMode", str)
+            asLabelMap = optional("asLabelMap", lambda v: str(v).lower() in ("true", "1"))
+            streaming = self.streamingLevels(root, properties, level, maxBytes, timeMode, asLabelMap)
             with Progress(_("Loading OME-Zarr..."), properties["fileName"]) as progress:
                 nodes = OMEZarrLogic.loadImage(
                     root,
-                    level=optional("level", int),
-                    timeIndex=optional("timeIndex", int),
+                    level=streaming[0] if streaming else level,
+                    timeIndex=timeIndex,
                     name=properties.get("name"),
-                    maxBytes=optional("maxBytes", int),
+                    maxBytes=maxBytes,
                     labels=optional("labels", lambda v: str(v).lower() in ("true", "1")),
-                    timeMode=optional("timeMode", str),
-                    asLabelMap=optional("asLabelMap", lambda v: str(v).lower() in ("true", "1")),
+                    timeMode=timeMode,
+                    asLabelMap=asLabelMap,
                     userMessages=self.parent.userMessages(),
                     progress=progress,
+                    announceLevel=streaming is None,
                 )
         except InterruptedError:
             self.parent.userMessages().AddMessage(vtk.vtkCommand.WarningEvent, "Loading cancelled")
@@ -1745,10 +2215,30 @@ class OMEZarrFileReader:
                 fit=True,
             )
             coarse = any(n.GetAttribute("OMEZarr.Level") not in (None, "0") for n in scalars)
-            if coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
+            if streaming and scalars:
+                OMEZarrLogic.startStreaming(root, scalars[0], streaming[1], timeIndex=timeIndex or 0)
+            elif coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
                 OMEZarrLogic.startAutoRefine(root)
         self.parent.loadedNodes = [node.GetID() for node in nodes]
         return True
+
+    @staticmethod
+    def streamingLevels(root, properties, level, maxBytes, timeMode, asLabelMap):
+        """(coarsest, target) when this load should show the coarsest level and stream the target."""
+        if (
+            level is not None
+            or asLabelMap
+            or not properties.get("show", True)
+            or not Settings.get(Settings.STREAM, True)
+            or slicer.app.layoutManager() is None
+            or isBioformats2rawRoot(root)
+            or isLabelStore(root)
+        ):
+            return None
+        multiscales = OMEZarrLogic.openMultiscales(root)
+        if asLabelMap is None and OMEZarrLogic.looksLikeLabelMap(multiscales):
+            return None
+        return OMEZarrLogic.streamingLevels(multiscales, maxBytes, timeMode)
 
 
 #
@@ -2023,6 +2513,17 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         )
         settingsLayout.addRow(_("Auto-refine after load:"), self.autoRefineOnLoadCheckBox)
 
+        self.streamCheckBox = qt.QCheckBox()
+        self.streamCheckBox.checked = Settings.get(Settings.STREAM, True)
+        self.streamCheckBox.setToolTip(
+            _(
+                "Show a store at once from its coarsest level. The slice views then get the plane "
+                "they show at screen resolution first, and the level that fits the memory budget is "
+                "read in the background"
+            )
+        )
+        settingsLayout.addRow(_("Stream large stores:"), self.streamCheckBox)
+
         self.resetUnitsButton = qt.QPushButton(_("Reset display to mm"))
         settingsLayout.addRow(self.resetUnitsButton)
 
@@ -2051,6 +2552,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.displayUnitsCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.DISPLAY_UNITS, bool(b)))
         self.resetUnitsButton.connect("clicked(bool)", OMEZarrLogic.resetDisplayUnits)
         self.autoRefineOnLoadCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.AUTO_REFINE, bool(b)))
+        self.streamCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.STREAM, bool(b)))
         self.detectLabelMapsCheckBox.connect(
             "toggled(bool)", lambda b: Settings.set(Settings.DETECT_LABEL_MAPS, bool(b))
         )
@@ -2268,6 +2770,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
 
     def cleanup(self):
         OMEZarrLogic.stopAutoRefine()
+        OMEZarrLogic.stopStreaming()
 
     def onCreateRoi(self):
         """A region of interest already placed: the middle half of what the slice view shows."""
@@ -2339,15 +2842,19 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
                 Settings.LABELS_AS_SEGMENTATION,
                 Settings.STORAGE_OPTIONS,
                 Settings.DETECT_LABEL_MAPS,
+                Settings.STREAM,
             )
         }
         for key in self.savedSettings:
             qt.QSettings().remove(key)
+        # Most tests check what a load returns; the streaming tests turn it back on.
+        Settings.set(Settings.STREAM, False)
 
     def tearDown(self):
         import shutil
 
         OMEZarrLogic.stopAutoRefine()
+        OMEZarrLogic.stopStreaming()
         shutil.rmtree(self.tempDir, ignore_errors=True)
         for key, value in self.savedSettings.items():
             if value is None:
@@ -2381,6 +2888,8 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_Settings()
             self.test_CancelledLoadLeavesNothing()
             self.test_ObliqueRoundTrip()
+            self.test_Streaming()
+            self.test_StreamingCompletes()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
         finally:
@@ -2389,13 +2898,16 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
 
     # helpers
 
-    def writeMRHeadStore(self):
+    def writeMRHeadStore(self, chunks=None):
         import ngff_zarr
         import SampleData
 
         mrHead = SampleData.SampleDataLogic().downloadMRHead()
         image = OMEZarrLogic.ngffImageFromVolumeNode(mrHead, name="MRHead")
-        multiscales = ngff_zarr.to_multiscales(image, scale_factors=[2, 4])
+        if chunks:
+            multiscales = ngff_zarr.to_multiscales(image, scale_factors=[2, 4], chunks=chunks)
+        else:
+            multiscales = ngff_zarr.to_multiscales(image, scale_factors=[2, 4])
         storePath = os.path.join(self.tempDir, "MRHead.ome.zarr")
         ngff_zarr.to_ome_zarr(storePath, multiscales, overwrite=True)
         OMEZarrLogic.clearCache()
@@ -2781,6 +3293,101 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         stopped = refiner.refreshCount
         sliceNode.JumpSliceByCentering(center[0] - 25.0, center[1], center[2])
         self.assertFalse(self.waitFor(lambda: refiner.refreshCount > stopped, timeoutSeconds=1.0))
+
+    def centerRedViewOn(self, volumeNode, fieldOfView):
+        sliceNode = slicer.app.layoutManager().sliceWidget("Red").mrmlSliceNode()
+        sliceNode.SetOrientationToAxial()
+        bounds = [0.0] * 6
+        volumeNode.GetRASBounds(bounds)
+        sliceNode.JumpSliceByCentering(
+            (bounds[0] + bounds[1]) / 2, (bounds[2] + bounds[3]) / 2, (bounds[4] + bounds[5]) / 2
+        )
+        sliceNode.SetFieldOfView(fieldOfView, fieldOfView, 1.0)
+        return sliceNode
+
+    def test_Streaming(self):
+        self.delayDisplay("Streaming shows the coarsest level at once and each view's plane at screen resolution")
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        full = slicer.util.arrayFromVolume(mrHead)
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        budget = OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4  # the budget allows level 1
+        Settings.set(Settings.STREAM, True)
+
+        node = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": budget})
+        streamer = OMEZarrLogic.streamer(storePath)
+        self.assertIsNotNone(streamer)
+        self.assertEqual(streamer.target, 1)
+        self.assertEqual(streamer.shownLevel, 2)
+
+        # Zoomed in, the Red view needs more detail than level 1 has: it gets its own level-0 plane.
+        sliceNode = self.centerRedViewOn(mrHead, 40.0)
+        self.assertTrue(
+            self.waitFor(lambda: streamer.complete and streamer.views.get("Red", {}).get("shown", False), 20.0)
+        )
+        self.assertEqual(node.GetAttribute("OMEZarr.Level"), "1")
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node), np.asarray(multiscales.images[1].data))
+
+        overlay = streamer.overlays["Red"]
+        self.assertEqual(overlay.GetAttribute("OMEZarr.Level"), "0")
+        request = streamer.views["Red"]
+        self.assertLess(len(request["keys"]), len(streamer.levels[0].keys()) // 8)  # only what the view shows
+        array = slicer.util.arrayFromVolume(overlay)
+        self.assertLessEqual(min(array.shape), 4)  # a thin slab around the plane, not a block
+        rasToIjk = np.linalg.inv(self.ijkToRasArray(mrHead))
+        start = np.rint((rasToIjk @ np.append(self.ijkToRasArray(overlay)[:3, 3], 1.0))[:3]).astype(int)
+        k, j, i = array.shape
+        np.testing.assert_array_equal(
+            array, full[start[2] : start[2] + k, start[1] : start[1] + j, start[0] : start[0] + i]
+        )
+        redLogic = slicer.app.layoutManager().sliceWidget("Red").sliceLogic()
+        self.assertEqual(redLogic.GetForegroundLayer().GetVolumeNode().GetID(), overlay.GetID())
+
+        # Scrolling to another slice reads the new plane.
+        sliceNode.SetSliceOffset(sliceNode.GetSliceOffset() + 10.0)
+        self.assertTrue(
+            self.waitFor(
+                lambda: streamer.views.get("Red", {}).get("region") not in (None, request["region"])
+                and streamer.views["Red"]["shown"]
+            )
+        )
+
+        # Zoomed out, level 1 is detailed enough and the view's own plane goes away.
+        sliceNode.SetFieldOfView(2000.0, 2000.0, 1.0)
+        self.assertTrue(self.waitFor(lambda: "Red" not in streamer.overlays))
+        self.assertIsNone(overlay.GetScene())
+
+        OMEZarrLogic.stopStreaming(storePath)
+        self.assertIsNone(OMEZarrLogic.streamer(storePath))
+
+    def test_StreamingCompletes(self):
+        self.delayDisplay("Streaming ends with the full-resolution volume and nothing else in the scene")
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        Settings.set(Settings.STREAM, True)
+        self.centerRedViewOn(mrHead, 40.0)
+        # Hold every chunk read, so the load is seen returning before any of them.
+        gate = threading.Event()
+        read = LevelChunks.read
+        LevelChunks.read = lambda chunks, key: gate.wait(20.0) and read(chunks, key)
+        try:
+            node = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": 1 << 30})
+            self.assertEqual(node.GetAttribute("OMEZarr.Level"), "2")  # shown at once, from the coarsest level
+            self.assertEqual(OMEZarrLogic.streamer(storePath).target, 0)
+            gate.set()
+            self.assertTrue(self.waitFor(lambda: OMEZarrLogic.streamer(storePath) is None, 20.0))
+        finally:
+            LevelChunks.read = read
+            gate.set()
+        self.assertEqual(node.GetAttribute("OMEZarr.Level"), "0")
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node), slicer.util.arrayFromVolume(mrHead))
+        np.testing.assert_allclose(self.ijkToRasArray(node), self.ijkToRasArray(mrHead), atol=1e-6)
+        streamed = [n for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode") if n.GetAttribute("OMEZarr.Streamed")]
+        self.assertEqual(streamed, [])
+
+        # With streaming off, the same load returns the full level straight away.
+        Settings.set(Settings.STREAM, False)
+        direct = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": 1 << 30})
+        self.assertEqual(direct.GetAttribute("OMEZarr.Level"), "0")
+        self.assertIsNone(OMEZarrLogic.streamer(storePath))
 
     def test_MultiViewRefine(self):
         self.delayDisplay("Each slice view keeps its own refined block with the coarse window/level")
