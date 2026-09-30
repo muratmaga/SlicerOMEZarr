@@ -72,6 +72,10 @@ FALLBACK_MAX_BYTES = 1 << 30
 STREAM_CACHE_BYTES = 512 << 20
 STREAM_MAX_CHUNKS_PER_VIEW = 512
 STREAM_READERS = 8
+# Streamed volume rendering: one texture for what the 3D view shows, within these limits.
+STREAM_3D_MAX_BYTES = 512 << 20
+STREAM_3D_MAX_DIM = 2048  # a common GL_MAX_3D_TEXTURE_SIZE
+STREAM_3D_SETTLE_MS = 300  # the texture follows the camera once it has been still this long
 
 # Slicer core lookup tables used to colour separate microscopy channels.
 CHANNEL_COLOR_NODE_IDS = {
@@ -1409,6 +1413,20 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     def streamer(cls, path):
         return cls._streamers.get(str(path))
 
+    @classmethod
+    def startVolumeRendering(cls, path):
+        """Volume-render a streamed store in the first 3D view. Returns the node the view renders."""
+        streamer = cls.streamer(path)
+        if streamer is None:
+            raise ValueError("This store is not being streamed: render its volume in the Volume Rendering module")
+        return streamer.enable3D()
+
+    @classmethod
+    def stopVolumeRendering(cls, path):
+        streamer = cls.streamer(path)
+        if streamer is not None:
+            streamer.disable3D()
+
     # ---- display units ----
 
     @staticmethod
@@ -1810,7 +1828,7 @@ class Streamer:
         self.cache = collections.OrderedDict()  # (level, key) -> array, for levels other than the target
         self.cachedBytes = 0
         self.lock = threading.Lock()
-        self.requests = queue.PriorityQueue()  # (0 = a view needs it, 1 = background), order, level, key
+        self.requests = queue.PriorityQueue()  # (0 slice view, 0.5 3D view, 1 background), order, level, key
         self.order = itertools.count()
         self.inFlight = set()
         self.attempts = collections.Counter()
@@ -1821,6 +1839,13 @@ class Streamer:
         self.stopped = False
         self.complete = False
         self.lastPercent = -1
+        # The level shown when streaming starts stays in memory: the 3D view falls back to it.
+        self.contextLevel = self.shownLevel
+        self.contextArray = slicer.util.arrayFromVolume(node).copy()
+        self.volume3D = None  # volume node the 3D view renders
+        self.request3D = None  # {"level", "region", "keys", "shown"} for the 3D view
+        self.shown3D = None  # (level, region) in the 3D node
+        self.cameraObservers = []
 
         shape = self.levels[targetLevel].shape
         self.targetImageData = vtk.vtkImageData()
@@ -1862,6 +1887,10 @@ class Streamer:
         self.pollTimer = qt.QTimer()
         self.pollTimer.setInterval(100)
         self.pollTimer.timeout.connect(self.poll)
+        self.cameraTimer = qt.QTimer()
+        self.cameraTimer.setSingleShot(True)
+        self.cameraTimer.setInterval(STREAM_3D_SETTLE_MS)
+        self.cameraTimer.timeout.connect(self.update3D)
         self.pollTimer.start()
         self.viewTimer.start()
 
@@ -1884,7 +1913,7 @@ class Streamer:
             with self.lock:
                 if self.has(item) or item in self.inFlight or item in self.failed:
                     continue
-                if priority == 0 and item not in self.wanted:
+                if priority < 1 and item not in self.wanted:
                     continue  # the view has moved on
                 self.inFlight.add(item)
             try:
@@ -1981,7 +2010,6 @@ class Streamer:
         if self.stopped:
             return
         layoutManager = slicer.app.layoutManager()
-        wanted = set()
         for viewName in self.sliceViewNames:
             sliceWidget = layoutManager.sliceWidget(viewName) if layoutManager else None
             request = self.viewRequest(sliceWidget.mrmlSliceNode()) if sliceWidget is not None else None
@@ -1994,13 +2022,18 @@ class Streamer:
                 request = previous
             else:
                 self.views[viewName] = request
-            wanted.update((request["level"], key) for key in request["keys"])
-        with self.lock:
-            self.wanted = wanted
-            missing = [item for item in wanted if not self.has(item) and item not in self.inFlight]
-        for level, key in missing:
-            self.enqueue(0, level, key)
+        self.requestChunks()
         self.poll()
+
+    def requestChunks(self):
+        """Make what the views need now the only wanted chunks, and queue the missing ones."""
+        viewItems = {(r["level"], key) for r in self.views.values() for key in r["keys"]}
+        volumeItems = {(self.request3D["level"], key) for key in self.request3D["keys"]} if self.request3D else set()
+        with self.lock:
+            self.wanted = viewItems | volumeItems
+            missing = {item for item in self.wanted if not self.has(item) and item not in self.inFlight}
+        for level, key in missing:
+            self.enqueue(0 if (level, key) in viewItems else 0.5, level, key)
 
     def assemble(self, request):
         """The request's region from its chunks (lock held), or None while one is missing."""
@@ -2072,6 +2105,12 @@ class Streamer:
             if block is not None:
                 self.showOverlay(viewName, request, block)
                 request["shown"] = True
+        if self.request3D and not self.request3D["shown"]:
+            with self.lock:
+                block = self.assemble(self.request3D)
+            if block is not None:
+                self.show3D(self.request3D["level"], self.request3D["region"], block)
+                self.request3D["shown"] = True
         if not self.complete and len(self.targetHave) == len(self.targetKeys):
             self.switchToTarget()
             return
@@ -2112,14 +2151,188 @@ class Streamer:
             slicer.util.showStatusMessage(
                 _("{name}: level {level} loaded").format(name=self.node.GetName(), level=self.target), 3000
             )
-        if self.target == 0:
+        if self.target == 0 and self.volume3D is None:
             OMEZarrLogic.stopStreaming(self.path)  # nothing finer to show
         else:
             self.updateViews()  # views keep blocks only where they need more than the target level
 
+    # -- 3D view (main thread) --
+
+    def cameraNode3D(self):
+        layoutManager = slicer.app.layoutManager()
+        widget = layoutManager.threeDWidget(0) if layoutManager and layoutManager.threeDViewCount else None
+        if widget is None:
+            return None, None
+        return widget, slicer.modules.cameras.logic().GetViewActiveCameraNode(widget.mrmlViewNode())
+
+    def enable3D(self):
+        """Render the store in the first 3D view from a node that holds only what that view needs."""
+        if self.volume3D is not None and self.volume3D.GetScene() is not None:
+            return self.volume3D
+        widget, cameraNode = self.cameraNode3D()
+        if cameraNode is None:
+            raise ValueError("No 3D view to render in")
+        name = slicer.mrmlScene.GenerateUniqueName(f"{self.node.GetName()} (3D)")
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", name)
+        node.SetSaveWithScene(False)
+        node.SetAttribute("OMEZarr.Path", normalizeStorePath(self.path))
+        node.SetAttribute("OMEZarr.Streamed3D", "1")
+        self.volume3D = node
+        self.showContext3D()
+        volumeRenderingLogic = slicer.modules.volumerendering.logic()
+        display = volumeRenderingLogic.CreateDefaultVolumeRenderingNodes(node)
+        display.SetVisibility(True)
+        self.cameraObservers = [(cameraNode, cameraNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onCameraChanged))]
+        self.cameraObservers.append((display, display.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onCameraChanged)))
+        self.cameraTimer.start()
+        return node
+
+    def disable3D(self, stopWhenDone=True):
+        self.cameraTimer.stop()
+        for caller, tag in self.cameraObservers:
+            caller.RemoveObserver(tag)
+        self.cameraObservers = []
+        node, self.volume3D = self.volume3D, None
+        self.request3D = None
+        self.shown3D = None
+        if node is not None and node.GetScene() is not None:
+            for index in reversed(range(node.GetNumberOfDisplayNodes())):
+                display = node.GetNthDisplayNode(index)
+                if display is not None:
+                    slicer.mrmlScene.RemoveNode(display)
+            slicer.mrmlScene.RemoveNode(node)
+        if not self.stopped:
+            self.requestChunks()
+            if stopWhenDone and self.complete and self.target == 0:
+                OMEZarrLogic.stopStreaming(self.path)
+
+    def onCameraChanged(self, caller=None, event=None):
+        if not self.stopped and self.volume3D is not None:
+            self.cameraTimer.start()
+
+    def regionRasBounds(self, level, region):
+        corners = np.array(
+            [[x - 0.5, y - 0.5, z - 0.5, 1.0] for z in region[0] for y in region[1] for x in region[2]]
+        )
+        ras = (self.ijkToRas[level] @ corners.T)[:3]
+        return ras.min(axis=1), ras.max(axis=1)
+
+    def volumeRequest(self):
+        """What the 3D view needs: the part of the volume inside the camera's view (and the
+        cropping ROI), at the coarsest level whose voxels are no larger than a screen pixel at
+        the focal point, within the texture limits. None when the context level will do."""
+        widget, cameraNode = self.cameraNode3D()
+        if cameraNode is None:
+            return None
+        camera = cameraNode.GetCamera()
+        width, height = widget.threeDView().renderWindow().GetSize()
+        if width <= 0 or height <= 0:
+            return None
+        planes = [0.0] * 24
+        camera.GetFrustumPlanes(width / height, planes)
+        sides = np.array(planes[:16]).reshape(4, 4)  # left, right, bottom, top; depth is not limited
+        focal = np.append(camera.GetFocalPoint(), 1.0)
+        sides *= np.where(sides @ focal < 0, -1.0, 1.0)[:, None]
+
+        # A lattice over the whole volume, kept where it is in view, then grown by one cell.
+        steps = 33
+        shape = self.levels[self.contextLevel].shape  # z, y, x
+        axes = [np.linspace(-0.5, n - 0.5, steps) for n in shape[::-1]]  # i, j, k
+        i, j, k = np.meshgrid(*axes, indexing="ij")
+        ijk = np.stack([i.ravel(), j.ravel(), k.ravel(), np.ones(i.size)])
+        ras = self.ijkToRas[self.contextLevel] @ ijk
+        inside = (sides @ ras >= 0).all(axis=0)
+        display = self.volume3D.GetDisplayNode() if self.volume3D is not None else None
+        roi = display.GetROINode() if display is not None and display.GetCroppingEnabled() else None
+        if roi is not None:
+            bounds = [0.0] * 6
+            roi.GetRASBounds(bounds)
+            for axis in range(3):
+                inside &= (ras[axis] >= bounds[2 * axis]) & (ras[axis] <= bounds[2 * axis + 1])
+        inside = inside.reshape(i.shape)
+        grown = inside.copy()
+        for axis in range(3):  # one cell more on each side, without wrapping around
+            lower = [slice(None)] * 3
+            upper = [slice(None)] * 3
+            lower[axis], upper[axis] = slice(0, -1), slice(1, None)
+            grown[tuple(lower)] |= inside[tuple(upper)]
+            grown[tuple(upper)] |= inside[tuple(lower)]
+        if not grown.any():
+            return None
+        points = ras[:, grown.ravel()]
+
+        if camera.GetParallelProjection():
+            pixel = 2.0 * camera.GetParallelScale() / height
+        else:
+            pixel = 2.0 * camera.GetDistance() * np.tan(np.radians(camera.GetViewAngle() / 2.0)) / height
+        level = next((lv for lv in reversed(range(len(self.levels))) if self.spacing[lv] <= pixel * 1.001), 0)
+        itemSize = np.dtype(self.dtype).itemsize
+        for level in range(level, self.contextLevel):
+            index = np.linalg.inv(self.ijkToRas[level]) @ points
+            region = []
+            for row, size in zip((2, 1, 0), self.levels[level].shape):
+                start = max(0, int(np.floor(index[row].min())))
+                stop = min(size, int(np.ceil(index[row].max())) + 1)
+                region.append((start, stop))
+            region = tuple(region)
+            dims = [stop - start for start, stop in region]
+            if min(dims) <= 0:
+                return None
+            if max(dims) <= STREAM_3D_MAX_DIM and int(np.prod(dims)) * itemSize <= STREAM_3D_MAX_BYTES:
+                return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
+        return None
+
+    def update3D(self):
+        if self.stopped or self.volume3D is None:
+            return
+        if self.volume3D.GetScene() is None:  # deleted by the user
+            self.disable3D()
+            return
+        request = self.volumeRequest()
+        if request is None:
+            self.request3D = None
+            if self.shown3D is None or self.shown3D[0] != self.contextLevel:
+                self.showContext3D()
+            self.requestChunks()
+            return
+        current = self.request3D
+        if current and (current["level"], current["region"]) == (request["level"], request["region"]):
+            return
+        self.request3D = request
+        if not self.covers3D(request):
+            self.showContext3D()  # never leave part of the view empty while the new texture loads
+        self.requestChunks()
+        self.poll()
+
+    def covers3D(self, request):
+        """Whether what the 3D node holds spans the requested region."""
+        if self.shown3D is None:
+            return False
+        low, high = self.regionRasBounds(*self.shown3D)
+        wantLow, wantHigh = self.regionRasBounds(request["level"], request["region"])
+        tolerance = self.spacing[request["level"]]
+        return bool(np.all(low <= wantLow + tolerance) and np.all(high >= wantHigh - tolerance))
+
+    def setVolume3D(self, array, ijkToRas, level):
+        slicer.util.updateVolumeFromArray(self.volume3D, array)
+        self.volume3D.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
+        self.volume3D.SetAttribute("OMEZarr.Level", str(level))
+
+    def showContext3D(self):
+        self.setVolume3D(self.contextArray, self.ijkToRas[self.contextLevel], self.contextLevel)
+        shape = self.contextArray.shape
+        self.shown3D = (self.contextLevel, tuple((0, n) for n in shape))
+
+    def show3D(self, level, region, block):
+        ijkToRas = self.ijkToRas[level].copy()
+        ijkToRas[:3, 3] = (ijkToRas @ np.array([region[2][0], region[1][0], region[0][0], 1.0]))[:3]
+        self.setVolume3D(block, ijkToRas, level)
+        self.shown3D = (level, region)
+
     def stop(self):
         if self.stopped:
             return
+        self.disable3D(stopWhenDone=False)
         self.stopped = True
         self.viewTimer.stop()
         self.pollTimer.stop()
@@ -2426,6 +2639,15 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.autoRefineCheckBox.setToolTip(_("Reloads a view's block after it has been still for half a second"))
         refineLayout.addRow(self.autoRefineCheckBox)
 
+        self.volumeRenderingCheckBox = qt.QCheckBox(_("Volume-render in the 3D view, at the resolution it shows"))
+        self.volumeRenderingCheckBox.setToolTip(
+            _(
+                "For a streamed store: the 3D view renders only what is in view (and in the cropping ROI), "
+                "at the level its screen resolution needs, and sharpens after the camera stops"
+            )
+        )
+        refineLayout.addRow(self.volumeRenderingCheckBox)
+
         self.roiSelector = slicer.qMRMLNodeComboBox()
         self.roiSelector.nodeTypes = ["vtkMRMLMarkupsROINode"]
         self.roiSelector.addEnabled = False  # "New ROI in view" creates one that is already placed
@@ -2534,6 +2756,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.loadButton.connect("clicked(bool)", self.onLoad)
         self.refineButton.connect("clicked(bool)", self.onRefine)
         self.autoRefineCheckBox.connect("toggled(bool)", self.onAutoRefineToggled)
+        self.volumeRenderingCheckBox.connect("toggled(bool)", self.onVolumeRenderingToggled)
         self.loadRegionButton.connect("clicked(bool)", self.onLoadRegion)
         self.createRoiButton.connect("clicked(bool)", self.onCreateRoi)
         self.levelTable.connect("itemSelectionChanged()", self.updateButtons)
@@ -2768,6 +2991,23 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         with slicer.util.tryWithErrorDisplay(_("Failed to start automatic refinement")):
             OMEZarrLogic.startAutoRefine(self.path)
 
+    def onVolumeRenderingToggled(self, enabled):
+        if not enabled:
+            if self.path:
+                OMEZarrLogic.stopVolumeRendering(self.path)
+            return
+        try:
+            node = OMEZarrLogic.startVolumeRendering(self.path) if self.path else None
+            if node is not None:
+                self.statusLabel.text = _("3D view: rendering {name}").format(name=node.GetName())
+        except ValueError as e:
+            self.statusLabel.text = str(e)
+            node = None
+        if node is None:
+            self.volumeRenderingCheckBox.blockSignals(True)
+            self.volumeRenderingCheckBox.checked = False
+            self.volumeRenderingCheckBox.blockSignals(False)
+
     def cleanup(self):
         OMEZarrLogic.stopAutoRefine()
         OMEZarrLogic.stopStreaming()
@@ -2890,6 +3130,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_ObliqueRoundTrip()
             self.test_Streaming()
             self.test_StreamingCompletes()
+            self.test_StreamedVolumeRendering()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
         finally:
@@ -3388,6 +3629,78 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         direct = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": 1 << 30})
         self.assertEqual(direct.GetAttribute("OMEZarr.Level"), "0")
         self.assertIsNone(OMEZarrLogic.streamer(storePath))
+
+    def test_StreamedVolumeRendering(self):
+        self.delayDisplay("Streamed volume rendering holds only what the 3D view shows, at its resolution")
+        import time
+
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        full = slicer.util.arrayFromVolume(mrHead)
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        Settings.set(Settings.STREAM, True)
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        budget = OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4  # level 1: the streamer keeps running
+        slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": budget})
+        streamer = OMEZarrLogic.streamer(storePath)
+        node3D = OMEZarrLogic.startVolumeRendering(storePath)
+        self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "2")
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), np.asarray(multiscales.images[2].data))
+        display = node3D.GetDisplayNode()
+        self.assertTrue(display.IsA("vtkMRMLVolumeRenderingDisplayNode") and display.GetVisibility())
+
+        widget = slicer.app.layoutManager().threeDWidget(0)
+        cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(widget.mrmlViewNode())
+        bounds = [0.0] * 6
+        mrHead.GetRASBounds(bounds)
+        center = np.array([(bounds[0] + bounds[1]) / 2, (bounds[2] + bounds[3]) / 2, (bounds[4] + bounds[5]) / 2])
+
+        def lookFrom(distance):
+            cameraNode.SetFocalPoint(*center)
+            cameraNode.SetPosition(*(center + [0.0, -distance, 0.0]))
+            cameraNode.SetViewUp(0.0, 0.0, 1.0)
+            slicer.app.processEvents()
+            deadline = time.time() + 2 * STREAM_3D_SETTLE_MS / 1000.0
+            self.waitFor(lambda: time.time() > deadline, 5.0)  # let the camera settle
+
+        def region3D():
+            level, region = streamer.shown3D
+            return int(level), region
+
+        # Far away, a voxel of the coarsest level is smaller than a pixel: nothing finer is read.
+        lookFrom(20000.0)
+        self.assertIsNone(streamer.request3D)
+        self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "2")
+
+        # Close up, the view needs level 0, but only the part of the volume in front of the camera.
+        lookFrom(60.0)
+        self.assertTrue(self.waitFor(lambda: streamer.request3D is not None and streamer.request3D["shown"], 20.0))
+        level, region = region3D()
+        self.assertEqual(level, 0)
+        self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "0")
+        size = int(np.prod([stop - start for start, stop in region]))
+        self.assertLess(size, full.size // 2)
+        (z0, z1), (y0, y1), (x0, x1) = region
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), full[z0:z1, y0:y1, x0:x1])
+
+        # Cropping limits it further, along the viewing direction too.
+        roi = slicer.modules.volumerendering.logic().CreateROINode(display)
+        roi.SetXYZ(*center)
+        roi.SetRadiusXYZ(10.0, 10.0, 10.0)
+        display.SetCroppingEnabled(True)
+        self.assertTrue(
+            self.waitFor(
+                lambda: streamer.request3D is not None
+                and streamer.request3D["shown"]
+                and int(np.prod([b - a for a, b in streamer.shown3D[1]])) < size // 4,
+                20.0,
+            )
+        )
+        (z0, z1), (y0, y1), (x0, x1) = streamer.shown3D[1]
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), full[z0:z1, y0:y1, x0:x1])
+
+        OMEZarrLogic.stopVolumeRendering(storePath)
+        self.assertIsNone(node3D.GetScene())
+        self.assertIsNone(streamer.volume3D)
 
     def test_MultiViewRefine(self):
         self.delayDisplay("Each slice view keeps its own refined block with the coarse window/level")
