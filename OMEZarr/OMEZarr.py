@@ -104,6 +104,7 @@ class Settings:
     STORAGE_OPTIONS = "OMEZarr/StorageOptions"  # JSON passed to ngff-zarr for remote stores
     DETECT_LABEL_MAPS = "OMEZarr/DetectLabelMaps"  # integer stores with few values load as label maps
     STREAM = "OMEZarr/Stream"  # show the coarsest level at once and stream the chosen level behind it
+    STREAM_3D = "OMEZarr/StreamVolumeRendering"  # volume-render streamed stores in the 3D view
 
     @staticmethod
     def get(key, default):
@@ -2085,7 +2086,7 @@ class Streamer:
             node.CreateDefaultDisplayNodes()
             self.overlays[viewName] = node
         level, region = request["level"], request["region"]
-        slicer.util.updateVolumeFromArray(node, block)
+        self.replaceImage(node, block)
         ijkToRas = self.ijkToRas[level].copy()
         ijkToRas[:3, 3] = (ijkToRas @ np.array([region[2][0], region[1][0], region[0][0], 1.0]))[:3]
         node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
@@ -2340,8 +2341,24 @@ class Streamer:
         tolerance = self.spacing[request["level"]]
         return bool(np.all(low <= wantLow + tolerance) and np.all(high >= wantHigh - tolerance))
 
+    @staticmethod
+    def replaceImage(node, array):
+        """Give ``node`` a new image holding ``array``, built completely before it is attached.
+
+        slicer.util.updateVolumeFromArray resizes the node's image in place: SetDimensions fires
+        Modified before AllocateScalars runs, the volume rendering displayable manager renders
+        synchronously on it, and the texture upload then reads the old, smaller buffer with the new
+        dimensions, which crashes in the OpenGL driver."""
+        from vtk.util import numpy_support
+
+        imageData = vtk.vtkImageData()
+        imageData.SetDimensions(array.shape[2], array.shape[1], array.shape[0])
+        imageData.AllocateScalars(numpy_support.get_vtk_array_type(array.dtype), 1)
+        numpy_support.vtk_to_numpy(imageData.GetPointData().GetScalars()).reshape(array.shape)[:] = array
+        node.SetAndObserveImageData(imageData)
+
     def setVolume3D(self, array, ijkToRas, level):
-        slicer.util.updateVolumeFromArray(self.volume3D, array)
+        self.replaceImage(self.volume3D, array)
         self.volume3D.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
         self.volume3D.SetAttribute("OMEZarr.Level", str(level))
 
@@ -2464,7 +2481,10 @@ class OMEZarrFileReader:
             )
             coarse = any(n.GetAttribute("OMEZarr.Level") not in (None, "0") for n in scalars)
             if streaming and scalars:
-                OMEZarrLogic.startStreaming(root, scalars[0], streaming[1], timeIndex=timeIndex or 0)
+                streamer = OMEZarrLogic.startStreaming(root, scalars[0], streaming[1], timeIndex=timeIndex or 0)
+                if Settings.get(Settings.STREAM_3D, False):
+                    with slicer.util.tryWithErrorDisplay(_("Failed to start volume rendering")):
+                        streamer.enable3D()
             elif coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
                 OMEZarrLogic.startAutoRefine(root)
         self.parent.loadedNodes = [node.GetID() for node in nodes]
@@ -2679,10 +2699,12 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         refineLayout.addRow(self.autoRefineCheckBox)
 
         self.volumeRenderingCheckBox = qt.QCheckBox(_("Volume-render in the 3D view, at the resolution it shows"))
+        self.volumeRenderingCheckBox.checked = Settings.get(Settings.STREAM_3D, False)
         self.volumeRenderingCheckBox.setToolTip(
             _(
-                "For a streamed store: the 3D view renders only what is in view (and in the cropping ROI), "
-                "at the level its screen resolution needs, and sharpens after the camera stops"
+                "Can be set before loading. Streamed stores are then rendered as they load: the 3D view holds "
+                "only what is in view (and in the cropping ROI), at the level its screen resolution needs, "
+                "and sharpens after the camera stops"
             )
         )
         refineLayout.addRow(self.volumeRenderingCheckBox)
@@ -3031,23 +3053,23 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             OMEZarrLogic.startAutoRefine(self.path)
 
     def onVolumeRenderingToggled(self, enabled):
+        """A preference, usable before any store is chosen: streamed stores are volume-rendered as
+        they load, and a store already streaming starts or stops at once."""
+        Settings.set(Settings.STREAM_3D, bool(enabled))
+        streamer = OMEZarrLogic.streamer(self.path) if self.path else None
         if not enabled:
-            if self.path:
-                OMEZarrLogic.stopVolumeRendering(self.path)
+            if streamer is not None:
+                streamer.disable3D()
+            self.statusLabel.text = ""
             return
-        if not self.path:
-            self.statusLabel.text = _("Choose the OME-Zarr store above first")
+        if streamer is None:
+            self.statusLabel.text = _("The 3D view will render the next store you load (streamed)")
+            return
         try:
-            node = OMEZarrLogic.startVolumeRendering(self.path) if self.path else None
-            if node is not None:
-                self.statusLabel.text = _("3D view: rendering {name}").format(name=node.GetName())
+            node = streamer.enable3D()
+            self.statusLabel.text = _("3D view: rendering {name}").format(name=node.GetName())
         except ValueError as e:
             self.statusLabel.text = str(e)
-            node = None
-        if node is None:
-            self.volumeRenderingCheckBox.blockSignals(True)
-            self.volumeRenderingCheckBox.checked = False
-            self.volumeRenderingCheckBox.blockSignals(False)
 
     def cleanup(self):
         OMEZarrLogic.stopAutoRefine()
@@ -3124,6 +3146,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
                 Settings.STORAGE_OPTIONS,
                 Settings.DETECT_LABEL_MAPS,
                 Settings.STREAM,
+                Settings.STREAM_3D,
             )
         }
         for key in self.savedSettings:
@@ -3690,10 +3713,25 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         Settings.set(Settings.STREAM, True)
         slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
         budget = OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4  # level 1: the streamer keeps running
+        Settings.set(Settings.STREAM_3D, True)  # set before loading: the store is rendered as it loads
         slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": budget})
         streamer = OMEZarrLogic.streamer(storePath)
-        node3D = OMEZarrLogic.startVolumeRendering(storePath)
+        node3D = streamer.volume3D
+        self.assertIsNotNone(node3D)
+        self.assertIs(OMEZarrLogic.startVolumeRendering(storePath), node3D)
         self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "2")
+
+        # Whenever the rendered image changes, its dimensions and voxels must agree: volume rendering
+        # renders synchronously on the change and uploads that buffer to the GPU.
+        mismatches = []
+
+        def checkImage(caller=None, event=None):
+            image = node3D.GetImageData()
+            if image is not None and image.GetPointData().GetScalars() is not None:
+                if image.GetNumberOfPoints() != image.GetPointData().GetScalars().GetNumberOfTuples():
+                    mismatches.append(image.GetDimensions())
+
+        imageObserver = node3D.AddObserver(slicer.vtkMRMLVolumeNode.ImageDataModifiedEvent, checkImage)
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), np.asarray(multiscales.images[2].data))
         display = node3D.GetDisplayNode()
         self.assertTrue(display.IsA("vtkMRMLVolumeRenderingDisplayNode") and display.GetVisibility())
@@ -3747,6 +3785,9 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         )
         (z0, z1), (y0, y1), (x0, x1) = streamer.shown3D[1]
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), full[z0:z1, y0:y1, x0:x1])
+
+        node3D.RemoveObserver(imageObserver)
+        self.assertEqual(mismatches, [])
 
         OMEZarrLogic.stopVolumeRendering(storePath)
         self.assertIsNone(node3D.GetScene())
