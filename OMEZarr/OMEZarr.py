@@ -1844,9 +1844,13 @@ class Streamer:
         self.stopped = False
         self.complete = False
         self.lastPercent = -1
-        # The level shown when streaming starts stays in memory: the 3D view falls back to it.
-        self.contextLevel = self.shownLevel
-        self.contextArray = slicer.util.arrayFromVolume(node).copy()
+        # The coarsest level stays in memory: the 3D view falls back to it.
+        self.contextLevel = len(images) - 1
+        if self.shownLevel == self.contextLevel:
+            self.contextArray = slicer.util.arrayFromVolume(node).copy()
+        else:
+            coarsest, _addZ = OMEZarrLogic.spatialDaskArray(images[-1], timeIndex, 0)
+            self.contextArray = np.asarray(coarsest.compute()).astype(self.dtype)
         self.volume3D = None  # volume node the 3D view renders
         self.request3D = None  # {"level", "region", "keys", "shown"} for the 3D view
         self.shown3D = None  # (level, region) in the 3D node
@@ -2187,10 +2191,28 @@ class Streamer:
         volumeRenderingLogic = slicer.modules.volumerendering.logic()
         display = volumeRenderingLogic.CreateDefaultVolumeRenderingNodes(node)
         display.SetVisibility(True)
+        self.frameCamera(cameraNode)
         self.cameraObservers = [(cameraNode, cameraNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onCameraChanged))]
         self.cameraObservers.append((display, display.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onCameraChanged)))
         self.cameraTimer.start()
         return node
+
+    def frameCamera(self, cameraNode):
+        """Fit the specimen in the 3D view, keeping the viewing direction. The level follows the zoom,
+        so a view left far away (or zoomed out in parallel projection) would only ever show the coarsest one."""
+        low, high = self.regionRasBounds(self.contextLevel, tuple((0, n) for n in self.contextArray.shape))
+        center = (low + high) / 2.0
+        radius = 0.55 * float(np.linalg.norm(high - low))  # half the diagonal, with a margin
+        camera = cameraNode.GetCamera()
+        direction = np.array(camera.GetDirectionOfProjection())
+        viewUp = camera.GetViewUp()
+        distance = radius / np.sin(np.radians(camera.GetViewAngle() / 2.0))
+        cameraNode.SetFocalPoint(*center)
+        cameraNode.SetPosition(*(center - direction * distance))
+        cameraNode.SetViewUp(*viewUp)
+        camera.SetParallelScale(radius)
+        if hasattr(cameraNode, "ResetClippingRange"):
+            cameraNode.ResetClippingRange()
 
     def disable3D(self, stopWhenDone=True):
         self.cameraTimer.stop()
@@ -2450,10 +2472,10 @@ class OMEZarrFileReader:
 
     @staticmethod
     def streamingLevels(root, properties, level, maxBytes, timeMode, asLabelMap):
-        """(coarsest, target) when this load should show the coarsest level and stream the target."""
+        """(shown, target) when this load should show a level at once and stream a finer target:
+        the coarsest level by default, or the level asked for when the budget allows a finer one."""
         if (
-            level is not None
-            or asLabelMap
+            asLabelMap
             or not properties.get("show", True)
             or not Settings.get(Settings.STREAM, True)
             or slicer.app.layoutManager() is None
@@ -2464,7 +2486,11 @@ class OMEZarrFileReader:
         multiscales = OMEZarrLogic.openMultiscales(root)
         if asLabelMap is None and OMEZarrLogic.looksLikeLabelMap(multiscales):
             return None
-        return OMEZarrLogic.streamingLevels(multiscales, maxBytes, timeMode)
+        levels = OMEZarrLogic.streamingLevels(multiscales, maxBytes, timeMode)
+        if levels is None or level is None:
+            return levels
+        target = levels[1]
+        return (level, target) if 0 <= level < len(multiscales.images) and target < level else None
 
 
 #
@@ -3009,6 +3035,8 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             if self.path:
                 OMEZarrLogic.stopVolumeRendering(self.path)
             return
+        if not self.path:
+            self.statusLabel.text = _("Choose the OME-Zarr store above first")
         try:
             node = OMEZarrLogic.startVolumeRendering(self.path) if self.path else None
             if node is not None:
@@ -3636,6 +3664,15 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         np.testing.assert_allclose(self.ijkToRasArray(node), self.ijkToRasArray(mrHead), atol=1e-6)
         streamed = [n for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode") if n.GetAttribute("OMEZarr.Streamed")]
         self.assertEqual(streamed, [])
+
+        # A level picked in the module panel is shown at once, and the budget's finer level streamed in.
+        picked = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 2, "maxBytes": 1 << 30})
+        self.assertEqual(picked.GetAttribute("OMEZarr.Level"), "2")
+        self.assertTrue(self.waitFor(lambda: picked.GetAttribute("OMEZarr.Level") == "0", 20.0))
+        # Picking the level the budget allows (or a finer one) loads it directly.
+        direct = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 0, "maxBytes": 1 << 30})
+        self.assertEqual(direct.GetAttribute("OMEZarr.Level"), "0")
+        self.assertIsNone(OMEZarrLogic.streamer(storePath))
 
         # With streaming off, the same load returns the full level straight away.
         Settings.set(Settings.STREAM, False)
