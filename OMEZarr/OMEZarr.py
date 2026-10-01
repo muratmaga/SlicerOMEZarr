@@ -2704,6 +2704,9 @@ class Streamer:
         empty = not block.any()  # most chunks of a specimen are background
         if empty:
             self.empty.add(item)
+        request = self.request3D
+        if request is not None and level == request["level"] and key in request.get("missing", ()):
+            self.copyInto(request, key, None if empty else block)  # the texture fills as chunks arrive
         if level == self.fillLevel:
             (z0, z1), (y0, y1), (x0, x1) = self.levels[level].bounds(key)
             self.targetArray[z0:z1, y0:y1, x0:x1] = 0 if empty else block
@@ -2860,6 +2863,36 @@ class Streamer:
                 block[tuple(target)] = 0 if data is None else data[tuple(source)]
         return block
 
+    def copyInto(self, request, key, block):
+        """Copy chunk ``key`` (``block``; zeros when None) into the part of the request's texture it
+        covers, and mark it arrived (lock held)."""
+        grid = self.levels[request["level"]]
+        target, source = [], []
+        for (regionStart, regionStop), (chunkStart, chunkStop) in zip(request["region"], grid.bounds(key)):
+            start, stop = max(regionStart, chunkStart), min(regionStop, chunkStop)
+            target.append(slice(start - regionStart, stop - regionStart))
+            source.append(slice(start - chunkStart, stop - chunkStart))
+        request["voxels"][tuple(target)] = 0 if block is None else block[tuple(source)]
+        request["missing"].discard(key)
+
+    def startTexture(self, request):
+        """Give a 3D request its image now, filled with every chunk already at hand (and those the
+        texture shown can lend): the rest are copied in as they arrive, so the texture is ready
+        when the last one is, with no assembly after it."""
+        imageData, voxels = self.newImage([stop - start for start, stop in request["region"]], self.dtype)
+        request["image"], request["voxels"], request["missing"] = imageData, voxels, set(request["keys"])
+        with self.lock:
+            reuse = request.get("reuse", set())
+            if reuse:
+                self.assemble({**request, "keys": sorted(reuse)}, voxels, partial=True)
+                request["missing"] -= reuse
+            for key in list(request["missing"]):
+                if self.has((request["level"], key)):
+                    data = self.chunk((request["level"], key))
+                    self.copyInto(request, key, data)
+        request["reuseFrom"] = request["reuseImage"] = None  # copied: the old texture can go
+        request["reuse"] = set()
+
     def residentBlock(self, level, region):
         """``region`` of ``level`` sampled from the level wholly in memory, nearest voxel (lock held):
         what a view shows where its own chunks have not arrived yet."""
@@ -2941,12 +2974,15 @@ class Streamer:
         request3D = self.request3D
         if request3D and not request3D["shown"]:
             with self.lock:
-                ready = self.ready(request3D)
-            if ready:
-                # Read straight into the new image: a texture can be up to STREAM_3D_MAX_BYTES.
-                imageData, voxels = self.newImage([stop - start for start, stop in request3D["region"]], self.dtype)
-                with self.lock:
+                if "voxels" in request3D:  # filled as its chunks arrived
+                    imageData = request3D["image"] if not request3D["missing"] else None
+                elif self.ready(request3D):  # made elsewhere: assemble it now
+                    imageData, voxels = self.newImage([stop - start for start, stop in request3D["region"]], self.dtype)
                     self.assemble(request3D, voxels)
+                else:
+                    imageData = None
+            if imageData is not None:
+                request3D["image"] = request3D["voxels"] = None
                 self.show3D(request3D["level"], request3D["region"], imageData)
                 request3D["shown"] = True
                 request3D["reuseFrom"] = request3D["reuseImage"] = None
@@ -3460,6 +3496,7 @@ class Streamer:
         if current and (current["level"], current["region"]) == (request["level"], request["region"]):
             return
         self.markReusable(request)
+        self.startTexture(request)
         self.request3D = request
         if not self.covers3D(request):
             self.showContext3D()  # never leave part of the view empty while the new texture loads
