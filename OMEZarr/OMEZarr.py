@@ -2977,8 +2977,18 @@ class OMEZarrFileReader:
             maxBytes = optional("maxBytes", int)
             timeMode = optional("timeMode", str)
             asLabelMap = optional("asLabelMap", lambda v: str(v).lower() in ("true", "1"))
-            streaming = self.streamingLevels(root, properties, level, maxBytes, timeMode, asLabelMap)
             with Progress(_("Loading OME-Zarr..."), properties["fileName"]) as progress:
+                # Reading the store's metadata (and probing for a label map) goes over the network:
+                # off the GUI thread, under the progress dialog, so a slow server cannot freeze Slicer.
+                progress(0, 1, _("Reading {name}...").format(name=os.path.basename(root.rstrip("/"))))
+                streaming = None
+                if self.mayStream(properties, asLabelMap):
+                    streaming = runResponsive(
+                        lambda: self.streamingLevels(root, level, maxBytes, timeMode, asLabelMap),
+                        lambda: progress(0, 1) or None,
+                    )
+                if progress.cancelled:
+                    raise InterruptedError("Loading cancelled")
                 nodes = OMEZarrLogic.loadImage(
                     root,
                     level=streaming[0] if streaming else level,
@@ -3022,17 +3032,21 @@ class OMEZarrFileReader:
         return True
 
     @staticmethod
-    def streamingLevels(root, properties, level, maxBytes, timeMode, asLabelMap):
+    def mayStream(properties, asLabelMap):
+        """The streaming conditions that need the GUI thread (settings, views)."""
+        return bool(
+            not asLabelMap
+            and properties.get("show", True)
+            and Settings.get(Settings.STREAM, True)
+            and slicer.app.layoutManager() is not None
+        )
+
+    @staticmethod
+    def streamingLevels(root, level, maxBytes, timeMode, asLabelMap):
         """(shown, target) when this load should show a level at once and stream a finer target:
-        the coarsest level by default, or the level asked for when the budget allows a finer one."""
-        if (
-            asLabelMap
-            or not properties.get("show", True)
-            or not Settings.get(Settings.STREAM, True)
-            or slicer.app.layoutManager() is None
-            or isBioformats2rawRoot(root)
-            or isLabelStore(root)
-        ):
+        the coarsest level by default, or the level asked for when the budget allows a finer one.
+        Reads the store over the network: run it off the GUI thread."""
+        if isBioformats2rawRoot(root) or isLabelStore(root):
             return None
         multiscales = OMEZarrLogic.openMultiscales(root)
         if asLabelMap is None and OMEZarrLogic.looksLikeLabelMap(multiscales):
