@@ -83,7 +83,11 @@ STREAM_MAX_CHUNKS_PER_VIEW = 512
 STREAM_READERS = 16  # measured on JS2: 16 fills neotoma level 0 in 18 s; 32 is barely faster and slows the tail
 # Slice views come first: while one waits for a chunk, no 3D or background read starts, and those
 # reads never hold more than this many readers, so a view's chunks start at once on a busy link.
-STREAM_BACKGROUND_READERS = STREAM_READERS // 2
+# Reader threads: the cores, at least STREAM_READERS (the limit on requests to one server). Reads
+# from the disk cache are CPU-bound (decode, copy) and scale with them: 437 chunks/s with 8 on a
+# 32-core JS2 node, 1364 with 16.
+STREAM_READER_THREADS = max(STREAM_READERS, min(32, os.cpu_count() or 1))
+STREAM_BACKGROUND_READERS = STREAM_READER_THREADS // 2
 STREAM_PARTIAL_S = 0.25  # a view's plane is redrawn this often while its chunks arrive
 # Remote reads: requests to one server at a time start at STREAM_READERS and halve while it answers busy.
 HTTP_ATTEMPTS = 8  # per request, while the server answers busy or drops the connection
@@ -1937,6 +1941,9 @@ class AutoRefiner:
 #
 
 
+READ_CONTEXT = threading.local()  # .background: the current thread reads for the 3D view or the fill
+
+
 class HttpGate:
     """How many requests one server gets at a time, shared by every reader of every store on it.
 
@@ -1958,8 +1965,9 @@ class HttpGate:
         self.starts = collections.deque()  # start times within the last HTTP_WINDOW_S
         self.condition = threading.Condition()
 
-    def acquire(self):
-        """Wait for a turn; returns when it started."""
+    def acquire(self, background=False):
+        """Wait for a turn; returns when it started. A ``background`` request (the 3D view's, the
+        fill's) leaves half the turns to the slice views, so theirs start at once on a slow link."""
         with self.condition:
             while True:
                 if HttpClient.shutdown.is_set():
@@ -1970,7 +1978,10 @@ class HttpGate:
                 wait = self.pausedUntil - now
                 if len(self.starts) >= HTTP_WINDOW_REQUESTS:  # paced below the server's request limit
                     wait = max(wait, self.starts[0] + HTTP_WINDOW_S - now)
-                if wait <= 0 and self.inFlight < int(self.limit):
+                allowed = int(self.limit)
+                if background:
+                    allowed -= allowed // 2
+                if wait <= 0 and self.inFlight < max(1, allowed):
                     self.inFlight += 1
                     self.starts.append(now)
                     return now
@@ -2067,7 +2078,7 @@ class HttpClient:
 
         fresh, error = False, None
         for attempt in range(HTTP_ATTEMPTS):
-            started = self.gate.acquire()
+            started = self.gate.acquire(getattr(READ_CONTEXT, "background", False))
             try:
                 connection = self.connection(fresh)
                 connection.request("GET", path, headers=headers or {})
@@ -2564,7 +2575,7 @@ class Streamer:
             (slicer.mrmlScene, slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.EndCloseEvent, self.onSceneClosed))
         )
 
-        self.threads = [threading.Thread(target=self.readLoop, daemon=True) for _ in range(readers or STREAM_READERS)]
+        self.threads = [threading.Thread(target=self.readLoop, daemon=True) for _ in range(readers or STREAM_READER_THREADS)]
         for thread in self.threads:
             thread.start()
         self.viewTimer = qt.QTimer()
@@ -2623,7 +2634,21 @@ class Streamer:
         level, key = item
         if level == self.fillLevel:
             return key in self.targetHave
-        return level == self.residentLevel or item in self.cache or item in self.empty
+        if level == self.residentLevel or item in self.cache or item in self.empty:
+            return True
+        return self.inTexture(item)
+
+    def inTexture(self, item, whole=False):
+        """Whether the 3D request's texture holds this chunk (lock held); ``whole``: all of it, so
+        it can be read back from there."""
+        level, key = item
+        request = self.request3D
+        return (
+            request is not None
+            and level == request["level"]
+            and key in request.get("inside" if whole else "keySet", ())
+            and key not in request["missing"]
+        )
 
     def viewsWaiting(self):
         """Whether a slice view still lacks a chunk, read or not yet (lock held)."""
@@ -2665,6 +2690,8 @@ class Streamer:
                 self.kindInFlight[kind] += 1
                 if not forView:
                     self.backgroundInFlight += 1
+                fill = self.targetArray if level == self.fillLevel else None
+                request = self.request3D
             started = time.monotonic()
             grid = self.levels[level]
             try:
@@ -2675,44 +2702,60 @@ class Streamer:
                     logging.warning(f"OME-Zarr streaming: reading chunk {key} of level {level} failed", exc_info=True)
             ended = time.monotonic()  # the read alone, not the wait for the lock below
             fromCache = bool(grid.reader is not None and getattr(grid.reader.local, "fromCache", False))
-            with self.lock:
-                self.inFlight.discard(item)
-                self.kindInFlight[kind] -= 1
-                if not forView:
-                    self.backgroundInFlight -= 1
-                self.wake.notify_all()
-                self.reads.append((ended, block.nbytes if block is not None else 0, ended - started, fromCache))
-                if block is None:
+            if block is None:
+                with self.lock:
                     self.attempts[item] += 1
                     if self.attempts[item] < self.RETRIES:
+                        self.finishRead(item, kind, forView, ended, started, fromCache, 0)
                         self.push(priority, level, key)
                         continue
                     self.failed.add(item)
-                    logging.error(f"OME-Zarr streaming: chunk {key} of level {level} left empty")
-                    block = np.zeros([stop - start for start, stop in self.levels[level].bounds(key)], self.dtype)
-                self.store(item, block)
+                logging.error(f"OME-Zarr streaming: chunk {key} of level {level} left empty")
+                block = np.zeros([stop - start for start, stop in grid.bounds(key)], self.dtype)
+            # Without the lock: the scan and the copies into the arrays being built. Each chunk
+            # covers its own part of them, so the readers write in parallel; the lock only records it.
+            empty = not block.any()  # most chunks of a specimen are background
+            if fill is not None:
+                (z0, z1), (y0, y1), (x0, x1) = grid.bounds(key)
+                fill[z0:z1, y0:y1, x0:x1] = 0 if empty else block
+            inTexture = request is not None and level == request["level"] and key in request.get("keySet", ())
+            if inTexture:
+                self.copyInto(request, key, None if empty else block)
+            with self.lock:
+                self.finishRead(item, kind, forView, ended, started, fromCache, block.nbytes)
+                self.store(item, block, empty, fill is not None, request if inTexture else None)
+
+    def finishRead(self, item, kind, forView, ended, started, fromCache, nbytes):
+        """Account for a read that ended (lock held)."""
+        self.inFlight.discard(item)
+        self.kindInFlight[kind] -= 1
+        if not forView:
+            self.backgroundInFlight -= 1
+        self.wake.notify_all()
+        self.reads.append((ended, nbytes, ended - started, fromCache))
 
     def readChunk(self, level, key, forView):
         """One chunk, read off the GUI thread; ``forView``: for a slice view (tests watch this)."""
+        READ_CONTEXT.background = not forView
         return self.levels[level].read(key)
 
-    def store(self, item, block):
-        """Keep a chunk that was read (lock held)."""
+    def store(self, item, block, empty, inFill, request):
+        """Record a chunk that was read and copied where it goes (lock held): into the level being
+        filled (``inFill``) or the texture of the 3D ``request``, else into the chunk cache."""
         if self.stopped:
             return
         level, key = item
-        empty = not block.any()  # most chunks of a specimen are background
         if empty:
             self.empty.add(item)
-        request = self.request3D
-        if request is not None and level == request["level"] and key in request.get("missing", ()):
-            self.copyInto(request, key, None if empty else block)  # the texture fills as chunks arrive
-        if level == self.fillLevel:
-            (z0, z1), (y0, y1), (x0, x1) = self.levels[level].bounds(key)
-            self.targetArray[z0:z1, y0:y1, x0:x1] = 0 if empty else block
-            self.targetHave.add(key)
+        if request is not None:
+            request["missing"].discard(key)
+        if inFill:
+            if level == self.fillLevel:
+                self.targetHave.add(key)
             return
         self.partial[level].add(key)
+        if request is not None and request is self.request3D and key in request["inside"] and item not in self.viewItems:
+            return  # the texture holds all of it (see chunk): no second copy
         if not empty:
             self.cache[item] = block
             self.cachedBytes += block.nbytes
@@ -2735,8 +2778,12 @@ class Streamer:
             array = self.targetArray if level == self.fillLevel else self.residentArray
             (z0, z1), (y0, y1), (x0, x1) = self.levels[level].bounds(key)
             return array[z0:z1, y0:y1, x0:x1]
-        self.cache.move_to_end(item)
-        return self.cache[item]
+        if item in self.cache:
+            self.cache.move_to_end(item)
+            return self.cache[item]
+        request = self.request3D  # a chunk wholly inside the 3D texture: read back from it
+        bounds, region = self.levels[level].bounds(key), request["region"]
+        return request["voxels"][tuple(slice(c0 - r0, c1 - r0) for (c0, c1), (r0, _r1) in zip(bounds, region))]
 
     # -- views (main thread) --
 
@@ -2865,7 +2912,7 @@ class Streamer:
 
     def copyInto(self, request, key, block):
         """Copy chunk ``key`` (``block``; zeros when None) into the part of the request's texture it
-        covers, and mark it arrived (lock held)."""
+        covers. No lock: each chunk has its own part."""
         grid = self.levels[request["level"]]
         target, source = [], []
         for (regionStart, regionStop), (chunkStart, chunkStop) in zip(request["region"], grid.bounds(key)):
@@ -2873,25 +2920,53 @@ class Streamer:
             target.append(slice(start - regionStart, stop - regionStart))
             source.append(slice(start - chunkStart, stop - chunkStart))
         request["voxels"][tuple(target)] = 0 if block is None else block[tuple(source)]
-        request["missing"].discard(key)
 
     def startTexture(self, request):
-        """Give a 3D request its image now, filled with every chunk already at hand (and those the
-        texture shown can lend): the rest are copied in as they arrive, so the texture is ready
-        when the last one is, with no assembly after it."""
-        imageData, voxels = self.newImage([stop - start for start, stop in request["region"]], self.dtype)
-        request["image"], request["voxels"], request["missing"] = imageData, voxels, set(request["keys"])
+        """Give a 3D request its image now, with every chunk already at hand copied in; the rest
+        are copied in by the readers as they arrive, and the part the texture shown before covers
+        by a worker thread, so the texture is ready when the last chunk is."""
+        level, region = request["level"], request["region"]
+        imageData, voxels = self.newImage([stop - start for start, stop in region], self.dtype)
+        grid = self.levels[level]
+        request["image"], request["voxels"] = imageData, voxels
+        request["keySet"] = set(request["keys"])
+        request["inside"] = {
+            key for key in request["keys"]
+            if all(r0 <= c0 and c1 <= r1 for (c0, c1), (r0, r1) in zip(grid.bounds(key), region))
+        }
+        request["missing"] = set(request["keys"])
         with self.lock:
-            reuse = request.get("reuse", set())
-            if reuse:
-                self.assemble({**request, "keys": sorted(reuse)}, voxels, partial=True)
-                request["missing"] -= reuse
-            for key in list(request["missing"]):
-                if self.has((request["level"], key)):
-                    data = self.chunk((request["level"], key))
-                    self.copyInto(request, key, data)
-        request["reuseFrom"] = request["reuseImage"] = None  # copied: the old texture can go
-        request["reuse"] = set()
+            for key in request["keys"]:
+                if key not in request["reuse"] and self.has((level, key)):
+                    self.copyInto(request, key, self.chunk((level, key)))
+                    request["missing"].discard(key)
+        if request["reuse"]:
+            threading.Thread(target=self.copyReused, args=(request,), name="OMEZarr 3D reuse", daemon=True).start()
+        else:
+            request["reuseFrom"] = request["reuseImage"] = None
+
+    def copyReused(self, request):
+        """Copy, as one block, the part of the texture shown before that the new one covers (it can
+        be gigabytes: a worker thread), then count the request's reused chunks as arrived."""
+        try:
+            oldRegion, oldVoxels = request["reuseFrom"]
+            region = request["region"]
+            box = [(max(o0, r0), min(o1, r1)) for (o0, o1), (r0, r1) in zip(oldRegion, region)]
+            if all(start < stop for start, stop in box):
+                request["voxels"][tuple(slice(s0 - r0, s1 - r0) for (s0, s1), (r0, _r1) in zip(box, region))] = oldVoxels[
+                    tuple(slice(s0 - o0, s1 - o0) for (s0, s1), (o0, _o1) in zip(box, oldRegion))
+                ]
+        except Exception:  # noqa: BLE001 - the chunks are then read instead
+            logging.warning("OME-Zarr streaming: could not reuse the 3D texture", exc_info=True)
+            with self.lock:  # read those chunks instead
+                keys, request["reuse"] = request["reuse"], set()
+                self.wanted |= {(request["level"], key) for key in keys}
+                for key in keys:
+                    self.push(0.5, request["level"], key)
+            return
+        with self.lock:
+            request["missing"] -= request["reuse"]
+            request["reuseFrom"] = request["reuseImage"] = None
 
     def residentBlock(self, level, region):
         """``region`` of ``level`` sampled from the level wholly in memory, nearest voxel (lock held):
@@ -2981,8 +3056,7 @@ class Streamer:
                     self.assemble(request3D, voxels)
                 else:
                     imageData = None
-            if imageData is not None:
-                request3D["image"] = request3D["voxels"] = None
+            if imageData is not None:  # the voxels stay referenced: views read chunks back from the texture
                 self.show3D(request3D["level"], request3D["region"], imageData)
                 request3D["shown"] = True
                 request3D["reuseFrom"] = request3D["reuseImage"] = None
@@ -3497,7 +3571,8 @@ class Streamer:
             return
         self.markReusable(request)
         self.startTexture(request)
-        self.request3D = request
+        with self.lock:
+            self.request3D = request
         if not self.covers3D(request):
             self.showContext3D()  # never leave part of the view empty while the new texture loads
         self.requestChunks()
