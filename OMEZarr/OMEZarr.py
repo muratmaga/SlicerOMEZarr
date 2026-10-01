@@ -108,9 +108,10 @@ DISK_CACHE_MIB = 10240  # default size of the on-disk cache of remote chunks
 # the GPU's limits cannot be read (macOS reports no video memory; Apple GPUs allow 2048 per side).
 STREAM_3D_MAX_BYTES = 2 << 30
 STREAM_3D_MAX_DIM = 2048
-# Most memory one 3D texture takes when the "3D texture memory" setting is automatic. A region
-# that does not fit is shown one level coarser, whole: a texture is never cut inside what the
-# view sees. Building a texture costs about 0.5 s per GB on JS2 (A100); raise the setting there.
+# Most memory one 3D texture takes when the "3D texture memory" setting is automatic and neither
+# the video memory nor the RAM can be read (else 75% of the video memory and 25% of the RAM cap
+# it). A region that does not fit is shown one level coarser, whole: a texture is never cut
+# inside what the view sees. Building a texture costs about 0.5 s per GB on JS2 (A100).
 STREAM_3D_AUTO_BYTES = 8 << 30
 # Largest 3D texture side when the "3D texture side" setting is automatic. Not read from the GPU:
 # OpenGL's answer has proven unreliable (an A100 that takes 4096 reported 2048). Apple GPUs take 2048.
@@ -3713,24 +3714,65 @@ class Streamer:
             self.maxTextureDim = min(self.maxTextureDim, reported)
         budget = Settings.get(Settings.STREAM_3D_MEMORY, 0) << 20
         if not budget:
-            budget = min(self.maxTextureDim**3 * np.dtype(self.dtype).itemsize, STREAM_3D_AUTO_BYTES)
-            try:
-                gpus = vtk.vtkGPUInfoList()
-                gpus.Probe()
-                video = max((gpus.GetGPUInfo(i).GetDedicatedVideoMemory() for i in range(gpus.GetNumberOfGPUs())), default=0)
-                if video > 0:
-                    budget = min(budget, int(0.75 * video))
-            except Exception:  # noqa: BLE001 - keep the cube
-                pass
-            try:
-                budget = min(budget, os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 4)
-            except (AttributeError, ValueError, OSError):  # no sysconf (Windows)
-                pass
+            budget = self.maxTextureDim**3 * np.dtype(self.dtype).itemsize
+            video, ram = self.videoMemory(), self.systemMemory()
+            if video:
+                budget = min(budget, int(0.75 * video))
+            if ram:
+                budget = min(budget, ram // 4)
+            if not video and not ram:
+                budget = min(budget, STREAM_3D_AUTO_BYTES)
         self.maxTextureBytes = budget or STREAM_3D_MAX_BYTES
         logging.info(
             f"OME-Zarr streaming: 3D textures up to {self.maxTextureDim} voxels per side, {self.maxTextureBytes / 2**30:.1f} GiB"
             f" (OpenGL reports {reported} per side)"
         )
+
+    @staticmethod
+    def videoMemory():
+        """Dedicated video memory in bytes, or 0 when it cannot be read: VTK's probe (Windows, X11
+        with the NVIDIA driver), else nvidia-smi (Linux under VirtualGL/EGL, Windows)."""
+        try:
+            gpus = vtk.vtkGPUInfoList()
+            gpus.Probe()
+            video = max((gpus.GetGPUInfo(i).GetDedicatedVideoMemory() for i in range(gpus.GetNumberOfGPUs())), default=0)
+            if video > 0:
+                return int(video)
+        except Exception:  # noqa: BLE001 - try the next
+            pass
+        try:
+            import subprocess
+
+            output = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5, check=False,
+            ).stdout
+            return max((int(line.strip()) << 20 for line in output.splitlines() if line.strip().isdigit()), default=0)
+        except Exception:  # noqa: BLE001 - no nvidia-smi
+            return 0
+
+    @staticmethod
+    def systemMemory():
+        """Physical RAM in bytes, or 0 when it cannot be read."""
+        try:
+            return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (AttributeError, ValueError, OSError):  # no sysconf (Windows)
+            pass
+        try:
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            status = MemoryStatus()
+            status.dwLength = ctypes.sizeof(MemoryStatus)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+            return int(status.ullTotalPhys)
+        except Exception:  # noqa: BLE001 - not Windows either
+            return 0
 
     def fitsTexture(self, level):
         shape = self.levels[level].shape
@@ -4232,15 +4274,15 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.textureMemorySpinBox.setRange(0, 1 << 20)
         self.textureMemorySpinBox.setSingleStep(512)
         self.textureMemorySpinBox.setSuffix(" MiB")
-        self.textureMemorySpinBox.setSpecialValueText(_("automatic (8 GiB)"))
+        self.textureMemorySpinBox.setSpecialValueText(_("automatic (from the video memory and RAM)"))
         self.textureMemorySpinBox.setValue(Settings.get(Settings.STREAM_3D_MEMORY, 0))
         self.textureMemorySpinBox.setToolTip(
             _(
-                "Most memory one streamed 3D texture may use. Automatic: 8 GiB, or less when the cube of the "
-                "3D texture side, 75% of the video memory (where it can be read) or a quarter of the RAM is "
-                "smaller. A view that needs more than this at a level is shown one level coarser. Larger textures "
-                "show more at full resolution but take longer to build after each camera move (about 0.5 s per GB "
-                "on a fast GPU). Applies when 3D rendering of a store starts"
+                "Most memory one streamed 3D texture may use. Automatic: 75% of the video memory and a quarter of "
+                "the RAM, whichever is smaller (8 GiB when neither can be read), within the cube of the 3D texture "
+                "side. A view that needs more than this at a level is shown one level coarser. Larger textures show "
+                "more at full resolution but take longer to build after each camera move (about 0.5 s per GB on a "
+                "fast GPU). Applies when 3D rendering of a store starts"
             )
         )
         settingsLayout.addRow(_("3D texture memory:"), self.textureMemorySpinBox)
