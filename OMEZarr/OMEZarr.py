@@ -2514,7 +2514,7 @@ class Streamer:
         self.cache = collections.OrderedDict()  # (level, key) -> array, for levels other than the target
         self.cachedBytes = 0
         self.lock = threading.Lock()
-        self.wake = threading.Condition(self.lock)  # readers holding back a 3D or background read
+        self.wake = threading.Condition(self.lock)  # readers waiting for work: notify() per read ended, notify_all() per batch queued
         # Reads waiting, as heaps of (priority, order, level, key), one per kind (lock held):
         # "view" 0 slice views; "volume" 0.5 3D view, 0.75 3D fallback; "fill" 1 the level read whole.
         self.queues = {"view": [], "volume": [], "fill": []}
@@ -2754,7 +2754,11 @@ class Streamer:
         self.kindInFlight[kind] -= 1
         if not forView:
             self.backgroundInFlight -= 1
-        self.wake.notify_all()
+        # One read ended, so at most one more may start: wake one waiting reader. Waking them all
+        # here made every chunk wake 16 idle threads, each needing the GIL for a moment; the
+        # handoffs starved the working readers and the GUI thread (measured on JS2: a level fill
+        # took 82 s this way and 5.5 s waking one; the main thread was blocked 80 s of the 82).
+        self.wake.notify()
         self.reads.append((ended, nbytes, ended - started, fromCache))
 
     def readChunk(self, level, key, forView):
