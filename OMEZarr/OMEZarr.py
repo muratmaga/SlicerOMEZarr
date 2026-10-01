@@ -2636,7 +2636,7 @@ class Streamer:
             return key in self.targetHave
         if level == self.residentLevel or item in self.cache or item in self.empty:
             return True
-        return self.inTexture(item)
+        return self.inTexture(item, whole=True)  # a chunk only partly in the texture is kept in the cache
 
     def inTexture(self, item, whole=False):
         """Whether the 3D request's texture holds this chunk (lock held); ``whole``: all of it, so
@@ -2756,6 +2756,7 @@ class Streamer:
         self.partial[level].add(key)
         if request is not None and request is self.request3D and key in request["inside"] and item not in self.viewItems:
             return  # the texture holds all of it (see chunk): no second copy
+        # A chunk only partly in the texture is cached like any other: it cannot be read back whole.
         if not empty:
             self.cache[item] = block
             self.cachedBytes += block.nbytes
@@ -2781,6 +2782,8 @@ class Streamer:
         if item in self.cache:
             self.cache.move_to_end(item)
             return self.cache[item]
+        if not self.inTexture(item, whole=True):
+            raise KeyError(f"chunk {key} of level {level} is not at hand")
         request = self.request3D  # a chunk wholly inside the 3D texture: read back from it
         bounds, region = self.levels[level].bounds(key), request["region"]
         return request["voxels"][tuple(slice(c0 - r0, c1 - r0) for (c0, c1), (r0, _r1) in zip(bounds, region))]
@@ -3652,7 +3655,8 @@ class Streamer:
     def detectGpuLimits(self, widget):
         """Largest 3D texture side and the memory a 3D texture may use. The side is the module's
         "3D texture side" setting, else STREAM_3D_DEFAULT_SIDE: what OpenGL reports is only logged,
-        as it has proven unreliable. The memory is the "3D texture memory" setting, else the cube of
+        as it has proven unreliable, but never above what OpenGL reports, as VTK refuses larger
+        textures. The memory is the "3D texture memory" setting, else the cube of
         the side capped at STREAM_3D_AUTO_BYTES, at 75% of the video memory where VTK can read it
         (Windows, Linux) and at a quarter of the RAM (the texture is also held in RAM, twice while it
         is replaced)."""
@@ -3664,6 +3668,10 @@ class Streamer:
             reported = int(vtk.vtkTextureObject.GetMaximumTextureSize3D(renderWindow))
         except Exception:  # noqa: BLE001 - only logged
             logging.debug("OME-Zarr streaming: could not read the maximum 3D texture size", exc_info=True)
+        if reported and reported > 0:
+            # VTK refuses a texture with a side over what the context reports ("Invalid texture
+            # dimensions"), whatever the card could do: that value is a ceiling, never raised.
+            self.maxTextureDim = min(self.maxTextureDim, reported)
         budget = Settings.get(Settings.STREAM_3D_MEMORY, 0) << 20
         if not budget:
             budget = min(self.maxTextureDim**3 * np.dtype(self.dtype).itemsize, STREAM_3D_AUTO_BYTES)
