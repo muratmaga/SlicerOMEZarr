@@ -89,6 +89,13 @@ STREAM_READERS = 16  # measured on JS2: 16 fills neotoma level 0 in 18 s; 32 is 
 STREAM_READER_THREADS = max(STREAM_READERS, min(32, os.cpu_count() or 1))
 STREAM_BACKGROUND_READERS = STREAM_READER_THREADS // 2
 STREAM_PARTIAL_S = 0.25  # a view's plane is redrawn this often while its chunks arrive
+# Slicer's main thread keeps Python's GIL while it idles in the Qt event loop, so the reader
+# threads only run during the main thread's own Python calls (measured on JS2: a Python thread
+# got 180k loop iterations/s with Slicer idle, 18M/s while a main-thread slot slept 8 ms of every
+# 10). While chunks are queued or in flight, the main thread therefore sleeps STREAM_YIELD_S every
+# STREAM_YIELD_MS, which hands the GIL to the readers; the timer stops when they have nothing to do.
+STREAM_YIELD_MS = 10
+STREAM_YIELD_S = 0.008
 # Remote reads: requests to one server at a time start at STREAM_READERS and halve while it answers busy.
 HTTP_ATTEMPTS = 8  # per request, while the server answers busy or drops the connection
 HTTP_MAX_WAIT_S = 60.0  # longest pause asked by Retry-After that is honored as such
@@ -2585,6 +2592,10 @@ class Streamer:
         self.pollTimer = qt.QTimer()
         self.pollTimer.setInterval(100)
         self.pollTimer.timeout.connect(self.poll)
+        self.yieldTimer = qt.QTimer()
+        self.yieldTimer.setInterval(STREAM_YIELD_MS)
+        self.yieldTimer.timeout.connect(self.yieldToReaders)
+        self.yieldTimer.start()
         self.cameraTimer = qt.QTimer()
         self.cameraTimer.setSingleShot(True)
         self.cameraTimer.setInterval(STREAM_3D_SETTLE_MS)
@@ -3038,12 +3049,33 @@ class Streamer:
         if node is not None and node.GetScene() is not None:
             slicer.mrmlScene.RemoveNode(node)
 
+    def readersBusy(self):
+        """Whether any chunk is queued or being read (lock held)."""
+        return bool(self.inFlight) or any(self.queues.values())
+
+    def yieldToReaders(self):
+        """Main thread: hand the GIL to the reader threads for a moment (see STREAM_YIELD_MS)."""
+        if self.stopped:
+            self.yieldTimer.stop()
+            return
+        with self.lock:
+            busy = self.readersBusy()
+        if busy:
+            time.sleep(STREAM_YIELD_S)
+        else:
+            self.yieldTimer.stop()
+
     def poll(self):
         if self.stopped:
             return
         if self.node.GetScene() is None:  # the volume was deleted
             OMEZarrLogic.stopStreaming(self.path)
             return
+        if not self.yieldTimer.isActive():
+            with self.lock:
+                busy = self.readersBusy()
+            if busy:
+                self.yieldTimer.start()
         now = time.monotonic()
         for viewName, request in list(self.views.items()):
             if request["shown"]:
@@ -3755,6 +3787,7 @@ class Streamer:
         self.stopped = True
         self.viewTimer.stop()
         self.pollTimer.stop()
+        self.yieldTimer.stop()
         for caller, tag in self.observers:
             caller.RemoveObserver(tag)
         self.observers = []
