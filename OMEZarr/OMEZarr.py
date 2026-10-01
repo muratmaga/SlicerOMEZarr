@@ -1876,19 +1876,11 @@ class Streamer:
         self.lastStatus = 0.0
         self.idleShown = False
 
-        shape = self.levels[targetLevel].shape
-        self.targetImageData = vtk.vtkImageData()
-        self.targetImageData.SetDimensions(shape[2], shape[1], shape[0])
-        self.targetImageData.AllocateScalars(numpy_support.get_vtk_array_type(self.dtype), 1)
-        self.targetArray = numpy_support.vtk_to_numpy(self.targetImageData.GetPointData().GetScalars()).reshape(shape)
-        grid = self.levels[targetLevel]
-        center = np.array(shape) / 2.0
-        self.targetKeys = sorted(
-            grid.keys(), key=lambda key: float(np.linalg.norm([np.mean(b) for b in grid.bounds(key)] - center))
-        )
-        self.targetHave = set()
-        for key in self.targetKeys:
-            self.enqueue(1, targetLevel, key)
+        # The volume sharpens level by level, from the one shown down to the target: each coarser
+        # level costs an eighth of the next. The level wholly in memory serves the views' chunks.
+        self.residentLevel = self.shownLevel
+        self.residentArray = slicer.util.arrayFromVolume(node)
+        self.startFill(max(targetLevel, self.shownLevel - 1))
 
         self.observers = []
         layoutManager = slicer.app.layoutManager()
@@ -1923,6 +1915,33 @@ class Streamer:
         self.pollTimer.start()
         self.viewTimer.start()
 
+    def startFill(self, level):
+        """Read ``level`` whole, in the background, into the image the volume node will switch to."""
+        from vtk.util import numpy_support
+
+        shape = self.levels[level].shape
+        imageData = vtk.vtkImageData()
+        imageData.SetDimensions(shape[2], shape[1], shape[0])
+        imageData.AllocateScalars(numpy_support.get_vtk_array_type(self.dtype), 1)
+        grid = self.levels[level]
+        center = np.array(shape) / 2.0
+        keys = sorted(grid.keys(), key=lambda key: float(np.linalg.norm([np.mean(b) for b in grid.bounds(key)] - center)))
+        with self.lock:
+            self.fillLevel = level
+            self.targetImageData = imageData
+            self.targetArray = numpy_support.vtk_to_numpy(imageData.GetPointData().GetScalars()).reshape(shape)
+            self.targetKeys = keys
+            self.targetHave = set()
+            for key in keys:  # chunks the views already read are not read again
+                cached = self.cache.get((level, key))
+                if cached is not None:
+                    (z0, z1), (y0, y1), (x0, x1) = grid.bounds(key)
+                    self.targetArray[z0:z1, y0:y1, x0:x1] = cached
+                    self.targetHave.add(key)
+        for key in keys:
+            if key not in self.targetHave:
+                self.enqueue(1, level, key)
+
     # -- reading (worker threads) --
 
     def enqueue(self, priority, level, key):
@@ -1930,7 +1949,9 @@ class Streamer:
 
     def has(self, item):
         level, key = item
-        return key in self.targetHave if level == self.target else item in self.cache
+        if level == self.fillLevel:
+            return key in self.targetHave
+        return level == self.residentLevel or item in self.cache
 
     def readLoop(self):
         while not self.stopped:
@@ -1944,6 +1965,8 @@ class Streamer:
                     continue
                 if priority < 1 and item not in self.wanted:
                     continue  # the view has moved on
+                if priority >= 1 and level != self.fillLevel:
+                    continue  # a level already filled
                 self.inFlight.add(item)
             started = time.monotonic()
             try:
@@ -1951,9 +1974,9 @@ class Streamer:
             except Exception:  # noqa: BLE001 - retried, then reported and left empty
                 block = None
                 logging.warning(f"OME-Zarr streaming: reading chunk {key} of level {level} failed", exc_info=True)
+            ended = time.monotonic()  # the read alone, not the wait for the lock below
             with self.lock:
                 self.inFlight.discard(item)
-                ended = time.monotonic()
                 self.reads.append((ended, block.nbytes if block is not None else 0, ended - started))
                 if block is None:
                     self.attempts[item] += 1
@@ -1970,7 +1993,7 @@ class Streamer:
         if self.stopped:
             return
         level, key = item
-        if level == self.target:
+        if level == self.fillLevel:
             (z0, z1), (y0, y1), (x0, x1) = self.levels[level].bounds(key)
             self.targetArray[z0:z1, y0:y1, x0:x1] = block
             self.targetHave.add(key)
@@ -1990,9 +2013,10 @@ class Streamer:
     def chunk(self, item):
         """A chunk that was read (lock held)."""
         level, key = item
-        if level == self.target:
+        if level == self.fillLevel or level == self.residentLevel:
+            array = self.targetArray if level == self.fillLevel else self.residentArray
             (z0, z1), (y0, y1), (x0, x1) = self.levels[level].bounds(key)
-            return self.targetArray[z0:z1, y0:y1, x0:x1]
+            return array[z0:z1, y0:y1, x0:x1]
         self.cache.move_to_end(item)
         return self.cache[item]
 
@@ -2196,7 +2220,14 @@ class Streamer:
                 self.setContext(contextRequest["level"], imageData)
                 self.requestChunks()
         if not self.complete and len(self.targetHave) == len(self.targetKeys):
-            self.switchToTarget()
+            if self.fillLevel == self.target:
+                self.switchToTarget()
+            else:
+                level = self.fillLevel
+                self.switchToLevel(level)
+                self.startFill(level - 1)  # before the views refresh: they poll again
+                self.planContext()
+                self.updateViews()  # views keep their own planes only where they need more
             return
         self.reportProgress()
 
@@ -2220,7 +2251,10 @@ class Streamer:
         """One line for the status bar: background level, what the views wait for, and the rate."""
         parts = []
         if not self.complete:
-            parts.append(_("level {level} {percent}%").format(level=self.target, percent=int(100 * self.progress())))
+            text = _("level {level} {percent}%").format(level=self.fillLevel, percent=int(100 * self.progress()))
+            if self.fillLevel != self.target:
+                text += _(" (then down to level {level})").format(level=self.target)
+            parts.append(text)
         pending, inFlight = self.pendingForViews()
         if pending:
             parts.append(_("views waiting for {count} chunks").format(count=pending))
@@ -2294,15 +2328,21 @@ class Streamer:
                 5000,
             )
 
-    def switchToTarget(self):
-        self.complete = True
+    def switchToLevel(self, level):
+        """Show the level just filled in the volume node; it then serves the views' chunks."""
         display = self.node.GetDisplayNode()
         if display is not None:
             display.SetAutoWindowLevel(False)  # keep the window/level the user sees
         self.node.SetAndObserveImageData(self.targetImageData)
-        self.node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(self.ijkToRas[self.target]))
-        self.node.SetAttribute("OMEZarr.Level", str(self.target))
-        self.shownLevel = self.target
+        self.node.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(self.ijkToRas[level]))
+        self.node.SetAttribute("OMEZarr.Level", str(level))
+        with self.lock:
+            self.shownLevel = self.residentLevel = level
+            self.residentArray = self.targetArray
+
+    def switchToTarget(self):
+        self.complete = True
+        self.switchToLevel(self.target)
         if self.failed:
             message = _("{count} chunks of {name} could not be read and are shown empty").format(
                 count=len(self.failed), name=self.node.GetName()
@@ -2603,10 +2643,11 @@ class Streamer:
         level = max(self.target, fitting)
         if level >= self.contextLevel:
             return
-        if level == self.target:
-            if self.complete:
-                self.setContext(level, self.targetImageData)
+        if level == self.residentLevel:  # wholly in memory: share the volume node's voxels
+            self.setContext(level, self.node.GetImageData())
             return
+        if self.target <= level < self.residentLevel:
+            return  # the level-by-level fill gets there
         if self.contextRequest is None or self.contextRequest["level"] != level:
             region = tuple((0, n) for n in self.levels[level].shape)
             self.contextRequest = {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
@@ -3954,7 +3995,16 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.assertEqual(node.GetAttribute("OMEZarr.Level"), "2")  # shown at once, from the coarsest level
             self.assertEqual(OMEZarrLogic.streamer(storePath).target, 0)
             gate.set()
-            self.assertTrue(self.waitFor(lambda: OMEZarrLogic.streamer(storePath) is None, 20.0))
+            shown = []
+
+            def finished():
+                level = node.GetAttribute("OMEZarr.Level")
+                if not shown or shown[-1] != level:
+                    shown.append(level)
+                return OMEZarrLogic.streamer(storePath) is None
+
+            self.assertTrue(self.waitFor(finished, 20.0))
+            self.assertEqual(shown, ["2", "1", "0"])  # sharpened level by level, not straight to the target
         finally:
             LevelChunks.read = read
             gate.set()
