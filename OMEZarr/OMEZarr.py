@@ -2950,7 +2950,16 @@ class Streamer:
             start, stop = max(regionStart, chunkStart), min(regionStop, chunkStop)
             target.append(slice(start - regionStart, stop - regionStart))
             source.append(slice(start - chunkStart, stop - chunkStart))
-        request["voxels"][tuple(target)] = 0 if block is None else block[tuple(source)]
+        voxels = request.get("voxels")
+        if voxels is not None:  # None once the request was superseded and its texture released
+            voxels[tuple(target)] = 0 if block is None else block[tuple(source)]
+
+    def releaseRequest(self, request):
+        """Drop a superseded request's texture (gigabytes): the node holds the image while it is
+        shown, and nothing reads chunks back from a request that is not the current one."""
+        for key in ("voxels", "image", "reuseFrom", "reuseImage"):
+            request[key] = None
+        request["missing"] = set(request.get("keySet", ()))
 
     def startTexture(self, request):
         """Give a 3D request its image now, with every chunk already at hand copied in; the rest
@@ -2980,11 +2989,14 @@ class Streamer:
         """Copy, as one block, the part of the texture shown before that the new one covers (it can
         be gigabytes: a worker thread), then count the request's reused chunks as arrived."""
         try:
-            oldRegion, oldVoxels = request["reuseFrom"]
+            reuseFrom, voxels = request.get("reuseFrom"), request.get("voxels")
+            if reuseFrom is None or voxels is None:
+                return  # superseded meanwhile
+            oldRegion, oldVoxels = reuseFrom
             region = request["region"]
             box = [(max(o0, r0), min(o1, r1)) for (o0, o1), (r0, r1) in zip(oldRegion, region)]
             if all(start < stop for start, stop in box):
-                request["voxels"][tuple(slice(s0 - r0, s1 - r0) for (s0, s1), (r0, _r1) in zip(box, region))] = oldVoxels[
+                voxels[tuple(slice(s0 - r0, s1 - r0) for (s0, s1), (r0, _r1) in zip(box, region))] = oldVoxels[
                     tuple(slice(s0 - o0, s1 - o0) for (s0, s1), (o0, _o1) in zip(box, oldRegion))
                 ]
         except Exception:  # noqa: BLE001 - the chunks are then read instead
@@ -3362,7 +3374,11 @@ class Streamer:
             caller.RemoveObserver(tag)
         self.cameraObservers = []
         node, self.volume3D = self.volume3D, None
-        self.request3D = None
+        previous = self.request3D
+        with self.lock:
+            self.request3D = None
+        if previous is not None:
+            self.releaseRequest(previous)
         self.shown3D = None
         if node is not None and node.GetScene() is not None:
             for index in reversed(range(node.GetNumberOfDisplayNodes())):
@@ -3604,7 +3620,11 @@ class Streamer:
             # Sharpen one level at a time: neighbouring levels look alike, and each costs an eighth of the next.
             request = self.volumeRequest(finest=shownLevel - 1) or request
         if request is None:
-            self.request3D = None
+            previous = self.request3D
+            with self.lock:
+                self.request3D = None
+            if previous is not None:
+                self.releaseRequest(previous)
             if self.shown3D is None or self.shown3D[0] != self.contextLevel:
                 self.showContext3D()
             self.requestChunks()
@@ -3614,8 +3634,11 @@ class Streamer:
             return
         self.markReusable(request)
         self.startTexture(request)
+        previous = self.request3D
         with self.lock:
             self.request3D = request
+        if previous is not None and previous is not request:
+            self.releaseRequest(previous)  # its texture, if shown, lives on in the node until replaced
         if not self.covers3D(request):
             self.showContext3D()  # never leave part of the view empty while the new texture loads
         self.requestChunks()
