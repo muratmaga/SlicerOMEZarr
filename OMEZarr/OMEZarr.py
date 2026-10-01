@@ -517,17 +517,50 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         return len(multiscales.images) - 1
 
     @staticmethod
-    def maxBytesFromSettings():
+    def availableMemory():
+        """Bytes of RAM available to load data, or None when it cannot be read.
+
+        On macOS this is the kernel's own free-memory level (what Activity Monitor and
+        ``memory_pressure`` report) times the installed RAM. psutil multiplies the kernel's page
+        counts by the page size the process sees, which is 4 KiB in an x86_64 Slicer running under
+        Rosetta while Apple silicon pages are 16 KiB: there it reported 4 GiB of 36 available when
+        macOS reported 76% free."""
+        import sys
+
+        if sys.platform == "darwin":
+            try:
+                import ctypes
+                import ctypes.util
+
+                libc = ctypes.CDLL(ctypes.util.find_library("c"))
+
+                def sysctl(name, ctype):
+                    value = ctype(0)
+                    size = ctypes.c_size_t(ctypes.sizeof(value))
+                    if libc.sysctlbyname(name.encode(), ctypes.byref(value), ctypes.byref(size), None, 0) != 0:
+                        return None
+                    return value.value
+
+                level, total = sysctl("kern.memorystatus_level", ctypes.c_int), sysctl("hw.memsize", ctypes.c_uint64)
+                if level and total:
+                    return int(total * min(100, max(0, level)) / 100)
+            except Exception:  # noqa: BLE001 - fall back to psutil
+                logging.debug("OME-Zarr: could not read the macOS memory level", exc_info=True)
+        try:
+            import psutil
+
+            return int(psutil.virtual_memory().available)
+        except Exception:  # noqa: BLE001 - psutil is optional
+            return None
+
+    @classmethod
+    def maxBytesFromSettings(cls):
         """Configured budget, or a fraction of the available RAM when set to automatic."""
         value = Settings.get(Settings.MAX_BYTES, 0)
         if value > 0:
             return value
-        try:
-            import psutil
-
-            return int(psutil.virtual_memory().available * DEFAULT_BUDGET_FRACTION)
-        except Exception:  # noqa: BLE001 - psutil is optional
-            return FALLBACK_MAX_BYTES
+        available = cls.availableMemory()
+        return int(available * DEFAULT_BUDGET_FRACTION) if available else FALLBACK_MAX_BYTES
 
     @staticmethod
     def timeUnit(image):
@@ -1774,13 +1807,169 @@ class AutoRefiner:
 #
 
 
+class ShardReader:
+    """Reads the inner chunks of one sharded Zarr v3 array straight over HTTP(S).
+
+    ngff-zarr's remote reader fetches the whole shard for every inner chunk it reads (a 3D view of
+    neotoma moved 10.9 GB for 2012 requests, against 108 MB unsharded). Here each shard's index is
+    read once (a suffix range of the shard file) and kept; an inner chunk the index marks empty
+    costs no request at all, and the others are read by byte range over one kept-alive connection
+    per reader thread. Only the plain layout is handled (index at the end, bytes + optional zstd,
+    z/y/x arrays); anything else returns None from ``forArray`` and uses ngff-zarr.
+    """
+
+    EMPTY = 2**64 - 1
+
+    @classmethod
+    def forArray(cls, storeUrl, arrayPath):
+        import urllib.parse
+
+        url = f"{str(storeUrl).rstrip('/')}/{arrayPath.strip('/')}"
+        if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+            return None
+        try:
+            with urllib.request.urlopen(f"{url}/zarr.json", timeout=30) as response:
+                meta = json.load(response)
+            codecs = meta.get("codecs") or []
+            if meta.get("zarr_format") != 3 or len(codecs) != 1 or codecs[0].get("name") != "sharding_indexed":
+                return None
+            if tuple(meta.get("dimension_names") or ()) not in ((), ("z", "y", "x")) or len(meta["shape"]) != 3:
+                return None
+            config = codecs[0]["configuration"]
+            inner = config.get("codecs") or []
+            names = [c.get("name") for c in inner]
+            indexNames = [c.get("name") for c in config.get("index_codecs") or []]
+            if config.get("index_location", "end") != "end" or not names or names[0] != "bytes":
+                return None
+            if names[1:] not in ([], ["zstd"]) or indexNames not in (["bytes"], ["bytes", "crc32c"]):
+                return None
+            encoding = meta.get("chunk_key_encoding") or {}
+            separator = (encoding.get("configuration") or {}).get("separator", "/")
+            if encoding.get("name", "default") != "default":
+                return None
+            endian = ((inner[0].get("configuration") or {}).get("endian") or "little")[0]
+            dtype = np.dtype(meta["data_type"]).newbyteorder("<" if endian == "l" else ">")
+            return cls(url, meta["chunk_grid"]["configuration"]["chunk_shape"], config["chunk_shape"], dtype,
+                       "zstd" in names, "crc32c" in indexNames, separator)
+        except Exception:  # noqa: BLE001 - fall back to ngff-zarr
+            logging.debug(f"OME-Zarr streaming: {url} is read through ngff-zarr", exc_info=True)
+            return None
+
+    def __init__(self, url, shardShape, innerShape, dtype, zstd, checksum, separator):
+        import urllib.parse
+
+        parts = urllib.parse.urlsplit(url)
+        self.scheme, self.host, self.port = parts.scheme, parts.hostname, parts.port
+        self.base = parts.path.rstrip("/")
+        self.innerShape = tuple(int(n) for n in innerShape)
+        self.perShard = tuple(int(s) // int(i) for s, i in zip(shardShape, innerShape))
+        self.dtype = dtype
+        self.zstd = None
+        if zstd:
+            import numcodecs
+
+            self.zstd = numcodecs.Zstd()
+        self.indexBytes = int(np.prod(self.perShard)) * 16 + (4 if checksum else 0)
+        self.separator = separator
+        self.indexes = {}  # shard key -> (n, 2) uint64 array of (offset, nbytes), or None for a missing shard
+        self.fetching = {}  # shard key -> Event set once its index is in ``indexes`` (one fetch per shard)
+        self.lock = threading.Lock()
+        self.local = threading.local()
+        self.requests = 0
+        self.indexReads = 0
+        self.bytesRead = 0
+
+    def connection(self, fresh=False):
+        import http.client
+        import ssl
+
+        if fresh or getattr(self.local, "connection", None) is None:
+            if self.scheme == "https":
+                self.local.connection = http.client.HTTPSConnection(
+                    self.host, self.port, timeout=60, context=ssl.create_default_context()
+                )
+            else:
+                self.local.connection = http.client.HTTPConnection(self.host, self.port, timeout=60)
+        return self.local.connection
+
+    def get(self, path, byteRange):
+        """(status, body) of a ranged GET, retrying once on a dropped kept-alive connection."""
+        import http.client
+
+        for attempt in (0, 1):
+            try:
+                connection = self.connection(fresh=attempt == 1)
+                connection.request("GET", path, headers={"Range": f"bytes={byteRange}"})
+                response = connection.getresponse()
+                body = response.read()
+                with self.lock:
+                    self.requests += 1
+                    self.bytesRead += len(body)
+                return response.status, body
+            except (OSError, http.client.HTTPException):
+                if attempt:
+                    raise
+        return None, b""
+
+    def shardPath(self, shardKey):
+        return f"{self.base}/c{self.separator}" + self.separator.join(str(k) for k in shardKey)
+
+    def shardIndex(self, shardKey):
+        """The shard's index, read once: readers needing it meanwhile wait for that one read."""
+        while True:
+            with self.lock:
+                if shardKey in self.indexes:
+                    return self.indexes[shardKey]
+                event = self.fetching.get(shardKey)
+                if event is None:
+                    event = self.fetching[shardKey] = threading.Event()
+                    break  # this thread reads it
+            event.wait(60)
+        try:
+            status, body = self.get(self.shardPath(shardKey), f"-{self.indexBytes}")
+            with self.lock:
+                self.indexReads += 1
+            if status == 404:
+                index = None
+            elif status in (200, 206):
+                entries = int(np.prod(self.perShard))
+                index = np.frombuffer(body[-self.indexBytes:][: entries * 16], "<u8").reshape(entries, 2)
+            else:
+                raise OSError(f"HTTP {status} reading the index of shard {shardKey}")
+            with self.lock:
+                self.indexes[shardKey] = index
+            return index
+        finally:
+            with self.lock:
+                self.fetching.pop(shardKey, None)
+            event.set()
+
+    def read(self, key):
+        """The inner chunk ``key`` (z, y, x) as a full inner-chunk array, or None when it is empty."""
+        shardKey = tuple(k // p for k, p in zip(key, self.perShard))
+        index = self.shardIndex(shardKey)
+        if index is None:
+            return None
+        offset, nbytes = (int(v) for v in index[np.ravel_multi_index(tuple(k % p for k, p in zip(key, self.perShard)), self.perShard)])
+        if offset == self.EMPTY and nbytes == self.EMPTY:
+            return None
+        status, body = self.get(self.shardPath(shardKey), f"{offset}-{offset + nbytes - 1}")
+        if status == 200 and len(body) != nbytes:  # a server that ignores Range
+            body = body[offset:offset + nbytes]
+        elif status not in (200, 206):
+            raise OSError(f"HTTP {status} reading chunk {key}")
+        raw = self.zstd.decode(body) if self.zstd is not None else body
+        return np.frombuffer(raw, self.dtype).reshape(self.innerShape)
+
+
 class LevelChunks:
     """Chunk grid of one level, for one time point and channel, in (z, y, x) order."""
 
-    def __init__(self, image, timeIndex, channelIndex):
+    def __init__(self, image, timeIndex, channelIndex, shardReader=None):
         self.image = image
         self.timeIndex = timeIndex
         self.channelIndex = channelIndex
+        self.shardReader = shardReader
         dims = list(image.dims)
         self.edges = [
             np.concatenate([[0], np.cumsum(image.data.chunks[dims.index(d)])]).astype(int) for d in ("z", "y", "x")
@@ -1801,6 +1990,13 @@ class LevelChunks:
         return [(int(self.edges[axis][k]), int(self.edges[axis][k + 1])) for axis, k in enumerate(key)]
 
     def read(self, key):
+        if self.shardReader is not None:
+            bounds = self.bounds(key)
+            block = self.shardReader.read(key)
+            shape = [stop - start for start, stop in bounds]
+            if block is None:
+                return np.zeros(shape, self.shardReader.dtype.newbyteorder("="))
+            return block[: shape[0], : shape[1], : shape[2]].astype(block.dtype.newbyteorder("="), copy=False)
         region = dict(zip(("z", "y", "x"), self.bounds(key)))
         sub, _addZ = OMEZarrLogic.spatialDaskArray(self.image, self.timeIndex, self.channelIndex, region)
         return np.asarray(sub.compute(scheduler="synchronous"))
@@ -1839,7 +2035,13 @@ class Streamer:
         self.shownLevel = int(node.GetAttribute("OMEZarr.Level"))
         self.sliceViewNames = list(sliceViewNames)
         images = multiscales.images
-        self.levels = [LevelChunks(image, timeIndex, 0) for image in images]
+        self.levels = []
+        datasets = getattr(multiscales.metadata, "datasets", None) or []
+        for level, image in enumerate(images):
+            reader = None
+            if list(image.dims) == ["z", "y", "x"] and level < len(datasets):
+                reader = ShardReader.forArray(path, datasets[level].path)
+            self.levels.append(LevelChunks(image, timeIndex, 0, reader))
         self.ijkToRas = [OMEZarrLogic.ijkToRasMatrix(image)[0] for image in images]
         self.spacing = [float(np.linalg.norm(m[:3, :3], axis=0).max()) for m in self.ijkToRas]
         self.dtype = OMEZarrLogic.vtkCompatibleDtype(images[0].data.dtype)
@@ -3571,6 +3773,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_StreamingCompletes()
             self.test_StreamedVolumeRendering()
             self.test_StreamedVolumeRenderingGpuLimits()
+            self.test_StreamingShardedRemote()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
         finally:
@@ -4273,6 +4476,98 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
                 self.assertIs(node3D.GetImageData(), streamer.targetImageData)
         finally:
             Streamer.detectGpuLimits = detect
+
+    @staticmethod
+    def serveDirectory(root):
+        """A local HTTP server with Range support for ``root``; returns (base URL, server)."""
+        import http.server
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_HEAD(self):
+                path = os.path.join(root, self.path.split("?")[0].lstrip("/"))
+                self.send_response(200 if os.path.isfile(path) else 404)
+                self.send_header("Content-Length", str(os.path.getsize(path)) if os.path.isfile(path) else "0")
+                self.end_headers()
+
+            def do_GET(self):
+                path = os.path.join(root, self.path.split("?")[0].lstrip("/"))
+                if not os.path.isfile(path):
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                data = open(path, "rb").read()
+                byteRange = self.headers.get("Range")
+                status, total, contentRange = 200, len(data), None
+                if byteRange:
+                    first, last = byteRange.replace("bytes=", "").split("-")
+                    start, end = (total - int(last), total - 1) if first == "" else (int(first), int(last or total - 1))
+                    end = min(end, total - 1)
+                    data, status, contentRange = data[start : end + 1], 206, f"bytes {start}-{end}/{total}"
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                if contentRange:
+                    self.send_header("Content-Range", contentRange)
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{server.server_address[1]}", server
+
+    def test_StreamingShardedRemote(self):
+        self.delayDisplay("Sharded remote stores are read by shard index and byte ranges")
+        import ngff_zarr
+        import SampleData
+
+        mrHead = SampleData.SampleDataLogic().downloadMRHead()
+        full = slicer.util.arrayFromVolume(mrHead)
+        image = OMEZarrLogic.ngffImageFromVolumeNode(mrHead, name="MRHead")
+        multiscales = ngff_zarr.to_multiscales(image, scale_factors=[2, 4], chunks=32)
+        ngff_zarr.to_ome_zarr(os.path.join(self.tempDir, "sharded.ome.zarr"), multiscales, chunks_per_shard=2, overwrite=True)
+        ngff_zarr.to_ome_zarr(os.path.join(self.tempDir, "plain.ome.zarr"), multiscales, overwrite=True)
+        base, server = self.serveDirectory(self.tempDir)
+        try:
+            Settings.set(Settings.STREAM, True)
+            budget = OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4  # level 1: level 0 only for the views
+            plain = slicer.util.loadNodeFromFile(f"{base}/plain.ome.zarr", "OMEZarr", {"maxBytes": budget})
+            self.assertIsNone(OMEZarrLogic.streamer(f"{base}/plain.ome.zarr").levels[0].shardReader)
+            OMEZarrLogic.stopStreaming()
+            slicer.mrmlScene.RemoveNode(plain)
+
+            url = f"{base}/sharded.ome.zarr"
+            slicer.util.loadNodeFromFile(url, "OMEZarr", {"maxBytes": budget})
+            streamer = OMEZarrLogic.streamer(url)
+            reader = streamer.levels[0].shardReader
+            self.assertIsNotNone(reader)
+            self.assertEqual(reader.perShard, (2, 2, 2))
+            self.centerRedViewOn(mrHead, 40.0)
+            self.assertTrue(self.waitFor(lambda: streamer.views.get("Red", {}).get("shown", False), 20.0))
+            request = streamer.views["Red"]
+            self.assertEqual(request["level"], 0)
+            overlay = slicer.util.arrayFromVolume(streamer.overlays["Red"])
+            (z0, z1), (y0, y1), (x0, x1) = request["region"]
+            np.testing.assert_array_equal(overlay, full[z0:z1, y0:y1, x0:x1])
+            # One index per shard touched, then one range per non-empty chunk: never a whole shard.
+            keys = {key for r in streamer.views.values() if r["level"] == 0 for key in r["keys"]}
+            shards = {tuple(k // 2 for k in key) for key in keys}
+            self.assertLessEqual(shards, set(reader.indexes))
+            self.assertEqual(reader.indexReads, len(reader.indexes))  # each shard's index read once, then kept
+            # Byte ranges, never whole shards: far less than the shard files touched.
+            level0 = os.path.join(self.tempDir, "sharded.ome.zarr", "scale0", "MRHead", "c")
+            shardBytes = sum(
+                os.path.getsize(os.path.join(level0, *map(str, key)))
+                for key in reader.indexes
+                if os.path.isfile(os.path.join(level0, *map(str, key)))
+            )
+            self.assertLess(reader.bytesRead, shardBytes, f"{reader.bytesRead} bytes read of {shardBytes}")
+        finally:
+            OMEZarrLogic.stopStreaming()
+            server.shutdown()
 
     def test_MultiViewRefine(self):
         self.delayDisplay("Each slice view keeps its own refined block with the coarse window/level")
