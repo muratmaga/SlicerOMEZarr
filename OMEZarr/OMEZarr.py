@@ -2723,7 +2723,19 @@ class Streamer:
                 self.copyInto(request, key, None if empty else block)
             with self.lock:
                 self.finishRead(item, kind, forView, ended, started, fromCache, block.nbytes)
-                self.store(item, block, empty, fill is not None, request if inTexture else None)
+                # Where the chunk goes was decided when the read started; the fill may have moved to
+                # its level, or the 3D view asked for it, meanwhile. Then it is copied here, under the
+                # lock: rare, and the entry queued for it was dropped as the chunk was in flight.
+                inFill = fill is not None
+                if not inFill and level == self.fillLevel and key not in self.targetHave:
+                    (z0, z1), (y0, y1), (x0, x1) = grid.bounds(key)
+                    self.targetArray[z0:z1, y0:y1, x0:x1] = 0 if empty else block
+                    inFill = True
+                current = self.request3D
+                if current is not None and current is not request and level == current["level"] and key in current.get("missing", ()):
+                    self.copyInto(current, key, None if empty else block)
+                    request, inTexture = current, True
+                self.store(item, block, empty, inFill, request if inTexture else None)
 
     def finishRead(self, item, kind, forView, ended, started, fromCache, nbytes):
         """Account for a read that ended (lock held)."""
