@@ -1390,6 +1390,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     # ---- streaming ----
 
     _streamers = {}
+    panel = None  # the module widget, refreshed by streamers while they read
 
     @classmethod
     def streamingLevels(cls, multiscales, maxBytes=None, timeMode=None):
@@ -1880,6 +1881,9 @@ class Streamer:
         # level costs an eighth of the next. The level wholly in memory serves the views' chunks.
         self.residentLevel = self.shownLevel
         self.residentArray = slicer.util.arrayFromVolume(node)
+        self.downloaded = {self.shownLevel}  # levels read whole at some point
+        self.empty = set()  # (level, key) of chunks read as all zeros: kept as this mark, never read again
+        self.partial = collections.defaultdict(set)  # level -> chunks read for the views
         self.startFill(max(targetLevel, self.shownLevel - 1))
 
         self.observers = []
@@ -1934,9 +1938,9 @@ class Streamer:
             self.targetHave = set()
             for key in keys:  # chunks the views already read are not read again
                 cached = self.cache.get((level, key))
-                if cached is not None:
+                if cached is not None or (level, key) in self.empty:
                     (z0, z1), (y0, y1), (x0, x1) = grid.bounds(key)
-                    self.targetArray[z0:z1, y0:y1, x0:x1] = cached
+                    self.targetArray[z0:z1, y0:y1, x0:x1] = 0 if cached is None else cached
                     self.targetHave.add(key)
         for key in keys:
             if key not in self.targetHave:
@@ -1951,7 +1955,7 @@ class Streamer:
         level, key = item
         if level == self.fillLevel:
             return key in self.targetHave
-        return level == self.residentLevel or item in self.cache
+        return level == self.residentLevel or item in self.cache or item in self.empty
 
     def readLoop(self):
         while not self.stopped:
@@ -1993,14 +1997,19 @@ class Streamer:
         if self.stopped:
             return
         level, key = item
+        empty = not block.any()  # most chunks of a specimen are background
+        if empty:
+            self.empty.add(item)
         if level == self.fillLevel:
             (z0, z1), (y0, y1), (x0, x1) = self.levels[level].bounds(key)
-            self.targetArray[z0:z1, y0:y1, x0:x1] = block
+            self.targetArray[z0:z1, y0:y1, x0:x1] = 0 if empty else block
             self.targetHave.add(key)
             return
-        self.cache[item] = block
-        self.cachedBytes += block.nbytes
-        self.trimCache()
+        self.partial[level].add(key)
+        if not empty:
+            self.cache[item] = block
+            self.cachedBytes += block.nbytes
+            self.trimCache()
 
     def trimCache(self):
         """Drop the least recently used chunks no view needs now, down to the cache size (lock held)."""
@@ -2011,8 +2020,10 @@ class Streamer:
                 self.cachedBytes -= self.cache.pop(old).nbytes
 
     def chunk(self, item):
-        """A chunk that was read (lock held)."""
+        """A chunk that was read (lock held); None when it is all zeros."""
         level, key = item
+        if item in self.empty and level != self.fillLevel and level != self.residentLevel:
+            return None
         if level == self.fillLevel or level == self.residentLevel:
             array = self.targetArray if level == self.fillLevel else self.residentArray
             (z0, z1), (y0, y1), (x0, x1) = self.levels[level].bounds(key)
@@ -2137,7 +2148,8 @@ class Streamer:
                     tuple(slice(t.start + r[0] - o[0], t.stop + r[0] - o[0]) for t, r, o in zip(target, region, oldRegion))
                 ]
             else:
-                block[tuple(target)] = self.chunk((level, key))[tuple(source)]
+                data = self.chunk((level, key))
+                block[tuple(target)] = 0 if data is None else data[tuple(source)]
         return block
 
     def copyDisplay(self, node):
@@ -2217,9 +2229,11 @@ class Streamer:
                 with self.lock:
                     self.assemble(contextRequest, voxels)
                 contextRequest["shown"] = True
+                self.downloaded.add(contextRequest["level"])
                 self.setContext(contextRequest["level"], imageData)
                 self.requestChunks()
         if not self.complete and len(self.targetHave) == len(self.targetKeys):
+            self.downloaded.add(self.fillLevel)
             if self.fillLevel == self.target:
                 self.switchToTarget()
             else:
@@ -2308,6 +2322,21 @@ class Streamer:
                 annotation.SetText(self.LEVEL_CORNER, text)
                 view.scheduleRender()
 
+    def levelState(self, level):
+        """(mark, description) of a level for the module's level table."""
+        if level in self.downloaded:
+            return "✓", _("Downloaded in full")
+        if level == self.fillLevel and not self.complete:
+            percent = int(100 * self.progress())
+            return f"↓ {percent}%", _("Being read in the background: {percent}%").format(percent=percent)
+        read = len(self.partial.get(level, ()))
+        if read:
+            percent = max(1, int(100 * read / max(1, len(self.levels[level].keys()))))
+            return f"◐ {percent}%", _("{count} chunks read for the views ({percent}% of the level)").format(
+                count=read, percent=percent
+            )
+        return "", ""
+
     def reportProgress(self):
         """Keep the status bar current while anything is being read (it does not time out)."""
         now = time.monotonic()
@@ -2315,6 +2344,9 @@ class Streamer:
             return
         self.lastStatus = now
         self.updateLevelLabels()
+        widget = OMEZarrLogic.panel
+        if widget is not None and samePath(widget.path, self.path):
+            widget.updateLevelStatus()
         text = self.statusText()
         if text:
             self.idleShown = False
@@ -3123,6 +3155,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         settingsLayout.addRow(self.resetUnitsButton)
 
         self.layout.addStretch(1)
+        OMEZarrLogic.panel = self  # streamers refresh the level table while they read
 
         self.inspectButton.connect("clicked(bool)", self.onInspect)
         self.pathEdit.connect("currentPathChanged(QString)", self.onPathChanged)
@@ -3286,10 +3319,34 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         return f"{size / 2**30:.2f} GiB" if size >= 2**30 else f"{size / 2**20:.1f} MiB"
 
     def updateLevelStatus(self):
-        """Bold the level the budget selects; tick the levels present in the scene."""
+        """Bold the level the budget selects. While the store streams, mark what was downloaded
+        (✓ whole, ↓ being read, ◐ parts for the views) and the level the volume shows (▸);
+        otherwise tick the levels present in the scene."""
         if not self.path or self.multiscales is None:
             return
         recommended = self.logic.selectLevel(self.multiscales, self.logic.maxBytesFromSettings())
+        streamer = OMEZarrLogic.streamer(self.path)
+        if streamer is not None:
+            self.legendLabel.text = _(
+                "Bold: the level the memory budget selects. ▸ shown · ✓ downloaded · ↓ being read · ◐ parts read for the views."
+            )
+            for row in range(self.levelTable.rowCount):
+                mark, note = streamer.levelState(row) if row < len(streamer.levels) else ("", "")
+                shown = row == streamer.shownLevel
+                notes = [n for n in (note, _("The volume shows this level") if shown else "") if n]
+                if row == recommended:
+                    notes.append(_("Selected by the memory budget"))
+                levelItem = self.levelTable.item(row, 0)
+                levelItem.setText(" ".join(t for t in (("▸" if shown else "") + str(row), mark) if t))
+                for column in range(self.levelTable.columnCount):
+                    item = self.levelTable.item(row, column)
+                    font = item.font()
+                    font.setBold(row == recommended)
+                    item.setFont(font)
+                    if column == 0:
+                        item.setToolTip(". ".join(notes))
+            return
+        self.legendLabel.text = _("Bold: the level the memory budget selects. ✓: loaded in the scene.")
         loaded, regions = set(), set()
         for node in slicer.util.getNodesByClass("vtkMRMLVolumeNode"):
             if samePath(node.GetAttribute("OMEZarr.Path"), self.path) and node.GetAttribute("OMEZarr.Level"):
@@ -3387,6 +3444,8 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             self.statusLabel.text = str(e)
 
     def cleanup(self):
+        if OMEZarrLogic.panel is self:
+            OMEZarrLogic.panel = None
         OMEZarrLogic.stopAutoRefine()
         OMEZarrLogic.stopStreaming()
 
@@ -3972,6 +4031,12 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
                 and streamer.views["Red"]["shown"]
             )
         )
+
+        # Empty chunks are kept as marks, not as blocks of zeros; the level table reports what was read.
+        self.assertTrue(all(block.any() for block in streamer.cache.values()))
+        self.assertEqual(streamer.levelState(2)[0], "✓")  # shown first, read whole
+        self.assertEqual(streamer.levelState(1)[0], "✓")  # filled in the background
+        self.assertTrue(streamer.levelState(0)[0].startswith("◐"))  # only the planes the views needed
 
         # Zoomed out, level 1 is detailed enough and the view's own plane goes away.
         sliceNode.SetFieldOfView(2000.0, 2000.0, 1.0)
