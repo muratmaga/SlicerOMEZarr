@@ -73,7 +73,7 @@ STREAM_CACHE_BYTES = 512 << 20
 STREAM_MAX_CHUNKS_PER_VIEW = 512
 STREAM_READERS = 8
 # Streamed volume rendering: one texture for what the 3D view shows, within these limits.
-STREAM_3D_MAX_BYTES = 512 << 20
+STREAM_3D_MAX_BYTES = 2 << 30
 STREAM_3D_MAX_DIM = 2048  # a common GL_MAX_3D_TEXTURE_SIZE
 STREAM_3D_SETTLE_MS = 300  # the texture follows the camera once it has been still this long
 
@@ -1856,6 +1856,7 @@ class Streamer:
         self.request3D = None  # {"level", "region", "keys", "shown"} for the 3D view
         self.shown3D = None  # (level, region) in the 3D node
         self.cameraObservers = []
+        self.reusedChunks = 0  # chunks copied from the previous 3D texture instead of read again
 
         shape = self.levels[targetLevel].shape
         self.targetImageData = vtk.vtkImageData()
@@ -1955,6 +1956,10 @@ class Streamer:
             return
         self.cache[item] = block
         self.cachedBytes += block.nbytes
+        self.trimCache()
+
+    def trimCache(self):
+        """Drop the least recently used chunks no view needs now, down to the cache size (lock held)."""
         for old in list(self.cache):
             if self.cachedBytes <= self.cacheBytes:
                 break
@@ -2038,27 +2043,48 @@ class Streamer:
     def requestChunks(self):
         """Make what the views need now the only wanted chunks, and queue the missing ones."""
         viewItems = {(r["level"], key) for r in self.views.values() for key in r["keys"]}
-        volumeItems = {(self.request3D["level"], key) for key in self.request3D["keys"]} if self.request3D else set()
+        # A 3D texture's chunks are wanted only until it is built: it can be up to STREAM_3D_MAX_BYTES.
+        request3D = self.request3D
+        volumeItems = (
+            {(request3D["level"], key) for key in request3D["keys"] if key not in request3D["reuse"]}
+            if request3D and not request3D["shown"]
+            else set()
+        )
         with self.lock:
             self.wanted = viewItems | volumeItems
+            self.trimCache()
             missing = {item for item in self.wanted if not self.has(item) and item not in self.inFlight}
         for level, key in missing:
             self.enqueue(0 if (level, key) in viewItems else 0.5, level, key)
 
-    def assemble(self, request):
-        """The request's region from its chunks (lock held), or None while one is missing."""
+    def ready(self, request):
+        """Whether every chunk of the request has been read, or can be copied from the texture
+        shown before (lock held)."""
+        reuse = request.get("reuse", ())
+        return all(key in reuse or self.has((request["level"], key)) for key in request["keys"])
+
+    def assemble(self, request, block=None):
+        """The request's region from its chunks (lock held), into ``block`` when given; None while
+        a chunk is missing. The chunks cover the region, so ``block`` needs no initialization."""
         level, region = request["level"], request["region"]
-        if not all(self.has((level, key)) for key in request["keys"]):
+        if not self.ready(request):
             return None
         grid = self.levels[level]
-        block = np.zeros([stop - start for start, stop in region], self.dtype)
+        if block is None:
+            block = np.zeros([stop - start for start, stop in region], self.dtype)
         for key in request["keys"]:
             target, source = [], []
             for (regionStart, regionStop), (chunkStart, chunkStop) in zip(region, grid.bounds(key)):
                 start, stop = max(regionStart, chunkStart), min(regionStop, chunkStop)
                 target.append(slice(start - regionStart, stop - regionStart))
                 source.append(slice(start - chunkStart, stop - chunkStart))
-            block[tuple(target)] = self.chunk((level, key))[tuple(source)]
+            if key in request.get("reuse", ()):
+                oldRegion, oldVoxels = request["reuseFrom"]
+                block[tuple(target)] = oldVoxels[
+                    tuple(slice(t.start + r[0] - o[0], t.stop + r[0] - o[0]) for t, r, o in zip(target, region, oldRegion))
+                ]
+            else:
+                block[tuple(target)] = self.chunk((level, key))[tuple(source)]
         return block
 
     def copyDisplay(self, node):
@@ -2115,12 +2141,20 @@ class Streamer:
             if block is not None:
                 self.showOverlay(viewName, request, block)
                 request["shown"] = True
-        if self.request3D and not self.request3D["shown"]:
+        request3D = self.request3D
+        if request3D and not request3D["shown"]:
             with self.lock:
-                block = self.assemble(self.request3D)
-            if block is not None:
-                self.show3D(self.request3D["level"], self.request3D["region"], block)
-                self.request3D["shown"] = True
+                ready = self.ready(request3D)
+            if ready:
+                # Read straight into the new image: a texture can be up to STREAM_3D_MAX_BYTES.
+                imageData, voxels = self.newImage([stop - start for start, stop in request3D["region"]], self.dtype)
+                with self.lock:
+                    self.assemble(request3D, voxels)
+                self.show3D(request3D["level"], request3D["region"], imageData)
+                request3D["shown"] = True
+                request3D["reuseFrom"] = request3D["reuseImage"] = None
+                request3D["reuse"] = set()
+                self.requestChunks()  # its chunks may now leave the cache
         if not self.complete and len(self.targetHave) == len(self.targetKeys):
             self.switchToTarget()
             return
@@ -2326,11 +2360,38 @@ class Streamer:
         current = self.request3D
         if current and (current["level"], current["region"]) == (request["level"], request["region"]):
             return
+        self.markReusable(request)
         self.request3D = request
         if not self.covers3D(request):
             self.showContext3D()  # never leave part of the view empty while the new texture loads
         self.requestChunks()
         self.poll()
+
+    def markReusable(self, request):
+        """Let the new texture copy, from the one shown now, every chunk whose part it needs lies
+        inside it: moving the camera a little then reads only the newly visible chunks. The old
+        image is kept referenced until the new one is built (its GPU copy is freed when replaced)."""
+        request["reuse"], request["reuseFrom"] = set(), None
+        if self.shown3D is None or self.shown3D[0] != request["level"] or self.volume3D is None:
+            return
+        from vtk.util import numpy_support
+
+        oldRegion = self.shown3D[1]
+        image = self.volume3D.GetImageData()
+        if image is None:
+            return
+        oldVoxels = numpy_support.vtk_to_numpy(image.GetPointData().GetScalars()).reshape(
+            [stop - start for start, stop in oldRegion]
+        )
+        grid = self.levels[request["level"]]
+        for key in request["keys"]:
+            part = [(max(r0, c0), min(r1, c1)) for (r0, r1), (c0, c1) in zip(request["region"], grid.bounds(key))]
+            if all(o0 <= p0 and p1 <= o1 for (p0, p1), (o0, o1) in zip(part, oldRegion)):
+                request["reuse"].add(key)
+        if request["reuse"]:
+            self.reusedChunks += len(request["reuse"])
+            request["reuseFrom"] = (oldRegion, oldVoxels)
+            request["reuseImage"] = image  # keeps the voxels alive if the node switches to the coarse level meanwhile
 
     def covers3D(self, request):
         """Whether what the 3D node holds spans the requested region."""
@@ -2342,6 +2403,16 @@ class Streamer:
         return bool(np.all(low <= wantLow + tolerance) and np.all(high >= wantHigh - tolerance))
 
     @staticmethod
+    def newImage(shape, dtype):
+        """A vtkImageData of (z, y, x) ``shape`` and a numpy view of its voxels."""
+        from vtk.util import numpy_support
+
+        imageData = vtk.vtkImageData()
+        imageData.SetDimensions(int(shape[2]), int(shape[1]), int(shape[0]))
+        imageData.AllocateScalars(numpy_support.get_vtk_array_type(np.dtype(dtype)), 1)
+        return imageData, numpy_support.vtk_to_numpy(imageData.GetPointData().GetScalars()).reshape(shape)
+
+    @staticmethod
     def replaceImage(node, array):
         """Give ``node`` a new image holding ``array``, built completely before it is attached.
 
@@ -2349,16 +2420,16 @@ class Streamer:
         Modified before AllocateScalars runs, the volume rendering displayable manager renders
         synchronously on it, and the texture upload then reads the old, smaller buffer with the new
         dimensions, which crashes in the OpenGL driver."""
-        from vtk.util import numpy_support
-
-        imageData = vtk.vtkImageData()
-        imageData.SetDimensions(array.shape[2], array.shape[1], array.shape[0])
-        imageData.AllocateScalars(numpy_support.get_vtk_array_type(array.dtype), 1)
-        numpy_support.vtk_to_numpy(imageData.GetPointData().GetScalars()).reshape(array.shape)[:] = array
+        imageData, voxels = Streamer.newImage(array.shape, array.dtype)
+        voxels[:] = array
         node.SetAndObserveImageData(imageData)
 
-    def setVolume3D(self, array, ijkToRas, level):
-        self.replaceImage(self.volume3D, array)
+    def setVolume3D(self, image, ijkToRas, level):
+        """Show ``image`` (a complete vtkImageData, or an array copied into a new one) in the 3D node."""
+        if isinstance(image, np.ndarray):
+            self.replaceImage(self.volume3D, image)
+        else:
+            self.volume3D.SetAndObserveImageData(image)
         self.volume3D.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(ijkToRas))
         self.volume3D.SetAttribute("OMEZarr.Level", str(level))
 
@@ -2367,10 +2438,10 @@ class Streamer:
         shape = self.contextArray.shape
         self.shown3D = (self.contextLevel, tuple((0, n) for n in shape))
 
-    def show3D(self, level, region, block):
+    def show3D(self, level, region, image):
         ijkToRas = self.ijkToRas[level].copy()
         ijkToRas[:3, 3] = (ijkToRas @ np.array([region[2][0], region[1][0], region[0][0], 1.0]))[:3]
-        self.setVolume3D(block, ijkToRas, level)
+        self.setVolume3D(image, ijkToRas, level)
         self.shown3D = (level, region)
 
     def stop(self, wait=False):
@@ -3768,6 +3839,22 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         size = int(np.prod([stop - start for start, stop in region]))
         self.assertLess(size, full.size // 2)
         (z0, z1), (y0, y1), (x0, x1) = region
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), full[z0:z1, y0:y1, x0:x1])
+
+        # A small camera move copies what the previous texture already holds instead of reading it again.
+        reused = streamer.reusedChunks
+        cameraNode.SetFocalPoint(*(center + [3.0, 0.0, 0.0]))
+        cameraNode.SetPosition(*(center + [3.0, -60.0, 0.0]))
+        self.assertTrue(
+            self.waitFor(
+                lambda: streamer.request3D is not None
+                and streamer.request3D["shown"]
+                and streamer.shown3D[1] != region,
+                20.0,
+            )
+        )
+        self.assertGreater(streamer.reusedChunks, reused)
+        (z0, z1), (y0, y1), (x0, x1) = streamer.shown3D[1]
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), full[z0:z1, y0:y1, x0:x1])
 
         # Cropping limits it further, along the viewing direction too.
