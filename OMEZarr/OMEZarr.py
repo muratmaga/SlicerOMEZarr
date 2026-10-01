@@ -97,6 +97,10 @@ DISK_CACHE_MIB = 10240  # default size of the on-disk cache of remote chunks
 # the GPU's limits cannot be read (macOS reports no video memory; Apple GPUs allow 2048 per side).
 STREAM_3D_MAX_BYTES = 2 << 30
 STREAM_3D_MAX_DIM = 2048
+# Most memory one 3D texture takes when the "3D texture memory" setting is automatic: building and
+# uploading a texture costs about 1 s per GB on JS2 (A100), and more voxels than ~2 per screen pixel
+# do not sharpen the image.
+STREAM_3D_AUTO_BYTES = 4 << 30
 # Largest 3D texture side when the "3D texture side" setting is automatic. Not read from the GPU:
 # OpenGL's answer has proven unreliable (an A100 that takes 4096 reported 2048). Apple GPUs take 2048.
 STREAM_3D_DEFAULT_SIDE = 2048 if sys.platform == "darwin" else 4096
@@ -106,7 +110,8 @@ STREAM_3D_SETTLE_MS = 300  # the texture follows the camera once it has been sti
 # is not read. An opaque rendering stops just behind the surface; a transparent one reads deeper.
 # The rays (STREAM_3D_RAYS per side) are marched through the coarsest level, always in memory.
 STREAM_3D_OPAQUE = 0.95
-STREAM_3D_VISIBLE_OPACITY = 0.01  # opacity from which a voxel counts as seen
+STREAM_3D_RAY_SHARE = 0.9  # the far depth: where this share of the rays that turn opaque have; see visibleDepthRange
+STREAM_3D_VISIBLE_OPACITY = 0.01  # opacity accumulated along a ray from which it shows something
 STREAM_3D_RAYS = 32
 
 # Slicer core lookup tables used to colour separate microscopy channels.
@@ -3344,7 +3349,9 @@ class Streamer:
     def visibleDepthRange(self, camera, width, height, roiBounds):
         """(near, far): distances along the view direction between the nearest voxel the 3D view's
         opacity shows and the deepest point where a ray's accumulated opacity reaches
-        STREAM_3D_OPAQUE (or leaves the volume). Rays on a STREAM_3D_RAYS grid over the view are
+        STREAM_3D_OPAQUE for STREAM_3D_RAY_SHARE of the rays that do; when more than the rest of
+        the rays that show something never turn opaque (a see-through rendering), as deep as they go
+        before leaving the volume. Rays on a STREAM_3D_RAYS grid over the view are
         marched through the coarsest level, half a voxel at a time, with the opacity corrected for
         that step as the renderer does. None when no ray meets anything shown; (-inf, inf) without
         a volume rendering. Averaging in the coarse level lowers the opacity of thin structures, so
@@ -3408,19 +3415,27 @@ class Streamer:
                 alpha = np.where(
                     (samples[..., axis] >= roiBounds[2 * axis]) & (samples[..., axis] <= roiBounds[2 * axis + 1]), alpha, 0.0
                 )
-        seen = alpha > STREAM_3D_VISIBLE_OPACITY
+        stepAlpha = 1.0 - np.power(1.0 - np.clip(alpha, 0.0, 1.0), step / unit)  # the renderer's opacity correction
+        accumulated = 1.0 - np.cumprod(1.0 - stepAlpha, axis=1)
+        # A ray shows something once its accumulated opacity passes STREAM_3D_VISIBLE_OPACITY: in a
+        # transparent rendering no single voxel does, only many together.
+        seen = accumulated >= STREAM_3D_VISIBLE_OPACITY
         anySeen = seen.any(axis=1)
         if not anySeen.any():
             return None
-        stepAlpha = 1.0 - np.power(1.0 - np.clip(alpha, 0.0, 1.0), step / unit)  # the renderer's opacity correction
-        accumulated = 1.0 - np.cumprod(1.0 - stepAlpha, axis=1)
         opaque = accumulated >= STREAM_3D_OPAQUE
         first = np.argmax(seen, axis=1)
         last = np.where(opaque.any(axis=1), np.argmax(opaque, axis=1), np.searchsorted(ts, leave, side="right") - 1)
         last = np.clip(last, 0, ts.size - 1)
         cosine = rays @ direction  # distance along a ray -> depth along the view direction
         near = float((ts[first] * cosine)[anySeen].min())
-        far = float((ts[last] * cosine)[anySeen].max())
+        stops = (ts[last] * cosine)[anySeen]
+        turned = opaque.any(axis=1)[anySeen]
+        # Where the rays that turn opaque do so: not the deepest of them, so a few seeing deep through
+        # an opening do not pull the region through the whole specimen.
+        far = float(np.percentile(stops[turned], 100 * STREAM_3D_RAY_SHARE)) if turned.any() else -np.inf
+        if (~turned).mean() > 1 - STREAM_3D_RAY_SHARE:  # a see-through rendering: as deep as those rays go
+            far = max(far, float(stops[~turned].max()))
         margin = float(self.spacing[level])  # one coarse voxel each side
         return near - margin, far + margin
 
@@ -3526,8 +3541,9 @@ class Streamer:
         """Largest 3D texture side and the memory a 3D texture may use. The side is the module's
         "3D texture side" setting, else STREAM_3D_DEFAULT_SIDE: what OpenGL reports is only logged,
         as it has proven unreliable. The memory is the "3D texture memory" setting, else the cube of
-        the side, capped at 75% of the video memory where VTK can read it (Windows, Linux) and at a
-        quarter of the RAM (the texture is also held in RAM, twice while it is replaced)."""
+        the side capped at STREAM_3D_AUTO_BYTES, at 75% of the video memory where VTK can read it
+        (Windows, Linux) and at a quarter of the RAM (the texture is also held in RAM, twice while it
+        is replaced)."""
         self.maxTextureDim = Settings.get(Settings.STREAM_3D_SIDE, 0) or STREAM_3D_DEFAULT_SIDE
         reported = None
         try:
@@ -3538,7 +3554,7 @@ class Streamer:
             logging.debug("OME-Zarr streaming: could not read the maximum 3D texture size", exc_info=True)
         budget = Settings.get(Settings.STREAM_3D_MEMORY, 0) << 20
         if not budget:
-            budget = self.maxTextureDim**3 * np.dtype(self.dtype).itemsize
+            budget = min(self.maxTextureDim**3 * np.dtype(self.dtype).itemsize, STREAM_3D_AUTO_BYTES)
             try:
                 gpus = vtk.vtkGPUInfoList()
                 gpus.Probe()
@@ -4056,13 +4072,14 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.textureMemorySpinBox.setRange(0, 1 << 20)
         self.textureMemorySpinBox.setSingleStep(512)
         self.textureMemorySpinBox.setSuffix(" MiB")
-        self.textureMemorySpinBox.setSpecialValueText(_("automatic (largest texture side, cubed)"))
+        self.textureMemorySpinBox.setSpecialValueText(_("automatic (4 GiB)"))
         self.textureMemorySpinBox.setValue(Settings.get(Settings.STREAM_3D_MEMORY, 0))
         self.textureMemorySpinBox.setToolTip(
             _(
-                "Most memory one streamed 3D texture may use. Automatic: the cube of the largest 3D texture "
-                "side the GPU accepts (2048 -> 8 GiB of 8-bit voxels), capped at 75% of the video memory where "
-                "it can be read (Windows, Linux). Applies when 3D rendering of a store starts"
+                "Most memory one streamed 3D texture may use. Automatic: 4 GiB, or less when the cube of the "
+                "3D texture side, 75% of the video memory (where it can be read) or a quarter of the RAM is "
+                "smaller. Larger textures show more of the volume at full resolution but take longer to build "
+                "after each camera move. Applies when 3D rendering of a store starts"
             )
         )
         settingsLayout.addRow(_("3D texture memory:"), self.textureMemorySpinBox)
@@ -5230,22 +5247,29 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         camera = cameraNode.GetCamera()
         width, height = widget.threeDView().renderWindow().GetSize()
         display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(streamer.volume3D)
-        opacity = display.GetVolumePropertyNode().GetVolumeProperty().GetScalarOpacity()
+
+        display.SetFollowVolumeDisplayNode(False)
 
         def depthWith(points):
-            opacity.RemoveAllPoints()
+            # A fresh property node, as choosing a preset gives: the one in use is edited by whatever observes it.
+            propertyNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumePropertyNode")
+            opacity = vtk.vtkPiecewiseFunction()
             for value, alpha in points:
                 opacity.AddPoint(value, alpha)
+            propertyNode.GetVolumeProperty().SetScalarOpacity(opacity)
+            propertyNode.GetVolumeProperty().SetScalarOpacityUnitDistance(1.0)  # opacity per mm
+            display.SetAndObserveVolumePropertyNodeID(propertyNode.GetID())
             return streamer.visibleDepthRange(camera, width, height, None)
 
         front = 400.0 - (center[1] - bounds[2])  # depth of the volume's front face
         back = 400.0 + (bounds[3] - center[1])  # and of its back face
-        opaqueNear, opaqueFar = depthWith([(0, 0.0), (30, 0.0), (31, 1.0)])
-        clearNear, clearFar = depthWith([(0, 0.0), (30, 0.0), (31, 0.002)])
+        # Each curve runs past the volume's largest value: Slicer adds its own end point to one that stops short.
+        opaqueNear, opaqueFar = depthWith([(0, 0.0), (30, 0.0), (31, 1.0), (10000, 1.0)])
+        clearNear, clearFar = depthWith([(0, 0.0), (30, 0.0), (31, 0.002), (10000, 0.002)])
         self.assertGreaterEqual(opaqueNear, front - 10.0)  # starts at the skin, not at the camera
         self.assertLess(opaqueFar, back - 50.0)  # opaque: stops at the visible skin, well before the back
         self.assertGreater(clearFar, back - 10.0)  # transparent: the rays see through to the back
-        self.assertIsNone(depthWith([(0, 0.0), (5000, 0.0)]))  # nothing shown: nothing to read
+        self.assertIsNone(depthWith([(0, 0.0), (10000, 0.0)]))  # nothing shown: nothing to read
 
         # Too deep for one texture: the far end is cut, the end nearest the camera kept.
         streamer.maxTextureDim, streamer.maxTextureBytes = 100, 1 << 30
