@@ -23,6 +23,7 @@ import logging
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import urllib.request
@@ -96,6 +97,9 @@ DISK_CACHE_MIB = 10240  # default size of the on-disk cache of remote chunks
 # the GPU's limits cannot be read (macOS reports no video memory; Apple GPUs allow 2048 per side).
 STREAM_3D_MAX_BYTES = 2 << 30
 STREAM_3D_MAX_DIM = 2048
+# Largest 3D texture side when the "3D texture side" setting is automatic. Not read from the GPU:
+# OpenGL's answer has proven unreliable (an A100 that takes 4096 reported 2048). Apple GPUs take 2048.
+STREAM_3D_DEFAULT_SIDE = 2048 if sys.platform == "darwin" else 4096
 STREAM_3D_SETTLE_MS = 300  # the texture follows the camera once it has been still this long
 # The 3D view reads, in depth, from the nearest voxel its opacity shows to where the opacity
 # accumulated along the view's rays reaches STREAM_3D_OPAQUE: what lies behind is not seen, so it
@@ -134,6 +138,7 @@ class Settings:
     STREAM = "OMEZarr/Stream"  # show the coarsest level at once and stream the chosen level behind it
     STREAM_3D = "OMEZarr/StreamVolumeRendering"  # volume-render streamed stores in the 3D view
     STREAM_3D_MEMORY = "OMEZarr/StreamVolumeRenderingMemory"  # MiB a 3D texture may use, 0 = automatic
+    STREAM_3D_SIDE = "OMEZarr/StreamVolumeRenderingTextureSide"  # voxels per side of a 3D texture, 0 = automatic
     DISK_CACHE = "OMEZarr/DiskCacheMiB"  # MiB of remote chunks kept on disk between sessions, 0 = off
     DISK_CACHE_DIR = "OMEZarr/DiskCacheDirectory"  # empty = <Slicer cache>/OMEZarr
 
@@ -3290,9 +3295,31 @@ class Streamer:
             dims = [stop - start for start, stop in region]
             if min(dims) <= 0:
                 return None
-            if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
+            region = self.trimToTexture(level, region, direction)
+            if region is not None:
                 return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
         return None
+
+    def trimToTexture(self, level, region, direction):
+        """``region`` of ``level``, cut at its far end along the axis closest to the view direction
+        until it fits one 3D texture: what is nearest the camera is kept. None when it cannot fit
+        (too wide across the view, or less than a chunk deep would be left)."""
+        itemSize = np.dtype(self.dtype).itemsize
+        dims = [stop - start for start, stop in region]
+        if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
+            return region
+        towards = np.linalg.inv(self.ijkToRas[level])[:3, :3] @ direction  # i, j, k
+        axis = 2 - int(np.argmax(np.abs(towards)))  # z, y, x index of the depth axis
+        across = [d for a, d in enumerate(dims) if a != axis]
+        if max(across) > self.maxTextureDim:
+            return None
+        depth = min(self.maxTextureDim, self.maxTextureBytes // (itemSize * int(np.prod(across))))
+        if depth < min(dims[axis], 64):
+            return None
+        start, stop = region[axis]
+        trimmed = list(region)
+        trimmed[axis] = (start, start + depth) if towards[2 - axis] > 0 else (stop - depth, stop)
+        return tuple(trimmed)
 
     def opacityLookup(self):
         """(opacity per value bin, low value, bins per value unit, opacity unit distance in mm) of the
@@ -3496,18 +3523,18 @@ class Streamer:
         self.shown3D = (self.contextLevel, tuple((0, n) for n in self.levels[self.contextLevel].shape))
 
     def detectGpuLimits(self, widget):
-        """Largest 3D texture side the GPU accepts, and the memory a 3D texture may use: the module's
-        "3D texture memory" setting when set; otherwise a cube of the largest side (2048 -> 8 Gi
-        voxels), capped at 75% of the video memory where VTK can read it (Windows, Linux; macOS
-        reports none). Slicer's own GPU memory size is not used: it has had no GUI since 2020, as
-        VTK ignores it."""
+        """Largest 3D texture side and the memory a 3D texture may use. The side is the module's
+        "3D texture side" setting, else STREAM_3D_DEFAULT_SIDE: what OpenGL reports is only logged,
+        as it has proven unreliable. The memory is the "3D texture memory" setting, else the cube of
+        the side, capped at 75% of the video memory where VTK can read it (Windows, Linux) and at a
+        quarter of the RAM (the texture is also held in RAM, twice while it is replaced)."""
+        self.maxTextureDim = Settings.get(Settings.STREAM_3D_SIDE, 0) or STREAM_3D_DEFAULT_SIDE
+        reported = None
         try:
             renderWindow = widget.threeDView().renderWindow()
             renderWindow.MakeCurrent()
-            size = int(vtk.vtkTextureObject.GetMaximumTextureSize3D(renderWindow))
-            if size > 0:
-                self.maxTextureDim = size
-        except Exception:  # noqa: BLE001 - keep the fallback
+            reported = int(vtk.vtkTextureObject.GetMaximumTextureSize3D(renderWindow))
+        except Exception:  # noqa: BLE001 - only logged
             logging.debug("OME-Zarr streaming: could not read the maximum 3D texture size", exc_info=True)
         budget = Settings.get(Settings.STREAM_3D_MEMORY, 0) << 20
         if not budget:
@@ -3520,9 +3547,14 @@ class Streamer:
                     budget = min(budget, int(0.75 * video))
             except Exception:  # noqa: BLE001 - keep the cube
                 pass
+            try:
+                budget = min(budget, os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 4)
+            except (AttributeError, ValueError, OSError):  # no sysconf (Windows)
+                pass
         self.maxTextureBytes = budget or STREAM_3D_MAX_BYTES
         logging.info(
             f"OME-Zarr streaming: 3D textures up to {self.maxTextureDim} voxels per side, {self.maxTextureBytes / 2**30:.1f} GiB"
+            f" (OpenGL reports {reported} per side)"
         )
 
     def fitsTexture(self, level):
@@ -4035,6 +4067,20 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         )
         settingsLayout.addRow(_("3D texture memory:"), self.textureMemorySpinBox)
 
+        self.textureSideSpinBox = qt.QSpinBox()
+        self.textureSideSpinBox.setRange(0, 1 << 15)
+        self.textureSideSpinBox.setSingleStep(1024)
+        self.textureSideSpinBox.setSuffix(_(" voxels"))
+        self.textureSideSpinBox.setSpecialValueText(_("automatic ({side})").format(side=STREAM_3D_DEFAULT_SIDE))
+        self.textureSideSpinBox.setValue(Settings.get(Settings.STREAM_3D_SIDE, 0))
+        self.textureSideSpinBox.setToolTip(
+            _(
+                "Largest side of one streamed 3D texture. Automatic: 4096 (2048 on macOS); OpenGL's own answer "
+                "is not used, as it has proven wrong. Set your GPU's limit here. Applies when 3D rendering of a store starts"
+            )
+        )
+        settingsLayout.addRow(_("3D texture side:"), self.textureSideSpinBox)
+
         self.diskCacheSpinBox = qt.QSpinBox()
         self.diskCacheSpinBox.setRange(0, 1 << 22)
         self.diskCacheSpinBox.setSingleStep(1024)
@@ -4086,6 +4132,9 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.resetUnitsButton.connect("clicked(bool)", OMEZarrLogic.resetDisplayUnits)
         self.autoRefineOnLoadCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.AUTO_REFINE, bool(b)))
         self.streamCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.STREAM, bool(b)))
+        self.textureSideSpinBox.connect(
+            "valueChanged(int)", lambda side: Settings.set(Settings.STREAM_3D_SIDE, int(side))
+        )
         self.textureMemorySpinBox.connect(
             "valueChanged(int)", lambda mib: Settings.set(Settings.STREAM_3D_MEMORY, int(mib))
         )
@@ -4448,6 +4497,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
                 Settings.STREAM,
                 Settings.STREAM_3D,
                 Settings.STREAM_3D_MEMORY,
+                Settings.STREAM_3D_SIDE,
                 Settings.DISK_CACHE,
                 Settings.DISK_CACHE_DIR,
             )
@@ -5196,6 +5246,14 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertLess(opaqueFar, back - 50.0)  # opaque: stops at the visible skin, well before the back
         self.assertGreater(clearFar, back - 10.0)  # transparent: the rays see through to the back
         self.assertIsNone(depthWith([(0, 0.0), (5000, 0.0)]))  # nothing shown: nothing to read
+
+        # Too deep for one texture: the far end is cut, the end nearest the camera kept.
+        streamer.maxTextureDim, streamer.maxTextureBytes = 100, 1 << 30
+        region = ((0, 50), (0, 250), (0, 60))  # z, y, x: deep along y
+        ahead = np.array(streamer.ijkToRas[0][:3, 1]) / np.linalg.norm(streamer.ijkToRas[0][:3, 1])  # RAS of +j
+        self.assertEqual(streamer.trimToTexture(0, region, ahead), ((0, 50), (0, 100), (0, 60)))
+        self.assertEqual(streamer.trimToTexture(0, region, -ahead), ((0, 50), (150, 250), (0, 60)))
+        self.assertIsNone(streamer.trimToTexture(0, ((0, 50), (0, 250), (0, 160)), ahead))  # too wide across the view
         OMEZarrLogic.stopStreaming(storePath, wait=True)
 
     def test_RequestPacing(self):
@@ -5359,7 +5417,11 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(streamer.maxTextureBytes, 300 << 20)
         Settings.set(Settings.STREAM_3D_MEMORY, 0)
         streamer.detectGpuLimits(widget)
-        self.assertGreater(streamer.maxTextureDim, 0)
+        self.assertEqual(streamer.maxTextureDim, STREAM_3D_DEFAULT_SIDE)  # not what OpenGL reports
+        Settings.set(Settings.STREAM_3D_SIDE, 1024)
+        streamer.detectGpuLimits(widget)
+        self.assertEqual(streamer.maxTextureDim, 1024)
+        Settings.set(Settings.STREAM_3D_SIDE, 0)
         self.assertLessEqual(streamer.maxTextureBytes, streamer.maxTextureDim**3 * np.dtype(streamer.dtype).itemsize)
         OMEZarrLogic.stopStreaming(storePath)
 
