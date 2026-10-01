@@ -16,6 +16,7 @@ NGFF parsing, multiscales, store access and RFC-4 orientation come from ngff-zar
 
 import collections
 import functools
+import heapq
 import itertools
 import json
 import logging
@@ -2483,10 +2484,14 @@ class Streamer:
         self.cachedBytes = 0
         self.lock = threading.Lock()
         self.wake = threading.Condition(self.lock)  # readers holding back a 3D or background read
-        self.requests = queue.PriorityQueue()  # (0 slice view, 0.5 3D view, 0.75 3D fallback, 1 background), order, level, key
+        # Reads waiting, as heaps of (priority, order, level, key), one per kind (lock held):
+        # "view" 0 slice views; "volume" 0.5 3D view, 0.75 3D fallback; "fill" 1 the level read whole.
+        self.queues = {"view": [], "volume": [], "fill": []}
         self.order = itertools.count()
         self.inFlight = set()
+        self.kindInFlight = collections.Counter()  # reads in flight per kind
         self.backgroundInFlight = 0  # reads in flight for anything but the slice views
+        self.lastBackground = None  # kind that started the last 3D-or-fill read: the other goes next on a tie
         self.viewItems = set()  # (level, key) the slice views need now
         self.attempts = collections.Counter()
         self.failed = set()
@@ -2586,14 +2591,20 @@ class Streamer:
                     (z0, z1), (y0, y1), (x0, x1) = grid.bounds(key)
                     self.targetArray[z0:z1, y0:y1, x0:x1] = 0 if cached is None else cached
                     self.targetHave.add(key)
-        for key in keys:
-            if key not in self.targetHave:
-                self.enqueue(1, level, key)
+            for key in keys:
+                if key not in self.targetHave:
+                    self.push(1, level, key)
+            self.wake.notify_all()
 
     # -- reading (worker threads) --
 
-    def enqueue(self, priority, level, key):
-        self.requests.put((priority, next(self.order), level, key))
+    @staticmethod
+    def kindOf(priority):
+        return "view" if priority == 0 else "volume" if priority < 1 else "fill"
+
+    def push(self, priority, level, key):
+        """Queue a read (lock held)."""
+        heapq.heappush(self.queues[self.kindOf(priority)], (priority, next(self.order), level, key))
 
     def has(self, item):
         level, key = item
@@ -2605,14 +2616,30 @@ class Streamer:
         """Whether a slice view still lacks a chunk, read or not yet (lock held)."""
         return any(not self.has(item) for item in self.viewItems)
 
+    def nextRead(self):
+        """The next read to start, or None (lock held). A slice view's always comes first. The 3D
+        view's and the background fill's start only while no view waits, within
+        STREAM_BACKGROUND_READERS, and take turns: neither holds back the other."""
+        if self.queues["view"]:
+            return heapq.heappop(self.queues["view"])
+        if self.backgroundInFlight >= STREAM_BACKGROUND_READERS or self.viewsWaiting():
+            return None
+        ready = [kind for kind in ("volume", "fill") if self.queues[kind]]
+        if not ready:
+            return None
+        kind = min(ready, key=lambda k: (self.kindInFlight[k], k == self.lastBackground))
+        self.lastBackground = kind
+        return heapq.heappop(self.queues[kind])
+
     def readLoop(self):
         while not self.stopped:
-            try:
-                priority, _order, level, key = self.requests.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            item = (level, key)
             with self.lock:
+                entry = self.nextRead()
+                if entry is None:
+                    self.wake.wait(0.2)
+                    continue
+                priority, _order, level, key = entry
+                item = (level, key)
                 if self.has(item) or item in self.inFlight or item in self.failed:
                     continue
                 if priority < 1 and item not in self.wanted:
@@ -2620,11 +2647,9 @@ class Streamer:
                 if priority >= 1 and level != self.fillLevel:
                     continue  # a level already filled
                 forView = priority == 0
-                if not forView and (self.backgroundInFlight >= STREAM_BACKGROUND_READERS or self.viewsWaiting()):
-                    self.requests.put((priority, _order, level, key))  # keeps its place in the queue
-                    self.wake.wait(0.2)
-                    continue
+                kind = self.kindOf(priority)
                 self.inFlight.add(item)
+                self.kindInFlight[kind] += 1
                 if not forView:
                     self.backgroundInFlight += 1
             started = time.monotonic()
@@ -2639,6 +2664,7 @@ class Streamer:
             fromCache = bool(grid.reader is not None and getattr(grid.reader.local, "fromCache", False))
             with self.lock:
                 self.inFlight.discard(item)
+                self.kindInFlight[kind] -= 1
                 if not forView:
                     self.backgroundInFlight -= 1
                 self.wake.notify_all()
@@ -2646,7 +2672,7 @@ class Streamer:
                 if block is None:
                     self.attempts[item] += 1
                     if self.attempts[item] < self.RETRIES:
-                        self.enqueue(priority, level, key)
+                        self.push(priority, level, key)
                         continue
                     self.failed.add(item)
                     logging.error(f"OME-Zarr streaming: chunk {key} of level {level} left empty")
@@ -2783,10 +2809,9 @@ class Streamer:
             self.viewItems = viewItems
             self.wake.notify_all()  # held-back reads may go once the views have what they need
             self.trimCache()
-            missing = {item for item in self.wanted if not self.has(item) and item not in self.inFlight}
-        for level, key in missing:
-            item = (level, key)
-            self.enqueue(0 if item in viewItems else 0.75 if item in contextItems else 0.5, level, key)
+            for item in self.wanted:
+                if not self.has(item) and item not in self.inFlight:
+                    self.push(0 if item in viewItems else 0.75 if item in contextItems else 0.5, *item)
 
     def ready(self, request):
         """Whether every chunk of the request has been read, or can be copied from the texture
@@ -4417,6 +4442,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_Streaming()
             self.test_StreamingCompletes()
             self.test_StreamingViewsFirst()
+            self.test_FillAnd3DTakeTurns()
             self.test_RequestPacing()
             self.test_StreamedVolumeRendering()
             self.test_StreamedVolumeRenderingGpuLimits()
@@ -5024,6 +5050,58 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         finally:
             Streamer.readChunk = readChunk
             background.set()
+            OMEZarrLogic.stopStreaming(storePath, wait=True)
+
+    def test_FillAnd3DTakeTurns(self):
+        self.delayDisplay("The 3D view and the background fill share the readers: neither starves the other")
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        Settings.set(Settings.STREAM, True)
+        Settings.set(Settings.STREAM_3D, True)
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        tokens = threading.Semaphore(0)  # each 3D or background read waits for one
+        readChunk = Streamer.readChunk
+
+        def gatedRead(streamer, level, key, forView):
+            if not forView:
+                tokens.acquire(timeout=20.0)
+            return readChunk(streamer, level, key, forView)
+
+        Streamer.readChunk = gatedRead
+        try:
+            slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4})
+            streamer = OMEZarrLogic.streamer(storePath)
+            for viewName in ("Red", "Green", "Yellow"):
+                slicer.app.layoutManager().sliceWidget(viewName).mrmlSliceNode().SetFieldOfView(2000.0, 2000.0, 1.0)
+            self.assertEqual(streamer.fillLevel, 1)
+            self.assertTrue(self.waitFor(lambda: streamer.kindInFlight["fill"] == STREAM_BACKGROUND_READERS))
+
+            # Close up, the 3D view queues level-0 chunks behind the fill already reading.
+            widget = slicer.app.layoutManager().threeDWidget(0)
+            cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(widget.mrmlViewNode())
+            bounds = [0.0] * 6
+            mrHead.GetRASBounds(bounds)
+            center = np.array([(bounds[2 * axis] + bounds[2 * axis + 1]) / 2 for axis in range(3)])
+            cameraNode.SetFocalPoint(*center)
+            cameraNode.SetPosition(*(center + [0.0, -60.0, 0.0]))
+            cameraNode.SetViewUp(0.0, 0.0, 1.0)
+            self.assertTrue(self.waitFor(lambda: len(streamer.queues["volume"]) >= STREAM_BACKGROUND_READERS // 2, 10.0))
+            self.assertEqual(streamer.kindInFlight["volume"], 0)
+
+            # As reads finish, the freed readers go to whichever kind has fewer in flight.
+            for _ in range(STREAM_BACKGROUND_READERS):
+                tokens.release()
+            half = STREAM_BACKGROUND_READERS // 2
+            self.assertTrue(
+                self.waitFor(lambda: streamer.kindInFlight["volume"] == half and streamer.kindInFlight["fill"] == half)
+            )
+            for _ in range(10000):
+                tokens.release()
+            self.assertTrue(self.waitFor(lambda: streamer.complete and streamer.request3D and streamer.request3D["shown"], 20.0))
+        finally:
+            Streamer.readChunk = readChunk
+            for _ in range(10000):
+                tokens.release()
             OMEZarrLogic.stopStreaming(storePath, wait=True)
 
     def test_RequestPacing(self):
