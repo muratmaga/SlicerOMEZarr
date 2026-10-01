@@ -107,6 +107,7 @@ class Settings:
     DETECT_LABEL_MAPS = "OMEZarr/DetectLabelMaps"  # integer stores with few values load as label maps
     STREAM = "OMEZarr/Stream"  # show the coarsest level at once and stream the chosen level behind it
     STREAM_3D = "OMEZarr/StreamVolumeRendering"  # volume-render streamed stores in the 3D view
+    STREAM_3D_MEMORY = "OMEZarr/StreamVolumeRenderingMemory"  # MiB a 3D texture may use, 0 = automatic
 
     @staticmethod
     def get(key, default):
@@ -2559,10 +2560,11 @@ class Streamer:
         self.shown3D = (self.contextLevel, tuple((0, n) for n in self.levels[self.contextLevel].shape))
 
     def detectGpuLimits(self, widget):
-        """Largest 3D texture side the GPU accepts, and the memory a 3D texture may use: the volume
-        rendering "GPU memory size" (view node or settings) when set; otherwise a cube of the largest
-        side (2048 -> 8 Gi voxels), capped at 75% of the video memory where VTK can read it (Windows,
-        Linux; macOS reports none)."""
+        """Largest 3D texture side the GPU accepts, and the memory a 3D texture may use: the module's
+        "3D texture memory" setting when set; otherwise a cube of the largest side (2048 -> 8 Gi
+        voxels), capped at 75% of the video memory where VTK can read it (Windows, Linux; macOS
+        reports none). Slicer's own GPU memory size is not used: it has had no GUI since 2020, as
+        VTK ignores it."""
         try:
             renderWindow = widget.threeDView().renderWindow()
             renderWindow.MakeCurrent()
@@ -2571,16 +2573,7 @@ class Streamer:
                 self.maxTextureDim = size
         except Exception:  # noqa: BLE001 - keep the fallback
             logging.debug("OME-Zarr streaming: could not read the maximum 3D texture size", exc_info=True)
-        budget = 0
-        try:
-            budget = int(widget.mrmlViewNode().GetGPUMemorySize()) << 20  # MB, 0 = automatic
-        except Exception:  # noqa: BLE001
-            pass
-        if not budget:
-            try:
-                budget = int(float(slicer.app.userSettings().value("VolumeRendering/GPUMemorySize") or 0)) << 20
-            except (TypeError, ValueError):
-                budget = 0
+        budget = Settings.get(Settings.STREAM_3D_MEMORY, 0) << 20
         if not budget:
             budget = self.maxTextureDim**3 * np.dtype(self.dtype).itemsize
             try:
@@ -3070,6 +3063,21 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         )
         settingsLayout.addRow(_("Stream large stores:"), self.streamCheckBox)
 
+        self.textureMemorySpinBox = qt.QSpinBox()
+        self.textureMemorySpinBox.setRange(0, 1 << 20)
+        self.textureMemorySpinBox.setSingleStep(512)
+        self.textureMemorySpinBox.setSuffix(" MiB")
+        self.textureMemorySpinBox.setSpecialValueText(_("automatic (largest texture side, cubed)"))
+        self.textureMemorySpinBox.setValue(Settings.get(Settings.STREAM_3D_MEMORY, 0))
+        self.textureMemorySpinBox.setToolTip(
+            _(
+                "Most memory one streamed 3D texture may use. Automatic: the cube of the largest 3D texture "
+                "side the GPU accepts (2048 -> 8 GiB of 8-bit voxels), capped at 75% of the video memory where "
+                "it can be read (Windows, Linux). Applies when 3D rendering of a store starts"
+            )
+        )
+        settingsLayout.addRow(_("3D texture memory:"), self.textureMemorySpinBox)
+
         self.resetUnitsButton = qt.QPushButton(_("Reset display to mm"))
         settingsLayout.addRow(self.resetUnitsButton)
 
@@ -3100,6 +3108,9 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.resetUnitsButton.connect("clicked(bool)", OMEZarrLogic.resetDisplayUnits)
         self.autoRefineOnLoadCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.AUTO_REFINE, bool(b)))
         self.streamCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.STREAM, bool(b)))
+        self.textureMemorySpinBox.connect(
+            "valueChanged(int)", lambda mib: Settings.set(Settings.STREAM_3D_MEMORY, int(mib))
+        )
         self.detectLabelMapsCheckBox.connect(
             "toggled(bool)", lambda b: Settings.set(Settings.DETECT_LABEL_MAPS, bool(b))
         )
@@ -3410,6 +3421,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
                 Settings.DETECT_LABEL_MAPS,
                 Settings.STREAM,
                 Settings.STREAM_3D,
+                Settings.STREAM_3D_MEMORY,
             )
         }
         for key in self.savedSettings:
@@ -4096,6 +4108,18 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         mrHead.GetRASBounds(bounds)
         center = np.array([(bounds[0] + bounds[1]) / 2, (bounds[2] + bounds[3]) / 2, (bounds[4] + bounds[5]) / 2])
         detect = Streamer.detectGpuLimits
+
+        # The module setting overrides the automatic budget; 0 means the cube of the largest texture side.
+        slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": 1 << 30})
+        streamer = OMEZarrLogic.streamer(storePath)
+        Settings.set(Settings.STREAM_3D_MEMORY, 300)
+        streamer.detectGpuLimits(widget)
+        self.assertEqual(streamer.maxTextureBytes, 300 << 20)
+        Settings.set(Settings.STREAM_3D_MEMORY, 0)
+        streamer.detectGpuLimits(widget)
+        self.assertGreater(streamer.maxTextureDim, 0)
+        self.assertLessEqual(streamer.maxTextureBytes, streamer.maxTextureDim**3 * np.dtype(streamer.dtype).itemsize)
+        OMEZarrLogic.stopStreaming(storePath)
 
         def gpu(maxDim):
             def limits(self, widget):
