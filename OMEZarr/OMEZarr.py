@@ -73,15 +73,27 @@ FALLBACK_MAX_BYTES = 1 << 30
 STREAM_CACHE_BYTES = 512 << 20
 STREAM_MAX_CHUNKS_PER_VIEW = 512
 STREAM_READERS = 16  # measured on JS2: 16 fills neotoma level 0 in 18 s; 32 is barely faster and slows the tail
+# Slice views come first: while one waits for a chunk, no 3D or background read starts, and those
+# reads never hold more than this many readers, so a view's chunks start at once on a busy link.
+STREAM_BACKGROUND_READERS = STREAM_READERS // 2
+STREAM_PARTIAL_S = 0.25  # a view's plane is redrawn this often while its chunks arrive
 # Remote reads: requests to one server at a time start at STREAM_READERS and halve while it answers busy.
 HTTP_ATTEMPTS = 8  # per request, while the server answers busy or drops the connection
 HTTP_MAX_WAIT_S = 60.0  # longest pause asked by Retry-After that is honored as such
+# Requests one Slicer sends one server within a sliding window. JS2's object store answers 429 past
+# 1000 requests in 10 s from one client IP, counting every GET/HEAD/PUT (2026-10-01): stay under it.
+HTTP_WINDOW_REQUESTS = 900
+HTTP_WINDOW_S = 10.0
 DISK_CACHE_MIB = 10240  # default size of the on-disk cache of remote chunks
 # Streamed volume rendering: one texture for what the 3D view shows. These are the fallbacks when
 # the GPU's limits cannot be read (macOS reports no video memory; Apple GPUs allow 2048 per side).
 STREAM_3D_MAX_BYTES = 2 << 30
 STREAM_3D_MAX_DIM = 2048
 STREAM_3D_SETTLE_MS = 300  # the texture follows the camera once it has been still this long
+# The 3D view reads from the nearest voxel its opacity shows to this fraction of the view's width
+# deeper: what lies further behind an opaque surface is not seen, so it is not read.
+STREAM_3D_DEPTH_FRACTION = 0.5
+STREAM_3D_VISIBLE_OPACITY = 0.01  # opacity from which a voxel counts as seen
 
 # Slicer core lookup tables used to colour separate microscopy channels.
 CHANNEL_COLOR_NODE_IDS = {
@@ -1923,6 +1935,7 @@ class HttpGate:
         self.lastDecrease = 0.0
         self.busyRounds = 0  # consecutive rounds the server was busy: sets the delay without Retry-After
         self.busyAnswers = 0
+        self.starts = collections.deque()  # start times within the last HTTP_WINDOW_S
         self.condition = threading.Condition()
 
     def acquire(self):
@@ -1931,10 +1944,16 @@ class HttpGate:
             while True:
                 if HttpClient.shutdown.is_set():
                     raise InterruptedError("Slicer is closing")
-                wait = self.pausedUntil - time.monotonic()
+                now = time.monotonic()
+                while self.starts and now - self.starts[0] >= HTTP_WINDOW_S:
+                    self.starts.popleft()
+                wait = self.pausedUntil - now
+                if len(self.starts) >= HTTP_WINDOW_REQUESTS:  # paced below the server's request limit
+                    wait = max(wait, self.starts[0] + HTTP_WINDOW_S - now)
                 if wait <= 0 and self.inFlight < int(self.limit):
                     self.inFlight += 1
-                    return time.monotonic()
+                    self.starts.append(now)
+                    return now
                 self.condition.wait(min(1.0, wait) if wait > 0 else 1.0)
 
     def release(self, started, outcome="ok", retryAfter=None):
@@ -2457,9 +2476,12 @@ class Streamer:
         self.cache = collections.OrderedDict()  # (level, key) -> array, for levels other than the target
         self.cachedBytes = 0
         self.lock = threading.Lock()
-        self.requests = queue.PriorityQueue()  # (0 slice view, 0.5 3D view, 1 background), order, level, key
+        self.wake = threading.Condition(self.lock)  # readers holding back a 3D or background read
+        self.requests = queue.PriorityQueue()  # (0 slice view, 0.5 3D view, 0.75 3D fallback, 1 background), order, level, key
         self.order = itertools.count()
         self.inFlight = set()
+        self.backgroundInFlight = 0  # reads in flight for anything but the slice views
+        self.viewItems = set()  # (level, key) the slice views need now
         self.attempts = collections.Counter()
         self.failed = set()
         self.wanted = set()  # (level, key) the views need now
@@ -2488,6 +2510,7 @@ class Streamer:
         self.shown3D = None  # (level, region) in the 3D node
         self.cameraObservers = []
         self.reusedChunks = 0  # chunks copied from the previous 3D texture instead of read again
+        self.visibleBlocksCache = None  # (opacity function MTime, block centres RAS, block radius)
         self.reads = collections.deque(maxlen=4096)  # (end time, decoded bytes, seconds, from disk) per chunk read
         self.lastStatus = 0.0
         self.idleShown = False
@@ -2572,6 +2595,10 @@ class Streamer:
             return key in self.targetHave
         return level == self.residentLevel or item in self.cache or item in self.empty
 
+    def viewsWaiting(self):
+        """Whether a slice view still lacks a chunk, read or not yet (lock held)."""
+        return any(not self.has(item) for item in self.viewItems)
+
     def readLoop(self):
         while not self.stopped:
             try:
@@ -2586,11 +2613,18 @@ class Streamer:
                     continue  # the view has moved on
                 if priority >= 1 and level != self.fillLevel:
                     continue  # a level already filled
+                forView = priority == 0
+                if not forView and (self.backgroundInFlight >= STREAM_BACKGROUND_READERS or self.viewsWaiting()):
+                    self.requests.put((priority, _order, level, key))  # keeps its place in the queue
+                    self.wake.wait(0.2)
+                    continue
                 self.inFlight.add(item)
+                if not forView:
+                    self.backgroundInFlight += 1
             started = time.monotonic()
             grid = self.levels[level]
             try:
-                block = grid.read(key)
+                block = self.readChunk(level, key, forView)
             except Exception:  # noqa: BLE001 - retried, then reported and left empty
                 block = None
                 if not self.stopped:
@@ -2599,6 +2633,9 @@ class Streamer:
             fromCache = bool(grid.reader is not None and getattr(grid.reader.local, "fromCache", False))
             with self.lock:
                 self.inFlight.discard(item)
+                if not forView:
+                    self.backgroundInFlight -= 1
+                self.wake.notify_all()
                 self.reads.append((ended, block.nbytes if block is not None else 0, ended - started, fromCache))
                 if block is None:
                     self.attempts[item] += 1
@@ -2609,6 +2646,10 @@ class Streamer:
                     logging.error(f"OME-Zarr streaming: chunk {key} of level {level} left empty")
                     block = np.zeros([stop - start for start, stop in self.levels[level].bounds(key)], self.dtype)
                 self.store(item, block)
+
+    def readChunk(self, level, key, forView):
+        """One chunk, read off the GUI thread; ``forView``: for a slice view (tests watch this)."""
+        return self.levels[level].read(key)
 
     def store(self, item, block):
         """Keep a chunk that was read (lock held)."""
@@ -2733,6 +2774,8 @@ class Streamer:
         volumeItems |= contextItems
         with self.lock:
             self.wanted = viewItems | volumeItems
+            self.viewItems = viewItems
+            self.wake.notify_all()  # held-back reads may go once the views have what they need
             self.trimCache()
             missing = {item for item in self.wanted if not self.has(item) and item not in self.inFlight}
         for level, key in missing:
@@ -2745,16 +2788,19 @@ class Streamer:
         reuse = request.get("reuse", ())
         return all(key in reuse or self.has((request["level"], key)) for key in request["keys"])
 
-    def assemble(self, request, block=None):
+    def assemble(self, request, block=None, partial=False):
         """The request's region from its chunks (lock held), into ``block`` when given; None while
-        a chunk is missing. The chunks cover the region, so ``block`` needs no initialization."""
+        a chunk is missing. The chunks cover the region, so ``block`` needs no initialization.
+        ``partial``: the chunks read so far, over the level in memory where the others go."""
         level, region = request["level"], request["region"]
-        if not self.ready(request):
+        if not partial and not self.ready(request):
             return None
         grid = self.levels[level]
         if block is None:
-            block = np.zeros([stop - start for start, stop in region], self.dtype)
+            block = self.residentBlock(level, region) if partial else np.zeros([stop - start for start, stop in region], self.dtype)
         for key in request["keys"]:
+            if partial and key not in request.get("reuse", ()) and not self.has((level, key)):
+                continue
             target, source = [], []
             for (regionStart, regionStop), (chunkStart, chunkStop) in zip(region, grid.bounds(key)):
                 start, stop = max(regionStart, chunkStart), min(regionStop, chunkStop)
@@ -2769,6 +2815,21 @@ class Streamer:
                 data = self.chunk((level, key))
                 block[tuple(target)] = 0 if data is None else data[tuple(source)]
         return block
+
+    def residentBlock(self, level, region):
+        """``region`` of ``level`` sampled from the level wholly in memory, nearest voxel (lock held):
+        what a view shows where its own chunks have not arrived yet."""
+        shape = [stop - start for start, stop in region]
+        levelToResident = np.linalg.inv(self.ijkToRas[self.residentLevel]) @ self.ijkToRas[level]
+        linear = levelToResident[:3, :3]
+        if not np.allclose(linear, np.diag(np.diag(linear)), atol=1e-6):
+            return np.zeros(shape, self.dtype)  # levels not axis-aligned to each other: leave the gaps empty
+        indices = []
+        for axis, (start, stop) in enumerate(region):  # z, y, x
+            ijk = 2 - axis
+            index = np.floor(linear[ijk, ijk] * np.arange(start, stop) + levelToResident[ijk, 3] + 0.5).astype(int)
+            indices.append(np.clip(index, 0, self.residentArray.shape[axis] - 1))
+        return self.residentArray[np.ix_(*indices)].astype(self.dtype, copy=False)
 
     def copyDisplay(self, node):
         source, display = self.node.GetDisplayNode(), node.GetDisplayNode()
@@ -2816,14 +2877,23 @@ class Streamer:
         if self.node.GetScene() is None:  # the volume was deleted
             OMEZarrLogic.stopStreaming(self.path)
             return
+        now = time.monotonic()
         for viewName, request in list(self.views.items()):
             if request["shown"]:
                 continue
+            # The plane sharpens chunk by chunk: a view never keeps showing a place it has left.
             with self.lock:
-                block = self.assemble(request)
+                have = sum(1 for key in request["keys"] if self.has((request["level"], key)))
+                complete = have == len(request["keys"])
+                block = None
+                if complete:
+                    block = self.assemble(request)
+                elif have > request.get("drawn", -1) and now - request.get("drawnAt", 0.0) >= STREAM_PARTIAL_S:
+                    block = self.assemble(request, partial=True)
             if block is not None:
                 self.showOverlay(viewName, request, block)
-                request["shown"] = True
+                request["drawn"], request["drawnAt"] = have, now
+                request["shown"] = complete
         request3D = self.request3D
         if request3D and not request3D["shown"]:
             with self.lock:
@@ -2882,8 +2952,11 @@ class Streamer:
         )
 
     def pendingForViews(self):
+        """(chunks the slice views lack, chunks the 3D view lacks, reads in flight)."""
         with self.lock:
-            return sum(1 for item in self.wanted if not self.has(item)), len(self.inFlight)
+            views = sum(1 for item in self.viewItems if not self.has(item))
+            volume = sum(1 for item in self.wanted - self.viewItems if not self.has(item))
+            return views, volume, len(self.inFlight)
 
     def statusText(self):
         """One line for the status bar: background level, what the views wait for, and the rate."""
@@ -2893,9 +2966,12 @@ class Streamer:
             if self.fillLevel != self.target:
                 text += _(" (then down to level {level})").format(level=self.target)
             parts.append(text)
-        pending, inFlight = self.pendingForViews()
-        if pending:
-            parts.append(_("views waiting for {count} chunks").format(count=pending))
+        pendingViews, pendingVolume, inFlight = self.pendingForViews()
+        pending = pendingViews + pendingVolume
+        if pendingViews:
+            parts.append(_("slice views waiting for {count} chunks").format(count=pendingViews))
+        if pendingVolume:
+            parts.append(_("3D view waiting for {count} chunks").format(count=pendingVolume))
         chunksPerSecond, megabytesPerSecond, secondsPerChunk, cached = self.transferRate()
         if chunksPerSecond:
             text = _("{rate:.0f} chunks/s, {mb:.0f} MB/s decoded, {ms:.0f} ms per chunk, {n} in flight").format(
@@ -3130,11 +3206,29 @@ class Streamer:
         inside = (sides @ ras >= 0).all(axis=0)
         display = self.volume3D.GetDisplayNode() if self.volume3D is not None else None
         roi = display.GetROINode() if display is not None and display.GetCroppingEnabled() else None
+        roiBounds = None
         if roi is not None:
-            bounds = [0.0] * 6
-            roi.GetRASBounds(bounds)
+            roiBounds = [0.0] * 6
+            roi.GetRASBounds(roiBounds)
             for axis in range(3):
-                inside &= (ras[axis] >= bounds[2 * axis]) & (ras[axis] <= bounds[2 * axis + 1])
+                inside &= (ras[axis] >= roiBounds[2 * axis]) & (ras[axis] <= roiBounds[2 * axis + 1])
+        # In depth, only from the nearest surface the view shows to a fraction of its width behind it.
+        position = np.array(camera.GetPosition())
+        direction = np.array(camera.GetDirectionOfProjection())
+        direction /= np.linalg.norm(direction)
+        surface = self.visibleSurfaceDepth(sides, roiBounds, position, direction)
+        if surface is None:
+            return None  # nothing the opacity shows is in view: the context level will do
+        if np.isfinite(surface):
+            if camera.GetParallelProjection():
+                viewSize = 2.0 * camera.GetParallelScale()
+            else:  # the view's width at the focal point (the zoom), or at the surface when that is further
+                distance = max(camera.GetDistance(), surface)
+                viewSize = 2.0 * distance * np.tan(np.radians(camera.GetViewAngle() / 2.0))
+            viewSize *= max(1.0, width / height)  # the view's larger side
+            depth = direction @ (ras[:3] - position[:, None])
+            cell = float(np.linalg.norm(self.ijkToRas[self.contextLevel][:3, :3] @ (np.array(shape[::-1]) / (steps - 1))))
+            inside &= (depth >= surface - cell) & (depth <= surface + STREAM_3D_DEPTH_FRACTION * viewSize + cell)
         inside = inside.reshape(i.shape)
         grown = inside.copy()
         for axis in range(3):  # one cell more on each side, without wrapping around
@@ -3167,6 +3261,56 @@ class Streamer:
             if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
                 return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
         return None
+
+    def visibleBlocks(self):
+        """(RAS centres (3, n), radius) of the blocks of the coarsest level holding a voxel the 3D
+        view's opacity shows; (None, 0) without a volume rendering. Recomputed when the opacity changes."""
+        logic = slicer.modules.volumerendering.logic()
+        display = logic.GetFirstVolumeRenderingDisplayNode(self.volume3D) if self.volume3D is not None else None
+        propertyNode = display.GetVolumePropertyNode() if display is not None else None
+        if propertyNode is None or propertyNode.GetVolumeProperty() is None:
+            return None, 0.0
+        opacity = propertyNode.GetVolumeProperty().GetScalarOpacity()
+        stamp = opacity.GetMTime()
+        if self.visibleBlocksCache is not None and self.visibleBlocksCache[0] == stamp:
+            return self.visibleBlocksCache[1:]
+        level = len(self.levels) - 1  # contextArray always holds the coarsest level
+        voxels = self.contextArray
+        low, high = float(voxels.min()), float(voxels.max())
+        bins = 4096
+        values = np.linspace(low, high, bins)
+        shown = np.array([opacity.GetValue(v) for v in values]) > STREAM_3D_VISIBLE_OPACITY
+        scale = (bins - 1) / max(high - low, 1e-12)
+        side = max(1, int(np.ceil(max(voxels.shape) / 64)))  # about 64 blocks along the longest axis
+        blocks = [int(np.ceil(n / side)) for n in voxels.shape]
+        seen = np.zeros(blocks, bool)
+        for bz in range(blocks[0]):  # a slab at a time bounds the temporaries
+            slab = shown[np.clip((voxels[bz * side : (bz + 1) * side].astype(np.float32) - low) * scale, 0, bins - 1).astype(np.int32)]
+            plane = np.pad(slab.any(axis=0), ((0, blocks[1] * side - voxels.shape[1]), (0, blocks[2] * side - voxels.shape[2])))
+            seen[bz] = plane.reshape(blocks[1], side, blocks[2], side).any(axis=(1, 3))
+        kz, ky, kx = np.nonzero(seen)
+        ijk = np.stack([kx, ky, kz, np.zeros_like(kx)]).astype(float) * side + (side - 1) / 2.0
+        ijk[3] = 1.0
+        centres = (self.ijkToRas[level] @ ijk)[:3]
+        radius = 0.5 * side * self.spacing[level] * np.sqrt(3.0)
+        self.visibleBlocksCache = (stamp, centres, radius)
+        return centres, radius
+
+    def visibleSurfaceDepth(self, sides, roiBounds, position, direction):
+        """Distance along the view direction to the nearest thing the 3D view's opacity shows inside
+        the view (and the cropping ROI); None when nothing is. The whole depth without a volume rendering."""
+        centres, radius = self.visibleBlocks()
+        if centres is None:
+            return -np.inf
+        inView = (sides @ np.vstack([centres, np.ones(centres.shape[1])]) >= -radius * np.linalg.norm(sides[:, :3], axis=1)[:, None]).all(axis=0)
+        if roiBounds is not None:
+            for axis in range(3):
+                inView &= (centres[axis] >= roiBounds[2 * axis] - radius) & (centres[axis] <= roiBounds[2 * axis + 1] + radius)
+        depth = direction @ (centres - position[:, None])
+        inView &= depth > -radius
+        if not inView.any():
+            return None
+        return float(depth[inView].min()) - radius
 
     def update3D(self):
         if self.stopped or self.volume3D is None:
@@ -4264,6 +4408,8 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_ObliqueRoundTrip()
             self.test_Streaming()
             self.test_StreamingCompletes()
+            self.test_StreamingViewsFirst()
+            self.test_RequestPacing()
             self.test_StreamedVolumeRendering()
             self.test_StreamedVolumeRenderingGpuLimits()
             self.test_StreamingShardedRemote()
@@ -4790,6 +4936,107 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(direct.GetAttribute("OMEZarr.Level"), "0")
         self.assertIsNone(OMEZarrLogic.streamer(storePath))
 
+    def test_StreamingViewsFirst(self):
+        self.delayDisplay("Slice views are read before anything else, and sharpen as their chunks arrive")
+        import time
+
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        budget = OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4  # level 1 fills in the background
+        Settings.set(Settings.STREAM, True)
+        sliceNode = self.centerRedViewOn(mrHead, 2000.0)
+        bounds = [0.0] * 6
+        mrHead.GetRASBounds(bounds)
+        center = [(bounds[2 * axis] + bounds[2 * axis + 1]) / 2 for axis in range(3)]
+
+        # Background reads wait for `background`; the slice views' reads take `fineSeconds` each.
+        background = threading.Event()
+        fineSeconds = [0.0]
+        starts, fineEnds = [], []
+        readChunk = Streamer.readChunk
+
+        def gatedRead(streamer, level, key, forView):
+            starts.append((time.monotonic(), forView))
+            if forView:
+                time.sleep(fineSeconds[0])
+            else:
+                background.wait(20.0)
+            block = readChunk(streamer, level, key, forView)
+            if forView:
+                fineEnds.append(time.monotonic())
+            return block
+
+        Streamer.readChunk = gatedRead
+        try:
+            slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": budget})
+            streamer = OMEZarrLogic.streamer(storePath)
+            self.assertEqual((streamer.shownLevel, streamer.fillLevel), (2, 1))
+            # Zoomed out (loading fits the views to the volume): the views need nothing finer yet.
+            for viewName in ("Red", "Green", "Yellow"):
+                slicer.app.layoutManager().sliceWidget(viewName).mrmlSliceNode().SetFieldOfView(2000.0, 2000.0, 1.0)
+            self.assertTrue(self.waitFor(lambda: streamer.views == {}))
+            # The background fill holds at most half the readers, however many chunks it has queued...
+            self.assertTrue(self.waitFor(lambda: streamer.backgroundInFlight == STREAM_BACKGROUND_READERS))
+            self.assertFalse(self.waitFor(lambda: streamer.backgroundInFlight > STREAM_BACKGROUND_READERS, 0.5))
+            # ...so a view that needs level 0 is read at once by the readers left free.
+            sliceNode.SetFieldOfView(40.0, 40.0, 1.0)
+            self.assertTrue(self.waitFor(lambda: streamer.views.get("Red", {}).get("shown", False), 10.0))
+            self.assertEqual(streamer.overlays["Red"].GetAttribute("OMEZarr.Level"), "0")
+            self.assertEqual(sum(1 for _started, fine in starts if not fine), STREAM_BACKGROUND_READERS)
+
+            # Panned to new chunks: while the view waits for them, no background read starts, and
+            # its plane shows the new place at once, sharpening as the chunks come in.
+            fineSeconds[0] = 0.5
+            first = streamer.views["Red"]
+            sliceNode.JumpSliceByCentering(center[0] + 60.0, center[1], center[2])
+            self.assertTrue(self.waitFor(lambda: streamer.views.get("Red") is not first, 5.0))
+            released = time.monotonic()
+            background.set()
+            drawnPartly = []
+
+            def panned():
+                request = streamer.views.get("Red")
+                if request is None or request is first:
+                    return False
+                overlay = streamer.overlays.get("Red")
+                if not request["shown"] and request.get("drawn", -1) >= 0 and overlay is not None:
+                    level, region = request["level"], request["region"]
+                    expected = (self.ijkToRasArray(overlay)[:3, 3], (streamer.ijkToRas[level] @ np.array(
+                        [region[2][0], region[1][0], region[0][0], 1.0]))[:3])
+                    drawnPartly.append(bool(np.allclose(*expected, atol=1e-6)))
+                return request["shown"]
+
+            self.assertTrue(self.waitFor(panned, 20.0))
+            self.assertTrue(drawnPartly)
+            self.assertTrue(all(drawnPartly))  # drawn where the view is now, before its chunks were all in
+            lastFine = max(fineEnds)
+            self.assertEqual([t for t, fine in starts if not fine and released <= t < lastFine], [])
+            # Once the view has its chunks, the background fill goes on to the end.
+            self.assertTrue(self.waitFor(lambda: streamer.complete, 20.0))
+        finally:
+            Streamer.readChunk = readChunk
+            background.set()
+            OMEZarrLogic.stopStreaming(storePath, wait=True)
+
+    def test_RequestPacing(self):
+        self.delayDisplay("Requests to one server stay under its request-rate limit")
+        import time
+
+        saved = HTTP_WINDOW_REQUESTS, HTTP_WINDOW_S
+        globals()["HTTP_WINDOW_REQUESTS"], globals()["HTTP_WINDOW_S"] = 5, 0.5
+        try:
+            gate = HttpGate(16)
+            begin = time.monotonic()
+            for _ in range(5):
+                gate.release(gate.acquire())
+            self.assertLess(time.monotonic() - begin, 0.25)  # within the window's allowance: no wait
+            started = gate.acquire()  # the sixth waits until the first leaves the window
+            gate.release(started)
+            self.assertGreaterEqual(started - begin, 0.5 - 0.01)
+            self.assertLess(started - begin, 1.0)
+        finally:
+            globals()["HTTP_WINDOW_REQUESTS"], globals()["HTTP_WINDOW_S"] = saved
+
     def test_StreamedVolumeRendering(self):
         self.delayDisplay("Streamed volume rendering holds only what the 3D view shows, at its resolution")
         import time
@@ -4862,6 +5109,9 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "0")
         size = int(np.prod([stop - start for start, stop in region]))
         self.assertLess(size, full.size // 2)
+        # In depth too: from the nearest surface the opacity shows, not through the whole head.
+        low, high = streamer.regionRasBounds(level, region)
+        self.assertLess(high[1] - low[1], 0.5 * (bounds[3] - bounds[2]))
         (z0, z1), (y0, y1), (x0, x1) = region
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), full[z0:z1, y0:y1, x0:x1])
 
@@ -4886,14 +5136,15 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         roi.SetXYZ(*center)
         roi.SetRadiusXYZ(10.0, 10.0, 10.0)
         display.SetCroppingEnabled(True)
-        self.assertTrue(
-            self.waitFor(
-                lambda: streamer.request3D is not None
-                and streamer.request3D["shown"]
-                and int(np.prod([b - a for a, b in streamer.shown3D[1]])) < size // 4,
-                20.0,
-            )
-        )
+        cell = 15.0  # the camera's region is found on a lattice of about this spacing (mm) for this volume
+
+        def insideRoi():
+            if streamer.request3D is None or not streamer.request3D["shown"]:
+                return False
+            low, high = streamer.regionRasBounds(*streamer.shown3D)
+            return bool(np.all(low >= center - 10.0 - cell) and np.all(high <= center + 10.0 + cell))
+
+        self.assertTrue(self.waitFor(insideRoi, 20.0))
         (z0, z1), (y0, y1), (x0, x1) = streamer.shown3D[1]
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), full[z0:z1, y0:y1, x0:x1])
 
