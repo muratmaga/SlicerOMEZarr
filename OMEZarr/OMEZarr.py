@@ -23,6 +23,7 @@ import os
 import queue
 import re
 import threading
+import time
 import urllib.request
 
 import numpy as np
@@ -71,10 +72,11 @@ FALLBACK_MAX_BYTES = 1 << 30
 # a view whose visible plane needs more chunks than the limit is shown one level coarser.
 STREAM_CACHE_BYTES = 512 << 20
 STREAM_MAX_CHUNKS_PER_VIEW = 512
-STREAM_READERS = 8
-# Streamed volume rendering: one texture for what the 3D view shows, within these limits.
+STREAM_READERS = 16  # measured on JS2: 16 fills neotoma level 0 in 18 s; 32 is barely faster and slows the tail
+# Streamed volume rendering: one texture for what the 3D view shows. These are the fallbacks when
+# the GPU's limits cannot be read (macOS reports no video memory; Apple GPUs allow 2048 per side).
 STREAM_3D_MAX_BYTES = 2 << 30
-STREAM_3D_MAX_DIM = 2048  # a common GL_MAX_3D_TEXTURE_SIZE
+STREAM_3D_MAX_DIM = 2048
 STREAM_3D_SETTLE_MS = 300  # the texture follows the camera once it has been still this long
 
 # Slicer core lookup tables used to colour separate microscopy channels.
@@ -334,6 +336,7 @@ class Progress:
         self.fileName = fileName
         self.dialog = None
         self.owned = False
+        self.cancelled = False
 
     def __enter__(self):
         if slicer.util.mainWindow() and not slicer.app.testingEnabled():
@@ -345,7 +348,15 @@ class Progress:
                 self.owned = True
             else:
                 self.dialog.setCancelButtonText(_("Cancel"))  # Slicer leaves it out for a single file
+            # Only a click on Cancel cancels. QProgressDialog.wasCanceled also turns true without one:
+            # the IO manager's parentless, window-modal dialog sometimes emits canceled() as it forces
+            # itself on screen after its minimum duration (seen on macOS), which aborted good loads.
+            for button in self.dialog.findChildren(qt.QPushButton):
+                button.connect("clicked()", self.onCancelClicked)
         return self
+
+    def onCancelClicked(self):
+        self.cancelled = True
 
     def ioManagerDialog(self):
         """The dialog the IO manager opens around a load, labelled with the file name."""
@@ -367,7 +378,7 @@ class Progress:
             self.dialog.value = min(99, int(100 * done / max(1, total)))  # 100 resets and hides the dialog
         if text:
             self.dialog.labelText = text
-        return not self.dialog.wasCanceled
+        return not self.cancelled
 
     def __exit__(self, *args):
         if self.owned:
@@ -1815,7 +1826,7 @@ class Streamer:
         targetLevel,
         sliceViewNames,
         timeIndex=0,
-        readers=STREAM_READERS,
+        readers=None,
         cacheBytes=STREAM_CACHE_BYTES,
     ):
         from vtk.util import numpy_support
@@ -1852,11 +1863,17 @@ class Streamer:
         else:
             coarsest, _addZ = OMEZarrLogic.spatialDaskArray(images[-1], timeIndex, 0)
             self.contextArray = np.asarray(coarsest.compute()).astype(self.dtype)
+        self.contextImage = None  # a finer whole level for the 3D fallback, once it is in memory
+        self.contextRequest = None  # whole level being read to become the 3D fallback
+        self.maxTextureDim, self.maxTextureBytes = STREAM_3D_MAX_DIM, STREAM_3D_MAX_BYTES
         self.volume3D = None  # volume node the 3D view renders
         self.request3D = None  # {"level", "region", "keys", "shown"} for the 3D view
         self.shown3D = None  # (level, region) in the 3D node
         self.cameraObservers = []
         self.reusedChunks = 0  # chunks copied from the previous 3D texture instead of read again
+        self.reads = collections.deque(maxlen=4096)  # (end time, decoded bytes, seconds) per chunk read
+        self.lastStatus = 0.0
+        self.idleShown = False
 
         shape = self.levels[targetLevel].shape
         self.targetImageData = vtk.vtkImageData()
@@ -1888,7 +1905,7 @@ class Streamer:
             (slicer.mrmlScene, slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.EndCloseEvent, self.onSceneClosed))
         )
 
-        self.threads = [threading.Thread(target=self.readLoop, daemon=True) for _ in range(readers)]
+        self.threads = [threading.Thread(target=self.readLoop, daemon=True) for _ in range(readers or STREAM_READERS)]
         for thread in self.threads:
             thread.start()
         self.viewTimer = qt.QTimer()
@@ -1927,6 +1944,7 @@ class Streamer:
                 if priority < 1 and item not in self.wanted:
                     continue  # the view has moved on
                 self.inFlight.add(item)
+            started = time.monotonic()
             try:
                 block = self.levels[level].read(key)
             except Exception:  # noqa: BLE001 - retried, then reported and left empty
@@ -1934,6 +1952,8 @@ class Streamer:
                 logging.warning(f"OME-Zarr streaming: reading chunk {key} of level {level} failed", exc_info=True)
             with self.lock:
                 self.inFlight.discard(item)
+                ended = time.monotonic()
+                self.reads.append((ended, block.nbytes if block is not None else 0, ended - started))
                 if block is None:
                     self.attempts[item] += 1
                     if self.attempts[item] < self.RETRIES:
@@ -2050,12 +2070,20 @@ class Streamer:
             if request3D and not request3D["shown"]
             else set()
         )
+        contextRequest = self.contextRequest
+        contextItems = (
+            {(contextRequest["level"], key) for key in contextRequest["keys"]}
+            if contextRequest and not contextRequest["shown"]
+            else set()
+        )
+        volumeItems |= contextItems
         with self.lock:
             self.wanted = viewItems | volumeItems
             self.trimCache()
             missing = {item for item in self.wanted if not self.has(item) and item not in self.inFlight}
         for level, key in missing:
-            self.enqueue(0 if (level, key) in viewItems else 0.5, level, key)
+            item = (level, key)
+            self.enqueue(0 if item in viewItems else 0.75 if item in contextItems else 0.5, level, key)
 
     def ready(self, request):
         """Whether every chunk of the request has been read, or can be copied from the texture
@@ -2155,6 +2183,17 @@ class Streamer:
                 request3D["reuseFrom"] = request3D["reuseImage"] = None
                 request3D["reuse"] = set()
                 self.requestChunks()  # its chunks may now leave the cache
+        contextRequest = self.contextRequest
+        if contextRequest and not contextRequest["shown"]:
+            with self.lock:
+                ready = self.ready(contextRequest)
+            if ready:
+                imageData, voxels = self.newImage(self.levels[contextRequest["level"]].shape, self.dtype)
+                with self.lock:
+                    self.assemble(contextRequest, voxels)
+                contextRequest["shown"] = True
+                self.setContext(contextRequest["level"], imageData)
+                self.requestChunks()
         if not self.complete and len(self.targetHave) == len(self.targetKeys):
             self.switchToTarget()
             return
@@ -2163,17 +2202,95 @@ class Streamer:
     def progress(self):
         return len(self.targetHave) / max(1, len(self.targetKeys))
 
+    def transferRate(self, window=3.0):
+        """(chunks/s, decoded MB/s, mean seconds per chunk) over the last ``window`` seconds."""
+        now = time.monotonic()
+        with self.lock:
+            recent = [r for r in self.reads if now - r[0] <= window]
+        if not recent:
+            return 0.0, 0.0, 0.0
+        return len(recent) / window, sum(r[1] for r in recent) / window / 1e6, sum(r[2] for r in recent) / len(recent)
+
+    def pendingForViews(self):
+        with self.lock:
+            return sum(1 for item in self.wanted if not self.has(item)), len(self.inFlight)
+
+    def statusText(self):
+        """One line for the status bar: background level, what the views wait for, and the rate."""
+        parts = []
+        if not self.complete:
+            parts.append(_("level {level} {percent}%").format(level=self.target, percent=int(100 * self.progress())))
+        pending, inFlight = self.pendingForViews()
+        if pending:
+            parts.append(_("views waiting for {count} chunks").format(count=pending))
+        chunksPerSecond, megabytesPerSecond, secondsPerChunk = self.transferRate()
+        if chunksPerSecond:
+            parts.append(
+                _("{rate:.0f} chunks/s, {mb:.0f} MB/s decoded, {ms:.0f} ms per chunk, {n} in flight").format(
+                    rate=chunksPerSecond, mb=megabytesPerSecond, ms=1000 * secondsPerChunk, n=inFlight
+                )
+            )
+        if not parts:
+            return None
+        return _("Streaming {name}: ").format(name=self.node.GetName()) + " · ".join(parts)
+
+    LEVEL_CORNER = 3  # upper right; Slicer's own slice annotations use the other corners
+
+    def levelText(self, level):
+        return _("OME-Zarr level {level} · {size:g} µm").format(level=level, size=round(self.spacing[level] * 1000, 1))
+
+    def viewWidgets(self):
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return []
+        widgets = []
+        for viewName in self.sliceViewNames:
+            sliceWidget = layoutManager.sliceWidget(viewName)
+            if sliceWidget is not None:
+                widgets.append((viewName, sliceWidget.sliceView()))
+        if layoutManager.threeDViewCount:
+            widgets.append(("3D", layoutManager.threeDWidget(0).threeDView()))
+        return widgets
+
+    def updateLevelLabels(self, clear=False):
+        """Show, in each view's corner, the resolution level it displays."""
+        for viewName, view in self.viewWidgets():
+            if viewName == "3D":
+                text = self.levelText(self.shown3D[0]) if (self.volume3D is not None and self.shown3D) else ""
+            else:
+                request, overlay = self.views.get(viewName), self.overlays.get(viewName)
+                shown = int(overlay.GetAttribute("OMEZarr.Level")) if overlay is not None and overlay.GetScene() else None
+                text = self.levelText(shown if shown is not None else self.shownLevel)
+                if request is not None and not request["shown"]:
+                    text += _(" (loading level {level})").format(level=request["level"])
+            if clear:
+                text = ""
+            try:
+                annotation = view.cornerAnnotation()
+            except AttributeError:
+                continue
+            if annotation.GetText(self.LEVEL_CORNER) != text:
+                annotation.SetText(self.LEVEL_CORNER, text)
+                view.scheduleRender()
+
     def reportProgress(self):
-        if self.complete:
+        """Keep the status bar current while anything is being read (it does not time out)."""
+        now = time.monotonic()
+        if now - self.lastStatus < 0.5:
             return
-        percent = int(100 * self.progress())
-        if percent != self.lastPercent:
-            self.lastPercent = percent
+        self.lastStatus = now
+        self.updateLevelLabels()
+        text = self.statusText()
+        if text:
+            self.idleShown = False
+            slicer.util.showStatusMessage(text, 0)
+        elif not self.idleShown:
+            self.idleShown = True
             slicer.util.showStatusMessage(
-                _("Reading level {level} of {name}: {percent}%").format(
-                    level=self.target, name=self.node.GetName(), percent=percent
+                _("Streaming {name}: level {level} loaded, views up to date").format(
+                    name=self.node.GetName(), level=self.target
                 ),
-                3000,
+                5000,
             )
 
     def switchToTarget(self):
@@ -2198,6 +2315,7 @@ class Streamer:
         if self.target == 0 and self.volume3D is None:
             OMEZarrLogic.stopStreaming(self.path)  # nothing finer to show
         else:
+            self.planContext()
             self.updateViews()  # views keep blocks only where they need more than the target level
 
     # -- 3D view (main thread) --
@@ -2222,7 +2340,9 @@ class Streamer:
         node.SetAttribute("OMEZarr.Path", normalizeStorePath(self.path))
         node.SetAttribute("OMEZarr.Streamed3D", "1")
         self.volume3D = node
+        self.detectGpuLimits(widget)
         self.showContext3D()
+        self.planContext()
         volumeRenderingLogic = slicer.modules.volumerendering.logic()
         display = volumeRenderingLogic.CreateDefaultVolumeRenderingNodes(node)
         display.SetVisibility(True)
@@ -2235,7 +2355,7 @@ class Streamer:
     def frameCamera(self, cameraNode):
         """Fit the specimen in the 3D view, keeping the viewing direction. The level follows the zoom,
         so a view left far away (or zoomed out in parallel projection) would only ever show the coarsest one."""
-        low, high = self.regionRasBounds(self.contextLevel, tuple((0, n) for n in self.contextArray.shape))
+        low, high = self.regionRasBounds(self.contextLevel, tuple((0, n) for n in self.levels[self.contextLevel].shape))
         center = (low + high) / 2.0
         radius = 0.55 * float(np.linalg.norm(high - low))  # half the diagonal, with a margin
         camera = cameraNode.GetCamera()
@@ -2340,7 +2460,7 @@ class Streamer:
             dims = [stop - start for start, stop in region]
             if min(dims) <= 0:
                 return None
-            if max(dims) <= STREAM_3D_MAX_DIM and int(np.prod(dims)) * itemSize <= STREAM_3D_MAX_BYTES:
+            if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
                 return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
         return None
 
@@ -2434,9 +2554,78 @@ class Streamer:
         self.volume3D.SetAttribute("OMEZarr.Level", str(level))
 
     def showContext3D(self):
-        self.setVolume3D(self.contextArray, self.ijkToRas[self.contextLevel], self.contextLevel)
-        shape = self.contextArray.shape
-        self.shown3D = (self.contextLevel, tuple((0, n) for n in shape))
+        image = self.contextImage if self.contextImage is not None else self.contextArray
+        self.setVolume3D(image, self.ijkToRas[self.contextLevel], self.contextLevel)
+        self.shown3D = (self.contextLevel, tuple((0, n) for n in self.levels[self.contextLevel].shape))
+
+    def detectGpuLimits(self, widget):
+        """Largest 3D texture side the GPU accepts, and the memory a 3D texture may use: the volume
+        rendering "GPU memory size" (view node or settings) when set; otherwise a cube of the largest
+        side (2048 -> 8 Gi voxels), capped at 75% of the video memory where VTK can read it (Windows,
+        Linux; macOS reports none)."""
+        try:
+            renderWindow = widget.threeDView().renderWindow()
+            renderWindow.MakeCurrent()
+            size = int(vtk.vtkTextureObject.GetMaximumTextureSize3D(renderWindow))
+            if size > 0:
+                self.maxTextureDim = size
+        except Exception:  # noqa: BLE001 - keep the fallback
+            logging.debug("OME-Zarr streaming: could not read the maximum 3D texture size", exc_info=True)
+        budget = 0
+        try:
+            budget = int(widget.mrmlViewNode().GetGPUMemorySize()) << 20  # MB, 0 = automatic
+        except Exception:  # noqa: BLE001
+            pass
+        if not budget:
+            try:
+                budget = int(float(slicer.app.userSettings().value("VolumeRendering/GPUMemorySize") or 0)) << 20
+            except (TypeError, ValueError):
+                budget = 0
+        if not budget:
+            budget = self.maxTextureDim**3 * np.dtype(self.dtype).itemsize
+            try:
+                gpus = vtk.vtkGPUInfoList()
+                gpus.Probe()
+                video = max((gpus.GetGPUInfo(i).GetDedicatedVideoMemory() for i in range(gpus.GetNumberOfGPUs())), default=0)
+                if video > 0:
+                    budget = min(budget, int(0.75 * video))
+            except Exception:  # noqa: BLE001 - keep the cube
+                pass
+        self.maxTextureBytes = budget or STREAM_3D_MAX_BYTES
+        logging.info(
+            f"OME-Zarr streaming: 3D textures up to {self.maxTextureDim} voxels per side, {self.maxTextureBytes / 2**30:.1f} GiB"
+        )
+
+    def fitsTexture(self, level):
+        shape = self.levels[level].shape
+        return max(shape) <= self.maxTextureDim and int(np.prod(shape)) * np.dtype(self.dtype).itemsize <= self.maxTextureBytes
+
+    def planContext(self):
+        """Make the 3D fallback the finest whole level the GPU holds, never finer than the level kept
+        in memory: that level itself (shared with the volume node) once streamed, or a coarser one
+        read once. When it is full resolution, the 3D view no longer follows the camera."""
+        if self.volume3D is None:
+            return
+        fitting = next((level for level in range(len(self.levels)) if self.fitsTexture(level)), len(self.levels) - 1)
+        level = max(self.target, fitting)
+        if level >= self.contextLevel:
+            return
+        if level == self.target:
+            if self.complete:
+                self.setContext(level, self.targetImageData)
+            return
+        if self.contextRequest is None or self.contextRequest["level"] != level:
+            region = tuple((0, n) for n in self.levels[level].shape)
+            self.contextRequest = {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
+            self.requestChunks()
+
+    def setContext(self, level, image):
+        self.contextLevel, self.contextImage = level, image
+        if self.volume3D is not None:
+            if self.shown3D is None or self.shown3D[0] >= level:  # showing something coarser: upgrade now
+                self.showContext3D()
+            self.request3D = None
+            self.update3D()
 
     def show3D(self, level, region, image):
         ijkToRas = self.ijkToRas[level].copy()
@@ -2450,6 +2639,9 @@ class Streamer:
                 self.joinReaders()
             return
         self.disable3D(stopWhenDone=False)
+        self.updateLevelLabels(clear=not self.complete or self.node.GetScene() is None)
+        if not self.complete and slicer.util.mainWindow():
+            slicer.util.showStatusMessage("", 1)  # the streaming line does not time out by itself
         self.stopped = True
         self.viewTimer.stop()
         self.pollTimer.stop()
@@ -3266,6 +3458,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_Streaming()
             self.test_StreamingCompletes()
             self.test_StreamedVolumeRendering()
+            self.test_StreamedVolumeRenderingGpuLimits()
             if os.environ.get("OMEZARR_TEST_REMOTE"):
                 self.test_RemoteStore()
         finally:
@@ -3790,7 +3983,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         node3D = streamer.volume3D
         self.assertIsNotNone(node3D)
         self.assertIs(OMEZarrLogic.startVolumeRendering(storePath), node3D)
-        self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "2")
+        self.assertIn(node3D.GetAttribute("OMEZarr.Level"), ("2", "1"))  # coarsest, until level 1 has streamed
 
         # Whenever the rendered image changes, its dimensions and voxels must agree: volume rendering
         # renders synchronously on the change and uploads that buffer to the GPU.
@@ -3803,7 +3996,11 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
                     mismatches.append(image.GetDimensions())
 
         imageObserver = node3D.AddObserver(slicer.vtkMRMLVolumeNode.ImageDataModifiedEvent, checkImage)
-        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), np.asarray(multiscales.images[2].data))
+        # Level 1 fits the GPU: once streamed it is the 3D fallback, sharing the volume node's voxels.
+        self.assertTrue(self.waitFor(lambda: streamer.complete and streamer.contextLevel == 1, 20.0))
+        self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "1")
+        self.assertIs(node3D.GetImageData(), streamer.targetImageData)
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), np.asarray(multiscales.images[1].data))
         display = node3D.GetDisplayNode()
         self.assertTrue(display.IsA("vtkMRMLVolumeRenderingDisplayNode") and display.GetVisibility())
 
@@ -3825,10 +4022,14 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             level, region = streamer.shown3D
             return int(level), region
 
-        # Far away, a voxel of the coarsest level is smaller than a pixel: nothing finer is read.
+        # Far away, the fallback level is detailed enough: nothing finer is read.
         lookFrom(20000.0)
         self.assertIsNone(streamer.request3D)
-        self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "2")
+        self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "1")
+        streamer.updateLevelLabels()
+        self.assertIn("level 1", widget.threeDView().cornerAnnotation().GetText(Streamer.LEVEL_CORNER))
+        redLabel = slicer.app.layoutManager().sliceWidget("Red").sliceView().cornerAnnotation()
+        self.assertIn("OME-Zarr level", redLabel.GetText(Streamer.LEVEL_CORNER))
 
         # Close up, the view needs level 0, but only the part of the volume in front of the camera.
         lookFrom(60.0)
@@ -3843,8 +4044,8 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
 
         # A small camera move copies what the previous texture already holds instead of reading it again.
         reused = streamer.reusedChunks
-        cameraNode.SetFocalPoint(*(center + [3.0, 0.0, 0.0]))
-        cameraNode.SetPosition(*(center + [3.0, -60.0, 0.0]))
+        cameraNode.SetFocalPoint(*(center + [15.0, 0.0, 0.0]))
+        cameraNode.SetPosition(*(center + [15.0, -60.0, 0.0]))
         self.assertTrue(
             self.waitFor(
                 lambda: streamer.request3D is not None
@@ -3879,6 +4080,60 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         OMEZarrLogic.stopVolumeRendering(storePath)
         self.assertIsNone(node3D.GetScene())
         self.assertIsNone(streamer.volume3D)
+
+    def test_StreamedVolumeRenderingGpuLimits(self):
+        self.delayDisplay("The 3D fallback is the finest whole level the GPU holds; full resolution stays put")
+        import time
+
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        Settings.set(Settings.STREAM, True)
+        Settings.set(Settings.STREAM_3D, True)
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        widget = slicer.app.layoutManager().threeDWidget(0)
+        cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(widget.mrmlViewNode())
+        bounds = [0.0] * 6
+        mrHead.GetRASBounds(bounds)
+        center = np.array([(bounds[0] + bounds[1]) / 2, (bounds[2] + bounds[3]) / 2, (bounds[4] + bounds[5]) / 2])
+        detect = Streamer.detectGpuLimits
+
+        def gpu(maxDim):
+            def limits(self, widget):
+                self.maxTextureDim, self.maxTextureBytes = maxDim, 1 << 34
+            Streamer.detectGpuLimits = limits
+
+        def lookFrom(distance):
+            cameraNode.SetFocalPoint(*center)
+            cameraNode.SetPosition(*(center + [0.0, -distance, 0.0]))
+            slicer.app.processEvents()
+            deadline = time.time() + 2 * STREAM_3D_SETTLE_MS / 1000.0
+            self.waitFor(lambda: time.time() > deadline, 5.0)
+
+        try:
+            # A GPU too small for level 0 (256 voxels a side): level 1 is read once as the fallback.
+            gpu(140)
+            slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": 1 << 30})
+            streamer = OMEZarrLogic.streamer(storePath)
+            self.assertEqual(streamer.target, 0)
+            self.assertTrue(self.waitFor(lambda: streamer.contextLevel == 1 and streamer.shown3D[0] == 1, 20.0))
+            np.testing.assert_array_equal(
+                slicer.util.arrayFromVolume(streamer.volume3D), np.asarray(multiscales.images[1].data)
+            )
+            OMEZarrLogic.stopStreaming(storePath)
+
+            # A GPU that holds level 0: once streamed it is rendered whole and no longer follows the camera.
+            gpu(4096)
+            slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": 1 << 30})
+            streamer = OMEZarrLogic.streamer(storePath)
+            self.assertTrue(self.waitFor(lambda: streamer.complete and streamer.contextLevel == 0, 20.0))
+            node3D = streamer.volume3D
+            self.assertIs(node3D.GetImageData(), streamer.targetImageData)
+            for distance in (60.0, 20000.0, 30.0):
+                lookFrom(distance)
+                self.assertIsNone(streamer.request3D)
+                self.assertIs(node3D.GetImageData(), streamer.targetImageData)
+        finally:
+            Streamer.detectGpuLimits = detect
 
     def test_MultiViewRefine(self):
         self.delayDisplay("Each slice view keeps its own refined block with the coarse window/level")
