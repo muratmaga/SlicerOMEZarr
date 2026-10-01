@@ -3469,8 +3469,8 @@ class Streamer:
 
     def opacityLookup(self):
         """(opacity per value bin, low value, bins per value unit, opacity unit distance in mm) of the
-        3D view's scalar opacity over the coarsest level's values; None without a volume rendering.
-        Recomputed when the opacity changes."""
+        3D view's scalar opacity over the values of the level the rays are marched through (see
+        marchLevel); None without a volume rendering. Recomputed when the opacity or that level changes."""
         logic = slicer.modules.volumerendering.logic()
         display = logic.GetFirstVolumeRenderingDisplayNode(self.volume3D) if self.volume3D is not None else None
         propertyNode = display.GetVolumePropertyNode() if display is not None else None
@@ -3478,14 +3478,26 @@ class Streamer:
         if volumeProperty is None:
             return None
         opacity = volumeProperty.GetScalarOpacity()
-        stamp = (opacity.GetMTime(), volumeProperty.GetMTime())
+        level, voxels = self.marchLevel()
+        stamp = (opacity.GetMTime(), volumeProperty.GetMTime(), level)
         if self.opacityCache is None or self.opacityCache[0] != stamp:
-            low, high = float(self.contextArray.min()), float(self.contextArray.max())
+            low, high = float(voxels.min()), float(voxels.max())
             bins = 4096
             table = np.array([opacity.GetValue(v) for v in np.linspace(low, high, bins)])
             unit = float(volumeProperty.GetScalarOpacityUnitDistance()) or 1.0
             self.opacityCache = (stamp, table, low, (bins - 1) / max(high - low, 1e-12), unit)
         return self.opacityCache[1:]
+
+    def marchLevel(self):
+        """(level, voxels) the 3D view's rays are marched through: the finest level wholly in
+        memory. The coarsest level averages thin structures away, so rays through it see too deep
+        and the regions come out deeper than the view needs. The cost is per ray sample, not per
+        voxel, so the finer level costs the same."""
+        with self.lock:
+            level, voxels = self.residentLevel, self.residentArray
+        if voxels is None or voxels.shape != self.levels[level].shape:
+            level, voxels = len(self.levels) - 1, self.contextArray
+        return level, voxels
 
     def visibleDepthRange(self, camera, width, height, roiBounds):
         """(near, far): distances along the view direction between the nearest voxel the 3D view's
@@ -3501,8 +3513,7 @@ class Streamer:
         if lookup is None:
             return -np.inf, np.inf
         table, low, binsPerValue, unit = lookup
-        level = len(self.levels) - 1  # contextArray always holds the coarsest level
-        voxels = self.contextArray
+        level, voxels = self.marchLevel()
         rasToIjk = np.linalg.inv(self.ijkToRas[level])
 
         position = np.array(camera.GetPosition())
