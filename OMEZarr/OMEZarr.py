@@ -108,10 +108,10 @@ DISK_CACHE_MIB = 10240  # default size of the on-disk cache of remote chunks
 # the GPU's limits cannot be read (macOS reports no video memory; Apple GPUs allow 2048 per side).
 STREAM_3D_MAX_BYTES = 2 << 30
 STREAM_3D_MAX_DIM = 2048
-# Most memory one 3D texture takes when the "3D texture memory" setting is automatic: building and
-# uploading a texture costs about 1 s per GB on JS2 (A100), and more voxels than ~2 per screen pixel
-# do not sharpen the image.
-STREAM_3D_AUTO_BYTES = 4 << 30
+# Most memory one 3D texture takes when the "3D texture memory" setting is automatic. A region
+# that does not fit is shown one level coarser, whole: a texture is never cut inside what the
+# view sees. Building a texture costs about 0.5 s per GB on JS2 (A100); raise the setting there.
+STREAM_3D_AUTO_BYTES = 8 << 30
 # Largest 3D texture side when the "3D texture side" setting is automatic. Not read from the GPU:
 # OpenGL's answer has proven unreliable (an A100 that takes 4096 reported 2048). Apple GPUs take 2048.
 STREAM_3D_DEFAULT_SIDE = 2048 if sys.platform == "darwin" else 4096
@@ -3461,31 +3461,11 @@ class Streamer:
             dims = [stop - start for start, stop in region]
             if min(dims) <= 0:
                 return None
-            region = self.trimToTexture(level, region, direction)
-            if region is not None:
+            # The whole visible region or nothing at this level: a texture cut inside what the view
+            # sees ends the specimen at its face. What does not fit is shown one level coarser.
+            if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
                 return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
         return None
-
-    def trimToTexture(self, level, region, direction):
-        """``region`` of ``level``, cut at its far end along the axis closest to the view direction
-        until it fits one 3D texture: what is nearest the camera is kept. None when it cannot fit
-        (too wide across the view, or less than a chunk deep would be left)."""
-        itemSize = np.dtype(self.dtype).itemsize
-        dims = [stop - start for start, stop in region]
-        if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
-            return region
-        towards = np.linalg.inv(self.ijkToRas[level])[:3, :3] @ direction  # i, j, k
-        axis = 2 - int(np.argmax(np.abs(towards)))  # z, y, x index of the depth axis
-        across = [d for a, d in enumerate(dims) if a != axis]
-        if max(across) > self.maxTextureDim:
-            return None
-        depth = min(self.maxTextureDim, self.maxTextureBytes // (itemSize * int(np.prod(across))))
-        if depth < min(dims[axis], 64):
-            return None
-        start, stop = region[axis]
-        trimmed = list(region)
-        trimmed[axis] = (start, start + depth) if towards[2 - axis] > 0 else (stop - depth, stop)
-        return tuple(trimmed)
 
     def opacityLookup(self):
         """(opacity per value bin, low value, bins per value unit, opacity unit distance in mm) of the
@@ -4241,14 +4221,15 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.textureMemorySpinBox.setRange(0, 1 << 20)
         self.textureMemorySpinBox.setSingleStep(512)
         self.textureMemorySpinBox.setSuffix(" MiB")
-        self.textureMemorySpinBox.setSpecialValueText(_("automatic (4 GiB)"))
+        self.textureMemorySpinBox.setSpecialValueText(_("automatic (8 GiB)"))
         self.textureMemorySpinBox.setValue(Settings.get(Settings.STREAM_3D_MEMORY, 0))
         self.textureMemorySpinBox.setToolTip(
             _(
-                "Most memory one streamed 3D texture may use. Automatic: 4 GiB, or less when the cube of the "
+                "Most memory one streamed 3D texture may use. Automatic: 8 GiB, or less when the cube of the "
                 "3D texture side, 75% of the video memory (where it can be read) or a quarter of the RAM is "
-                "smaller. Larger textures show more of the volume at full resolution but take longer to build "
-                "after each camera move. Applies when 3D rendering of a store starts"
+                "smaller. A view that needs more than this at a level is shown one level coarser. Larger textures "
+                "show more at full resolution but take longer to build after each camera move (about 0.5 s per GB "
+                "on a fast GPU). Applies when 3D rendering of a store starts"
             )
         )
         settingsLayout.addRow(_("3D texture memory:"), self.textureMemorySpinBox)
@@ -5440,13 +5421,22 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertGreater(clearFar, back - 10.0)  # transparent: the rays see through to the back
         self.assertIsNone(depthWith([(0, 0.0), (10000, 0.0)]))  # nothing shown: nothing to read
 
-        # Too deep for one texture: the far end is cut, the end nearest the camera kept.
+        # A visible region too big for one texture at the fine level is shown whole at a coarser one,
+        # never cut: with the texture limited, the request moves to level 1.
         streamer.maxTextureDim, streamer.maxTextureBytes = 100, 1 << 30
-        region = ((0, 50), (0, 250), (0, 60))  # z, y, x: deep along y
-        ahead = np.array(streamer.ijkToRas[0][:3, 1]) / np.linalg.norm(streamer.ijkToRas[0][:3, 1])  # RAS of +j
-        self.assertEqual(streamer.trimToTexture(0, region, ahead), ((0, 50), (0, 100), (0, 60)))
-        self.assertEqual(streamer.trimToTexture(0, region, -ahead), ((0, 50), (150, 250), (0, 60)))
-        self.assertIsNone(streamer.trimToTexture(0, ((0, 50), (0, 250), (0, 160)), ahead))  # too wide across the view
+        propertyNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumePropertyNode")
+        opacity = vtk.vtkPiecewiseFunction()
+        for value, alpha in [(0, 0.0), (30, 0.0), (31, 1.0), (10000, 1.0)]:
+            opacity.AddPoint(value, alpha)
+        propertyNode.GetVolumeProperty().SetScalarOpacity(opacity)
+        display.SetAndObserveVolumePropertyNodeID(propertyNode.GetID())
+        cameraNode.SetPosition(*(center + [0.0, -60.0, 0.0]))  # close up: the view wants level 0
+        request = streamer.volumeRequest()
+        if request is None:  # the level already shown whole (the context) is the coarser level that fits
+            self.assertEqual(streamer.contextLevel, 1)
+        else:
+            self.assertGreater(request["level"], 0)
+            self.assertLessEqual(max(stop - start for start, stop in request["region"]), 100)
         OMEZarrLogic.stopStreaming(storePath, wait=True)
 
     def test_RequestPacing(self):
