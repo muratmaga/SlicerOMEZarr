@@ -97,10 +97,13 @@ DISK_CACHE_MIB = 10240  # default size of the on-disk cache of remote chunks
 STREAM_3D_MAX_BYTES = 2 << 30
 STREAM_3D_MAX_DIM = 2048
 STREAM_3D_SETTLE_MS = 300  # the texture follows the camera once it has been still this long
-# The 3D view reads from the nearest voxel its opacity shows to this fraction of the view's width
-# deeper: what lies further behind an opaque surface is not seen, so it is not read.
-STREAM_3D_DEPTH_FRACTION = 0.5
+# The 3D view reads, in depth, from the nearest voxel its opacity shows to where the opacity
+# accumulated along the view's rays reaches STREAM_3D_OPAQUE: what lies behind is not seen, so it
+# is not read. An opaque rendering stops just behind the surface; a transparent one reads deeper.
+# The rays (STREAM_3D_RAYS per side) are marched through the coarsest level, always in memory.
+STREAM_3D_OPAQUE = 0.95
 STREAM_3D_VISIBLE_OPACITY = 0.01  # opacity from which a voxel counts as seen
+STREAM_3D_RAYS = 32
 
 # Slicer core lookup tables used to colour separate microscopy channels.
 CHANNEL_COLOR_NODE_IDS = {
@@ -2521,7 +2524,7 @@ class Streamer:
         self.shown3D = None  # (level, region) in the 3D node
         self.cameraObservers = []
         self.reusedChunks = 0  # chunks copied from the previous 3D texture instead of read again
-        self.visibleBlocksCache = None  # (opacity function MTime, block centres RAS, block radius)
+        self.opacityCache = None  # (MTimes, opacity per value bin, low value, bins per value, unit distance mm)
         self.reads = collections.deque(maxlen=4096)  # (end time, decoded bytes, seconds, from disk) per chunk read
         self.lastStatus = 0.0
         self.idleShown = False
@@ -2939,6 +2942,7 @@ class Streamer:
                 request3D["reuseFrom"] = request3D["reuseImage"] = None
                 request3D["reuse"] = set()
                 self.requestChunks()  # its chunks may now leave the cache
+                self.cameraTimer.start()  # a finer level may come next
         contextRequest = self.contextRequest
         if contextRequest and not contextRequest["shown"]:
             with self.lock:
@@ -3210,10 +3214,11 @@ class Streamer:
         ras = (self.ijkToRas[level] @ corners.T)[:3]
         return ras.min(axis=1), ras.max(axis=1)
 
-    def volumeRequest(self):
+    def volumeRequest(self, finest=0):
         """What the 3D view needs: the part of the volume inside the camera's view (and the
-        cropping ROI), at the coarsest level whose voxels are no larger than a screen pixel at
-        the focal point, within the texture limits. None when the context level will do."""
+        cropping ROI) between the depths it shows, at the coarsest level whose voxels are no larger
+        than a screen pixel at the focal point (never finer than ``finest``), within the texture
+        limits. None when the context level will do."""
         widget, cameraNode = self.cameraNode3D()
         if cameraNode is None:
             return None
@@ -3243,23 +3248,18 @@ class Streamer:
             roi.GetRASBounds(roiBounds)
             for axis in range(3):
                 inside &= (ras[axis] >= roiBounds[2 * axis]) & (ras[axis] <= roiBounds[2 * axis + 1])
-        # In depth, only from the nearest surface the view shows to a fraction of its width behind it.
+        # In depth, only between the nearest voxel the view shows and where its rays turn opaque.
         position = np.array(camera.GetPosition())
         direction = np.array(camera.GetDirectionOfProjection())
         direction /= np.linalg.norm(direction)
-        surface = self.visibleSurfaceDepth(sides, roiBounds, position, direction)
-        if surface is None:
+        depthRange = self.visibleDepthRange(camera, width, height, roiBounds)
+        if depthRange is None:
             return None  # nothing the opacity shows is in view: the context level will do
-        if np.isfinite(surface):
-            if camera.GetParallelProjection():
-                viewSize = 2.0 * camera.GetParallelScale()
-            else:  # the view's width at the focal point (the zoom), or at the surface when that is further
-                distance = max(camera.GetDistance(), surface)
-                viewSize = 2.0 * distance * np.tan(np.radians(camera.GetViewAngle() / 2.0))
-            viewSize *= max(1.0, width / height)  # the view's larger side
+        near, far = depthRange
+        if np.isfinite(near):
             depth = direction @ (ras[:3] - position[:, None])
             cell = float(np.linalg.norm(self.ijkToRas[self.contextLevel][:3, :3] @ (np.array(shape[::-1]) / (steps - 1))))
-            inside &= (depth >= surface - cell) & (depth <= surface + STREAM_3D_DEPTH_FRACTION * viewSize + cell)
+            inside &= (depth >= near - cell) & (depth <= far + cell)
         inside = inside.reshape(i.shape)
         grown = inside.copy()
         for axis in range(3):  # one cell more on each side, without wrapping around
@@ -3277,6 +3277,7 @@ class Streamer:
         else:
             pixel = 2.0 * camera.GetDistance() * np.tan(np.radians(camera.GetViewAngle() / 2.0)) / height
         level = next((lv for lv in reversed(range(len(self.levels))) if self.spacing[lv] <= pixel * 1.001), 0)
+        level = max(level, finest)
         itemSize = np.dtype(self.dtype).itemsize
         for level in range(level, self.contextLevel):
             index = np.linalg.inv(self.ijkToRas[level]) @ points
@@ -3293,55 +3294,108 @@ class Streamer:
                 return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
         return None
 
-    def visibleBlocks(self):
-        """(RAS centres (3, n), radius) of the blocks of the coarsest level holding a voxel the 3D
-        view's opacity shows; (None, 0) without a volume rendering. Recomputed when the opacity changes."""
+    def opacityLookup(self):
+        """(opacity per value bin, low value, bins per value unit, opacity unit distance in mm) of the
+        3D view's scalar opacity over the coarsest level's values; None without a volume rendering.
+        Recomputed when the opacity changes."""
         logic = slicer.modules.volumerendering.logic()
         display = logic.GetFirstVolumeRenderingDisplayNode(self.volume3D) if self.volume3D is not None else None
         propertyNode = display.GetVolumePropertyNode() if display is not None else None
-        if propertyNode is None or propertyNode.GetVolumeProperty() is None:
-            return None, 0.0
-        opacity = propertyNode.GetVolumeProperty().GetScalarOpacity()
-        stamp = opacity.GetMTime()
-        if self.visibleBlocksCache is not None and self.visibleBlocksCache[0] == stamp:
-            return self.visibleBlocksCache[1:]
+        volumeProperty = propertyNode.GetVolumeProperty() if propertyNode is not None else None
+        if volumeProperty is None:
+            return None
+        opacity = volumeProperty.GetScalarOpacity()
+        stamp = (opacity.GetMTime(), volumeProperty.GetMTime())
+        if self.opacityCache is None or self.opacityCache[0] != stamp:
+            low, high = float(self.contextArray.min()), float(self.contextArray.max())
+            bins = 4096
+            table = np.array([opacity.GetValue(v) for v in np.linspace(low, high, bins)])
+            unit = float(volumeProperty.GetScalarOpacityUnitDistance()) or 1.0
+            self.opacityCache = (stamp, table, low, (bins - 1) / max(high - low, 1e-12), unit)
+        return self.opacityCache[1:]
+
+    def visibleDepthRange(self, camera, width, height, roiBounds):
+        """(near, far): distances along the view direction between the nearest voxel the 3D view's
+        opacity shows and the deepest point where a ray's accumulated opacity reaches
+        STREAM_3D_OPAQUE (or leaves the volume). Rays on a STREAM_3D_RAYS grid over the view are
+        marched through the coarsest level, half a voxel at a time, with the opacity corrected for
+        that step as the renderer does. None when no ray meets anything shown; (-inf, inf) without
+        a volume rendering. Averaging in the coarse level lowers the opacity of thin structures, so
+        the depth is overestimated rather than cut short."""
+        lookup = self.opacityLookup()
+        if lookup is None:
+            return -np.inf, np.inf
+        table, low, binsPerValue, unit = lookup
         level = len(self.levels) - 1  # contextArray always holds the coarsest level
         voxels = self.contextArray
-        low, high = float(voxels.min()), float(voxels.max())
-        bins = 4096
-        values = np.linspace(low, high, bins)
-        shown = np.array([opacity.GetValue(v) for v in values]) > STREAM_3D_VISIBLE_OPACITY
-        scale = (bins - 1) / max(high - low, 1e-12)
-        side = max(1, int(np.ceil(max(voxels.shape) / 64)))  # about 64 blocks along the longest axis
-        blocks = [int(np.ceil(n / side)) for n in voxels.shape]
-        seen = np.zeros(blocks, bool)
-        for bz in range(blocks[0]):  # a slab at a time bounds the temporaries
-            slab = shown[np.clip((voxels[bz * side : (bz + 1) * side].astype(np.float32) - low) * scale, 0, bins - 1).astype(np.int32)]
-            plane = np.pad(slab.any(axis=0), ((0, blocks[1] * side - voxels.shape[1]), (0, blocks[2] * side - voxels.shape[2])))
-            seen[bz] = plane.reshape(blocks[1], side, blocks[2], side).any(axis=(1, 3))
-        kz, ky, kx = np.nonzero(seen)
-        ijk = np.stack([kx, ky, kz, np.zeros_like(kx)]).astype(float) * side + (side - 1) / 2.0
-        ijk[3] = 1.0
-        centres = (self.ijkToRas[level] @ ijk)[:3]
-        radius = 0.5 * side * self.spacing[level] * np.sqrt(3.0)
-        self.visibleBlocksCache = (stamp, centres, radius)
-        return centres, radius
+        rasToIjk = np.linalg.inv(self.ijkToRas[level])
 
-    def visibleSurfaceDepth(self, sides, roiBounds, position, direction):
-        """Distance along the view direction to the nearest thing the 3D view's opacity shows inside
-        the view (and the cropping ROI); None when nothing is. The whole depth without a volume rendering."""
-        centres, radius = self.visibleBlocks()
-        if centres is None:
-            return -np.inf
-        inView = (sides @ np.vstack([centres, np.ones(centres.shape[1])]) >= -radius * np.linalg.norm(sides[:, :3], axis=1)[:, None]).all(axis=0)
-        if roiBounds is not None:
-            for axis in range(3):
-                inView &= (centres[axis] >= roiBounds[2 * axis] - radius) & (centres[axis] <= roiBounds[2 * axis + 1] + radius)
-        depth = direction @ (centres - position[:, None])
-        inView &= depth > -radius
-        if not inView.any():
+        position = np.array(camera.GetPosition())
+        direction = np.array(camera.GetDirectionOfProjection())
+        direction /= np.linalg.norm(direction)
+        right = np.cross(direction, camera.GetViewUp())
+        right /= np.linalg.norm(right)
+        up = np.cross(right, direction)
+        u, v = (grid.ravel() for grid in np.meshgrid(np.linspace(-1, 1, STREAM_3D_RAYS), np.linspace(-1, 1, STREAM_3D_RAYS)))
+        aspect = width / height
+        if camera.GetParallelProjection():
+            half = camera.GetParallelScale()
+            origins = position + np.outer(u * half * aspect, right) + np.outer(v * half, up)
+            rays = np.tile(direction, (u.size, 1))
+        else:
+            tangent = np.tan(np.radians(camera.GetViewAngle() / 2.0))
+            origins = np.tile(position, (u.size, 1))
+            rays = direction + np.outer(u * tangent * aspect, right) + np.outer(v * tangent, up)
+            rays /= np.linalg.norm(rays, axis=1)[:, None]
+
+        # Where each ray is inside the volume (slab test in the coarsest level's index space).
+        originsIjk = (rasToIjk[:3, :3] @ origins.T + rasToIjk[:3, 3:4]).T
+        raysIjk = (rasToIjk[:3, :3] @ rays.T).T
+        boxLow = np.full(3, -0.5)
+        boxHigh = np.array(voxels.shape[::-1], float) - 0.5
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t0 = (boxLow - originsIjk) / raysIjk
+            t1 = (boxHigh - originsIjk) / raysIjk
+        enter = np.nanmax(np.where(np.isnan(t0), -np.inf, np.minimum(t0, t1)), axis=1)
+        leave = np.nanmin(np.where(np.isnan(t1), np.inf, np.maximum(t0, t1)), axis=1)
+        enter = np.maximum(enter, 0.0)
+        hits = leave > enter
+        if not hits.any():
             return None
-        return float(depth[inView].min()) - radius
+        step = 0.5 * float(min(self.spacing[level], *np.linalg.norm(self.ijkToRas[level][:3, :3], axis=0)))
+        ts = np.arange(enter[hits].min(), leave[hits].max() + step, step)
+        if ts.size > 4000:  # bounds the arrays below (rays x samples)
+            ts = np.linspace(ts[0], ts[-1], 4000)
+            step = float(ts[1] - ts[0])
+        sampleIjk = originsIjk[:, None, :] + raysIjk[:, None, :] * ts[None, :, None]  # rays, samples, ijk
+        index = np.rint(sampleIjk).astype(np.int64)
+        within = np.all((index >= 0) & (index < np.array(voxels.shape[::-1])), axis=2)
+        within &= (ts[None, :] >= enter[:, None]) & (ts[None, :] <= leave[:, None])
+        index = np.clip(index, 0, np.array(voxels.shape[::-1]) - 1)
+        values = voxels[index[..., 2], index[..., 1], index[..., 0]].astype(np.float32)
+        alpha = table[np.clip(((values - low) * binsPerValue).astype(np.int64), 0, table.size - 1)]
+        alpha = np.where(within, alpha, 0.0)
+        if roiBounds is not None:
+            samples = origins[:, None, :] + rays[:, None, :] * ts[None, :, None]
+            for axis in range(3):
+                alpha = np.where(
+                    (samples[..., axis] >= roiBounds[2 * axis]) & (samples[..., axis] <= roiBounds[2 * axis + 1]), alpha, 0.0
+                )
+        seen = alpha > STREAM_3D_VISIBLE_OPACITY
+        anySeen = seen.any(axis=1)
+        if not anySeen.any():
+            return None
+        stepAlpha = 1.0 - np.power(1.0 - np.clip(alpha, 0.0, 1.0), step / unit)  # the renderer's opacity correction
+        accumulated = 1.0 - np.cumprod(1.0 - stepAlpha, axis=1)
+        opaque = accumulated >= STREAM_3D_OPAQUE
+        first = np.argmax(seen, axis=1)
+        last = np.where(opaque.any(axis=1), np.argmax(opaque, axis=1), np.searchsorted(ts, leave, side="right") - 1)
+        last = np.clip(last, 0, ts.size - 1)
+        cosine = rays @ direction  # distance along a ray -> depth along the view direction
+        near = float((ts[first] * cosine)[anySeen].min())
+        far = float((ts[last] * cosine)[anySeen].max())
+        margin = float(self.spacing[level])  # one coarse voxel each side
+        return near - margin, far + margin
 
     def update3D(self):
         if self.stopped or self.volume3D is None:
@@ -3350,6 +3404,10 @@ class Streamer:
             self.disable3D()
             return
         request = self.volumeRequest()
+        shownLevel = self.shown3D[0] if self.shown3D else self.contextLevel
+        if request is not None and request["level"] < shownLevel - 1:
+            # Sharpen one level at a time: neighbouring levels look alike, and each costs an eighth of the next.
+            request = self.volumeRequest(finest=shownLevel - 1) or request
         if request is None:
             self.request3D = None
             if self.shown3D is None or self.shown3D[0] != self.contextLevel:
@@ -4443,6 +4501,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_StreamingCompletes()
             self.test_StreamingViewsFirst()
             self.test_FillAnd3DTakeTurns()
+            self.test_3DDepthFollowsOpacity()
             self.test_RequestPacing()
             self.test_StreamedVolumeRendering()
             self.test_StreamedVolumeRenderingGpuLimits()
@@ -5076,16 +5135,13 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.assertEqual(streamer.fillLevel, 1)
             self.assertTrue(self.waitFor(lambda: streamer.kindInFlight["fill"] == STREAM_BACKGROUND_READERS))
 
-            # Close up, the 3D view queues level-0 chunks behind the fill already reading.
-            widget = slicer.app.layoutManager().threeDWidget(0)
-            cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(widget.mrmlViewNode())
-            bounds = [0.0] * 6
-            mrHead.GetRASBounds(bounds)
-            center = np.array([(bounds[2 * axis] + bounds[2 * axis + 1]) / 2 for axis in range(3)])
-            cameraNode.SetFocalPoint(*center)
-            cameraNode.SetPosition(*(center + [0.0, -60.0, 0.0]))
-            cameraNode.SetViewUp(0.0, 0.0, 1.0)
-            self.assertTrue(self.waitFor(lambda: len(streamer.queues["volume"]) >= STREAM_BACKGROUND_READERS // 2, 10.0))
+            # The 3D view then asks for eight level-0 chunks, queued behind the fill already reading.
+            self.waitFor(lambda: False, 1.0)  # the 3D view's first update has run
+            region = ((0, 32), (0, 32), (0, streamer.levels[0].shape[2]))
+            keys = streamer.levels[0].keys(region)
+            self.assertEqual(len(keys), STREAM_BACKGROUND_READERS)
+            streamer.request3D = {"level": 0, "region": region, "keys": keys, "shown": False, "reuse": set()}
+            streamer.requestChunks()
             self.assertEqual(streamer.kindInFlight["volume"], 0)
 
             # As reads finish, the freed readers go to whichever kind has fewer in flight.
@@ -5103,6 +5159,44 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             for _ in range(10000):
                 tokens.release()
             OMEZarrLogic.stopStreaming(storePath, wait=True)
+
+    def test_3DDepthFollowsOpacity(self):
+        self.delayDisplay("The 3D view reads as deep as its transfer function lets it see")
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        Settings.set(Settings.STREAM, True)
+        Settings.set(Settings.STREAM_3D, True)
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4})
+        streamer = OMEZarrLogic.streamer(storePath)
+        widget = slicer.app.layoutManager().threeDWidget(0)
+        cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(widget.mrmlViewNode())
+        bounds = [0.0] * 6
+        mrHead.GetRASBounds(bounds)
+        center = np.array([(bounds[2 * axis] + bounds[2 * axis + 1]) / 2 for axis in range(3)])
+        cameraNode.SetFocalPoint(*center)
+        cameraNode.SetPosition(*(center + [0.0, -400.0, 0.0]))  # outside the head, looking at its face
+        cameraNode.SetViewUp(0.0, 0.0, 1.0)
+        camera = cameraNode.GetCamera()
+        width, height = widget.threeDView().renderWindow().GetSize()
+        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(streamer.volume3D)
+        opacity = display.GetVolumePropertyNode().GetVolumeProperty().GetScalarOpacity()
+
+        def depthWith(points):
+            opacity.RemoveAllPoints()
+            for value, alpha in points:
+                opacity.AddPoint(value, alpha)
+            return streamer.visibleDepthRange(camera, width, height, None)
+
+        front = 400.0 - (center[1] - bounds[2])  # depth of the volume's front face
+        back = 400.0 + (bounds[3] - center[1])  # and of its back face
+        opaqueNear, opaqueFar = depthWith([(0, 0.0), (30, 0.0), (31, 1.0)])
+        clearNear, clearFar = depthWith([(0, 0.0), (30, 0.0), (31, 0.002)])
+        self.assertGreaterEqual(opaqueNear, front - 10.0)  # starts at the skin, not at the camera
+        self.assertLess(opaqueFar, back - 50.0)  # opaque: stops at the visible skin, well before the back
+        self.assertGreater(clearFar, back - 10.0)  # transparent: the rays see through to the back
+        self.assertIsNone(depthWith([(0, 0.0), (5000, 0.0)]))  # nothing shown: nothing to read
+        OMEZarrLogic.stopStreaming(storePath, wait=True)
 
     def test_RequestPacing(self):
         self.delayDisplay("Requests to one server stay under its request-rate limit")
