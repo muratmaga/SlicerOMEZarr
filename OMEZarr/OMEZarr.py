@@ -2571,6 +2571,7 @@ class Streamer:
         self.request3D = None  # {"level", "region", "keys", "shown"} for the 3D view
         self.shown3D = None  # (level, region) in the 3D node
         self.cameraObservers = []
+        self.displayEdited = False  # the 3D display (its transfer function) changed since the last update3D
         self.reusedChunks = 0  # chunks copied from the previous 3D texture instead of read again
         self.opacityCache = None  # (MTimes, opacity per value bin, low value, bins per value, unit distance mm)
         self.unfit3D = None  # (level, dims z y x, bytes) the view wanted but no texture holds: shown in its label
@@ -3413,7 +3414,16 @@ class Streamer:
 
     def onCameraChanged(self, caller=None, event=None):
         if not self.stopped and self.volume3D is not None:
+            if caller is not None and not isinstance(caller, slicer.vtkMRMLCameraNode):
+                self.displayEdited = True  # the display node: its transfer function, mostly
             self.cameraTimer.start()
+
+    @staticmethod
+    def mouseHeld():
+        try:
+            return int(qt.QApplication.mouseButtons()) != 0
+        except Exception:  # noqa: BLE001 - no application
+            return False
 
     def regionRasBounds(self, level, region):
         corners = np.array(
@@ -3653,6 +3663,12 @@ class Streamer:
         if self.volume3D.GetScene() is None:  # deleted by the user
             self.disable3D()
             return
+        if self.displayEdited and self.mouseHeld():
+            # The transfer function is being dragged (the preset's shift slider, an opacity point):
+            # the depth the view reads follows it, so wait for the release, however long the pause.
+            self.cameraTimer.start()
+            return
+        self.displayEdited = False
         request = self.volumeRequest()
         shownLevel = self.shown3D[0] if self.shown3D else self.contextLevel
         if request is not None and request["level"] < shownLevel - 1:
@@ -5545,6 +5561,21 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertGreater(clearFar, opaqueFar + 50.0)
         self.assertLess(clearFar, back + 10.0)
         self.assertIsNone(depthWith([(0, 0.0), (10000, 0.0)]))  # nothing shown: nothing to read
+
+        # The transfer function being dragged (the preset's shift slider): the 3D view waits for the
+        # mouse release, however long the drag pauses, instead of reading a new box at each pause.
+        streamer.displayEdited = False
+        depthWith([(0, 0.0), (30, 0.0), (31, 1.0), (10000, 1.0)])  # edits the display: flagged
+        self.assertTrue(streamer.displayEdited)
+        streamer.mouseHeld = lambda: True
+        streamer.cameraTimer.stop()
+        streamer.update3D()
+        self.assertTrue(streamer.displayEdited)  # still pending
+        self.assertTrue(streamer.cameraTimer.isActive())  # and checked again later
+        streamer.mouseHeld = lambda: False
+        streamer.update3D()
+        self.assertFalse(streamer.displayEdited)  # released: the box was recomputed
+        del streamer.mouseHeld
 
         # A box too big for one texture at the level the view wants is shown whole one level
         # coarser, never cut: with the texture limited, a close-up request moves off level 0 (or
