@@ -5500,9 +5500,11 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
 
             # The 3D view then asks for eight level-0 chunks, queued behind the fill already reading.
             self.waitFor(lambda: False, 1.0)  # the 3D view's first update has run
-            region = ((0, 32), (0, 32), (0, streamer.levels[0].shape[2]))
+            perRow = len(streamer.levels[0].keys(((0, 32), (0, 32), (0, streamer.levels[0].shape[2]))))  # chunks along x
+            rows = -(-STREAM_BACKGROUND_READERS // perRow)  # enough rows for one chunk per background reader
+            region = ((0, 32), (0, 32 * rows), (0, streamer.levels[0].shape[2]))
             keys = streamer.levels[0].keys(region)
-            self.assertEqual(len(keys), STREAM_BACKGROUND_READERS)
+            self.assertGreaterEqual(len(keys), STREAM_BACKGROUND_READERS)
             streamer.request3D = {"level": 0, "region": region, "keys": keys, "shown": False, "reuse": set()}
             streamer.requestChunks()
             self.assertEqual(streamer.kindInFlight["volume"], 0)
