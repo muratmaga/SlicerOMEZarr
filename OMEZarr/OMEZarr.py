@@ -2166,6 +2166,14 @@ class DiskCache:
     def get(self, key, keep=False):
         """The bytes kept under ``key``, or None."""
         path = self.path(key, keep)
+        if keep and not os.path.exists(path):
+            older = self.path(key)  # written before kept entries had their own folder: moved over
+            if os.path.exists(older):
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    os.replace(older, path)
+                except OSError:
+                    path = older
         try:
             with open(path, "rb") as file:
                 data = file.read()
