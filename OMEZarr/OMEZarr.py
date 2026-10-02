@@ -4399,6 +4399,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.diskCacheSpinBox.setSuffix(" MiB")
         self.diskCacheSpinBox.setSpecialValueText(_("off"))
         self.diskCacheSpinBox.setValue(Settings.get(Settings.DISK_CACHE, DISK_CACHE_MIB))
+        self.diskCacheSpinBox.setKeyboardTracking(False)  # applied when committed, never per keystroke: a small value trims the cache
         self.diskCacheSpinBox.setToolTip(
             _(
                 "Chunks read from remote stores are kept on disk, compressed as sent, so opening a store "
