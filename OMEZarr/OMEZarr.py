@@ -5560,8 +5560,6 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         # of what they gather in all, not at the back face).
         self.assertGreater(clearFar, opaqueFar + 50.0)
         self.assertLess(clearFar, back + 10.0)
-        self.assertIsNone(depthWith([(0, 0.0), (10000, 0.0)]))  # nothing shown: nothing to read
-
         # The transfer function being dragged (the preset's shift slider): the 3D view waits for the
         # mouse release, however long the drag pauses, instead of reading a new box at each pause.
         streamer.displayEdited = False
@@ -5576,6 +5574,8 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         streamer.update3D()
         self.assertFalse(streamer.displayEdited)  # released: the box was recomputed
         del streamer.mouseHeld
+
+        self.assertIsNone(depthWith([(0, 0.0), (10000, 0.0)]))  # nothing shown: nothing to read
 
         # A box too big for one texture at the level the view wants is shown whole one level
         # coarser, never cut: with the texture limited, a close-up request moves off level 0 (or
