@@ -5357,8 +5357,8 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             node = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": 1 << 30})
             self.assertEqual(node.GetAttribute("OMEZarr.Level"), "2")  # shown at once, from the coarsest level
             self.assertEqual(OMEZarrLogic.streamer(storePath).target, 0)
+            shown = [node.GetAttribute("OMEZarr.Level")]  # a fast machine can pass a level between two checks
             gate.set()
-            shown = []
 
             def finished():
                 level = node.GetAttribute("OMEZarr.Level")
