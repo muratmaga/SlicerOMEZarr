@@ -3490,7 +3490,7 @@ class Streamer:
             # Too deep for one texture: cut at the texture limit, the part nearest the camera kept
             # (the user's choice over a coarser level: the texture then ends inside the specimen,
             # which the label says). Too wide across the view: one level coarser.
-            trimmed = self.trimToTexture(level, region, direction)
+            trimmed = self.trimToTexture(level, region, direction, np.array(camera.GetFocalPoint()))
             if trimmed is not None:
                 return {"level": level, "region": trimmed, "keys": self.levels[level].keys(trimmed), "shown": False,
                         "cut": trimmed != region}
@@ -3498,26 +3498,36 @@ class Streamer:
                 self.unfit3D = (level, dims, int(np.prod(dims)) * itemSize)
         return None
 
-    def trimToTexture(self, level, region, direction):
-        """``region`` of ``level``, cut at its far end along the axis closest to the view direction
-        until it fits one 3D texture: what is nearest the camera is kept. None when it cannot fit
-        (too wide across the view, or less than a chunk deep would be left)."""
+    def trimToTexture(self, level, region, direction, focal):
+        """``region`` of ``level`` cut down to one 3D texture: on the axis closest to the view
+        direction the part nearest the camera is kept, on the axes across the view the part around
+        the focal point, and the memory limit then shortens the depth further. None only when less
+        than a chunk of depth would be left."""
         itemSize = np.dtype(self.dtype).itemsize
+        rasToIjk = np.linalg.inv(self.ijkToRas[level])
+        towards = rasToIjk[:3, :3] @ direction  # i, j, k
+        depthAxis = 2 - int(np.argmax(np.abs(towards)))  # z, y, x index
+        centre = (rasToIjk @ np.append(focal, 1.0))[:3][::-1]  # z, y, x
+        region = [tuple(r) for r in region]
+        for axis in range(3):
+            start, stop = region[axis]
+            if stop - start <= self.maxTextureDim:
+                continue
+            if axis == depthAxis:
+                region[axis] = (start, start + self.maxTextureDim) if towards[2 - axis] > 0 else (stop - self.maxTextureDim, stop)
+            else:
+                first = int(round(centre[axis] - self.maxTextureDim / 2.0))
+                first = min(max(first, start), stop - self.maxTextureDim)
+                region[axis] = (first, first + self.maxTextureDim)
         dims = [stop - start for start, stop in region]
-        if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
-            return region
-        towards = np.linalg.inv(self.ijkToRas[level])[:3, :3] @ direction  # i, j, k
-        axis = 2 - int(np.argmax(np.abs(towards)))  # z, y, x index of the depth axis
-        across = [d for a, d in enumerate(dims) if a != axis]
-        if max(across) > self.maxTextureDim:
-            return None
-        depth = min(self.maxTextureDim, self.maxTextureBytes // (itemSize * int(np.prod(across))))
-        if depth < min(dims[axis], 64):
-            return None
-        start, stop = region[axis]
-        trimmed = list(region)
-        trimmed[axis] = (start, start + depth) if towards[2 - axis] > 0 else (stop - depth, stop)
-        return tuple(trimmed)
+        if int(np.prod(dims)) * itemSize > self.maxTextureBytes:
+            across = int(np.prod([d for axis, d in enumerate(dims) if axis != depthAxis]))
+            depth = int(self.maxTextureBytes // (itemSize * across))
+            if depth < min(dims[depthAxis], 64):
+                return None
+            start, stop = region[depthAxis]
+            region[depthAxis] = (start, start + depth) if towards[2 - depthAxis] > 0 else (stop - depth, stop)
+        return tuple(region)
 
     def unfitText(self):
         """Why the 3D view shows no finer level, for its label; empty when it shows what it wants."""
@@ -5557,13 +5567,17 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertGreater(clearFar, back - 10.0)  # transparent: the rays see through to the back
         self.assertIsNone(depthWith([(0, 0.0), (10000, 0.0)]))  # nothing shown: nothing to read
 
-        # Too deep for one texture: the far end is cut, the end nearest the camera kept.
+        # Too big for one texture: in depth the end nearest the camera is kept, across the view the
+        # part around the focal point; the memory limit then shortens the depth.
         streamer.maxTextureDim, streamer.maxTextureBytes = 100, 1 << 30
         region = ((0, 50), (0, 250), (0, 60))  # z, y, x: deep along y
         ahead = np.array(streamer.ijkToRas[0][:3, 1]) / np.linalg.norm(streamer.ijkToRas[0][:3, 1])  # RAS of +j
-        self.assertEqual(streamer.trimToTexture(0, region, ahead), ((0, 50), (0, 100), (0, 60)))
-        self.assertEqual(streamer.trimToTexture(0, region, -ahead), ((0, 50), (150, 250), (0, 60)))
-        self.assertIsNone(streamer.trimToTexture(0, ((0, 50), (0, 250), (0, 160)), ahead))  # too wide across the view
+        focal = (streamer.ijkToRas[0] @ np.array([80.0, 50.0, 25.0, 1.0]))[:3]  # i=80, j=50, k=25
+        self.assertEqual(streamer.trimToTexture(0, region, ahead, focal), ((0, 50), (0, 100), (0, 60)))
+        self.assertEqual(streamer.trimToTexture(0, region, -ahead, focal), ((0, 50), (150, 250), (0, 60)))
+        self.assertEqual(streamer.trimToTexture(0, ((0, 50), (0, 250), (0, 160)), ahead, focal), ((0, 50), (0, 100), (30, 130)))
+        streamer.maxTextureBytes = 100 * 100 * 20 * np.dtype(streamer.dtype).itemsize  # memory: 20 deep at most
+        self.assertEqual(streamer.trimToTexture(0, ((0, 100), (0, 250), (0, 100)), ahead, focal), ((0, 100), (0, 20), (0, 100)))
         OMEZarrLogic.stopStreaming(storePath, wait=True)
 
     def test_RequestPacing(self):
