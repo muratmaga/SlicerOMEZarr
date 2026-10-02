@@ -122,7 +122,7 @@ STREAM_3D_SETTLE_MS = 300  # the texture follows the camera once it has been sti
 # is not read. An opaque rendering stops just behind the surface; a transparent one reads deeper.
 # The rays (STREAM_3D_RAYS per side) are marched through the coarsest level, always in memory.
 STREAM_3D_OPAQUE = 0.95
-STREAM_3D_RAY_SHARE = 0.9  # the far depth: where this share of the rays that turn opaque have; see visibleDepthRange
+STREAM_3D_RAY_SHARE = 0.5  # the far depth: where this share of all rays are opaque or out of the volume (the median ray)
 STREAM_3D_VISIBLE_OPACITY = 0.01  # opacity accumulated along a ray from which it shows something
 STREAM_3D_RAYS = 32
 
@@ -3667,13 +3667,10 @@ class Streamer:
         last = np.clip(last, 0, ts.size - 1)
         cosine = rays @ direction  # distance along a ray -> depth along the view direction
         near = float((ts[first] * cosine)[anySeen].min())
-        stops = (ts[last] * cosine)[anySeen]
-        turned = opaque.any(axis=1)[anySeen]
-        # Where the rays that turn opaque do so: not the deepest of them, so a few seeing deep through
-        # an opening do not pull the region through the whole specimen.
-        far = float(np.percentile(stops[turned], 100 * STREAM_3D_RAY_SHARE)) if turned.any() else -np.inf
-        if (~turned).mean() > 1 - STREAM_3D_RAY_SHARE:  # a see-through rendering: as deep as those rays go
-            far = max(far, float(stops[~turned].max()))
+        stops = (ts[last] * cosine)[anySeen]  # per ray: where it turned opaque, or left the volume
+        # The median ray, not the deepest: a surface is read a few hundred voxels in, and rays
+        # through an opening deepen the region only when they are the majority.
+        far = float(np.percentile(stops, 100 * STREAM_3D_RAY_SHARE))
         margin = float(self.spacing[level])  # one coarse voxel each side
         return near - margin, far + margin
 
