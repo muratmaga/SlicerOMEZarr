@@ -2554,6 +2554,7 @@ class Streamer:
         self.cameraObservers = []
         self.reusedChunks = 0  # chunks copied from the previous 3D texture instead of read again
         self.opacityCache = None  # (MTimes, opacity per value bin, low value, bins per value, unit distance mm)
+        self.unfit3D = None  # (level, dims z y x, bytes) the view wanted but no texture holds: shown in its label
         self.reads = collections.deque(maxlen=4096)  # (end time, decoded bytes, seconds, from disk) per chunk read
         self.lastStatus = 0.0
         self.idleShown = False
@@ -3231,7 +3232,7 @@ class Streamer:
         """Show, in each view's corner, the resolution level it displays."""
         for viewName, view in self.viewWidgets():
             if viewName == "3D":
-                text = self.levelText(self.shown3D[0]) if (self.volume3D is not None and self.shown3D) else ""
+                text = self.levelText(self.shown3D[0]) + self.unfitText() if (self.volume3D is not None and self.shown3D) else ""
             else:
                 request, overlay = self.views.get(viewName), self.overlays.get(viewName)
                 shown = int(overlay.GetAttribute("OMEZarr.Level")) if overlay is not None and overlay.GetScene() else None
@@ -3467,6 +3468,7 @@ class Streamer:
         level = next((lv for lv in reversed(range(len(self.levels))) if self.spacing[lv] <= pixel * 1.001), 0)
         level = max(level, finest)
         itemSize = np.dtype(self.dtype).itemsize
+        self.unfit3D = None
         for level in range(level, self.contextLevel):
             index = np.linalg.inv(self.ijkToRas[level]) @ points
             region = []
@@ -3482,7 +3484,25 @@ class Streamer:
             # sees ends the specimen at its face. What does not fit is shown one level coarser.
             if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
                 return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
+            if self.unfit3D is None:
+                self.unfit3D = (level, dims, int(np.prod(dims)) * itemSize)
         return None
+
+    def unfitText(self):
+        """Why the 3D view shows no finer level, for its label; empty when it shows what it wants."""
+        if self.unfit3D is None:
+            return ""
+        level, dims, nbytes = self.unfit3D
+        shown = self.shown3D[0] if self.shown3D else self.contextLevel
+        if level >= shown:
+            return ""
+        if max(dims) > self.maxTextureDim:
+            limit = _("{side} per side").format(side=self.maxTextureDim)
+        else:
+            limit = _("{gib:.1f} GiB").format(gib=self.maxTextureBytes / 2**30)
+        return _(" · level {level} would need {x}×{y}×{z} voxels ({gib:.1f} GiB), over the 3D texture limit of {limit}").format(
+            level=level, x=dims[2], y=dims[1], z=dims[0], gib=nbytes / 2**30, limit=limit
+        )
 
     def opacityLookup(self):
         """(opacity per value bin, low value, bins per value unit, opacity unit distance in mm) of the
@@ -5624,8 +5644,20 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
                 20.0,
             )
         )
-        self.assertGreater(streamer.reusedChunks, reused)
-        (z0, z1), (y0, y1), (x0, x1) = streamer.shown3D[1]
+        # Exactly the chunks whose needed part lay inside the previous texture were copied from it
+        # (with a shallow depth window that can be none: the window moves with the surface).
+        grid = streamer.levels[0]
+        newRegion = streamer.shown3D[1]
+        expected = sum(
+            1
+            for key in grid.keys(newRegion)
+            if all(
+                o0 <= max(r0, c0) and min(r1, c1) <= o1
+                for (r0, r1), (c0, c1), (o0, o1) in zip(newRegion, grid.bounds(key), region)
+            )
+        )
+        self.assertEqual(streamer.reusedChunks - reused, expected)
+        (z0, z1), (y0, y1), (x0, x1) = newRegion
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), full[z0:z1, y0:y1, x0:x1])
 
         # Cropping limits it further, along the viewing direction too.
