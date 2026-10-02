@@ -3808,6 +3808,10 @@ class Streamer:
             # VTK refuses a texture with a side over what the context reports ("Invalid texture
             # dimensions"), whatever the card could do: that value is a ceiling, never raised.
             self.maxTextureDim = min(self.maxTextureDim, reported)
+        # Slicer's volume rendering splits a volume into dimension // limit + 1 blocks (limit 2048 on
+        # macOS, 4096 elsewhere): a side equal to the limit is split in two, and the block-streamed
+        # upload crashed Slicer on macOS (Metal read past the buffer). Stay one voxel under.
+        self.maxTextureDim -= 1
         budget = Settings.get(Settings.STREAM_3D_MEMORY, 0) << 20
         if not budget:
             budget = self.maxTextureDim**3 * np.dtype(self.dtype).itemsize
@@ -5760,10 +5764,10 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(streamer.maxTextureBytes, 300 << 20)
         Settings.set(Settings.STREAM_3D_MEMORY, 0)
         streamer.detectGpuLimits(widget)
-        self.assertEqual(streamer.maxTextureDim, STREAM_3D_DEFAULT_SIDE)  # not what OpenGL reports
+        self.assertEqual(streamer.maxTextureDim, min(STREAM_3D_DEFAULT_SIDE, 10**9) - 1)  # not what OpenGL reports; one under
         Settings.set(Settings.STREAM_3D_SIDE, 1024)
         streamer.detectGpuLimits(widget)
-        self.assertEqual(streamer.maxTextureDim, 1024)
+        self.assertEqual(streamer.maxTextureDim, 1023)  # one under: Slicer splits a volume at the limit itself
         Settings.set(Settings.STREAM_3D_SIDE, 0)
         self.assertLessEqual(streamer.maxTextureBytes, streamer.maxTextureDim**3 * np.dtype(streamer.dtype).itemsize)
         OMEZarrLogic.stopStreaming(storePath)
