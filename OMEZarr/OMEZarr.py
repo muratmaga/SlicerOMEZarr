@@ -3523,8 +3523,10 @@ class Streamer:
         if int(np.prod(dims)) * itemSize > self.maxTextureBytes:
             across = int(np.prod([d for axis, d in enumerate(dims) if axis != depthAxis]))
             depth = int(self.maxTextureBytes // (itemSize * across))
-            if depth < min(dims[depthAxis], 64):
-                return None
+            edges = self.levels[level].edges[depthAxis]
+            chunk = int(edges[1] - edges[0]) if len(edges) > 1 else int(edges[-1])
+            if depth < min(dims[depthAxis], chunk):
+                return None  # not even a chunk of depth would fit
             start, stop = region[depthAxis]
             region[depthAxis] = (start, start + depth) if towards[2 - depthAxis] > 0 else (stop - depth, stop)
         return tuple(region)
@@ -5576,8 +5578,8 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(streamer.trimToTexture(0, region, ahead, focal), ((0, 50), (0, 100), (0, 60)))
         self.assertEqual(streamer.trimToTexture(0, region, -ahead, focal), ((0, 50), (150, 250), (0, 60)))
         self.assertEqual(streamer.trimToTexture(0, ((0, 50), (0, 250), (0, 160)), ahead, focal), ((0, 50), (0, 100), (30, 130)))
-        streamer.maxTextureBytes = 100 * 100 * 20 * np.dtype(streamer.dtype).itemsize  # memory: 20 deep at most
-        self.assertEqual(streamer.trimToTexture(0, ((0, 100), (0, 250), (0, 100)), ahead, focal), ((0, 100), (0, 20), (0, 100)))
+        streamer.maxTextureBytes = 100 * 100 * 40 * np.dtype(streamer.dtype).itemsize  # memory: 40 deep at most
+        self.assertEqual(streamer.trimToTexture(0, ((0, 100), (0, 250), (0, 100)), ahead, focal), ((0, 100), (0, 40), (0, 100)))
         OMEZarrLogic.stopStreaming(storePath, wait=True)
 
     def test_RequestPacing(self):
