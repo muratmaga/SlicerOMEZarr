@@ -122,6 +122,10 @@ STREAM_3D_SETTLE_MS = 300  # the texture follows the camera once it has been sti
 # is not read. An opaque rendering stops just behind the surface; a transparent one reads deeper.
 # The rays (STREAM_3D_RAYS per side) are marched through the coarsest level, always in memory.
 STREAM_3D_OPAQUE = 0.95
+# A ray stops where it has gathered this share of all the opacity it gathers in the volume: what
+# lies deeper contributes little to the pixel (a 1 mm bone wall at diceCT's 0.8/mm passes 20% of
+# the light, so an absolute threshold would read through to the far wall of the braincase).
+STREAM_3D_SHARE_OF_LIGHT = 0.8
 STREAM_3D_RAY_SHARE = 0.5  # the far depth: where this share of all rays are opaque or out of the volume (the median ray)
 STREAM_3D_VISIBLE_OPACITY = 0.01  # opacity accumulated along a ray from which it shows something
 STREAM_3D_RAYS = 32
@@ -3661,9 +3665,12 @@ class Streamer:
         anySeen = seen.any(axis=1)
         if not anySeen.any():
             return None
-        opaque = accumulated >= STREAM_3D_OPAQUE
+        # Each ray stops where it reaches STREAM_3D_OPAQUE, or STREAM_3D_SHARE_OF_LIGHT of what it
+        # gathers in all, whichever comes first.
+        target = np.minimum(STREAM_3D_OPAQUE, STREAM_3D_SHARE_OF_LIGHT * accumulated[:, -1])[:, None]
+        done = accumulated >= target
         first = np.argmax(seen, axis=1)
-        last = np.where(opaque.any(axis=1), np.argmax(opaque, axis=1), np.searchsorted(ts, leave, side="right") - 1)
+        last = np.where(done.any(axis=1), np.argmax(done, axis=1), np.searchsorted(ts, leave, side="right") - 1)
         last = np.clip(last, 0, ts.size - 1)
         cosine = rays @ direction  # distance along a ray -> depth along the view direction
         near = float((ts[first] * cosine)[anySeen].min())
