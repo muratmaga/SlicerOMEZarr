@@ -532,7 +532,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             return None
         key = (normalizeStorePath(source), level)
         if key not in cls._chunkReaders:
-            cls._chunkReaders[key] = ChunkReader.forArray(source, datasets[level].path, DiskCache.instance(), keep=level > 0)
+            cls._chunkReaders[key] = ChunkReader.forArray(source, datasets[level].path, DiskCache.instance())
         return cls._chunkReaders[key]
 
     @staticmethod
@@ -2155,25 +2155,15 @@ class DiskCache:
             self.measured = True
         self.trimIfNeeded()
 
-    KEEP = "keep"  # subfolder of the entries dropped last (the coarse levels every session starts from)
-
-    def path(self, key, keep=False):
+    def path(self, key):
         import hashlib
 
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
-        return os.path.join(self.root, self.KEEP, digest[:2], digest[2:]) if keep else os.path.join(self.root, digest[:2], digest[2:])
+        return os.path.join(self.root, digest[:2], digest[2:])
 
-    def get(self, key, keep=False):
+    def get(self, key):
         """The bytes kept under ``key``, or None."""
-        path = self.path(key, keep)
-        if keep and not os.path.exists(path):
-            older = self.path(key)  # written before kept entries had their own folder: moved over
-            if os.path.exists(older):
-                try:
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    os.replace(older, path)
-                except OSError:
-                    path = older
+        path = self.path(key)
         try:
             with open(path, "rb") as file:
                 data = file.read()
@@ -2185,8 +2175,8 @@ class DiskCache:
             pass
         return data
 
-    def put(self, key, data, keep=False):
-        path = self.path(key, keep)
+    def put(self, key, data):
+        path = self.path(key)
         temporary = f"{path}.{threading.get_ident()}.tmp"
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2202,17 +2192,15 @@ class DiskCache:
 
     def trimIfNeeded(self):
         with self.lock:
-            if not self.measured or self.trimming or self.limit <= 0 or self.size <= self.limit:
-                return  # a limit of 0 means the cache is not used, not that it is emptied
+            if not self.measured or self.trimming or self.size <= self.limit:
+                return
             self.trimming = True
         threading.Thread(target=self.trim, name="OMEZarr cache", daemon=True).start()
 
     def trim(self):
-        """Drop the least recently used entries down to 90% of the limit: the fine levels' first,
-        the kept (coarse) levels' only when those alone are over the limit."""
+        """Drop the least recently used entries down to 90% of the limit."""
         try:
-            keep = os.path.join(self.root, self.KEEP) + os.sep
-            entries = sorted(self.entries(), key=lambda entry: (entry[0].startswith(keep), entry[2]))
+            entries = sorted(self.entries(), key=lambda entry: entry[2])
             total = sum(size for _path, size, _mtime in entries)
             for path, size, _mtime in entries:
                 if total <= 0.9 * self.limit:
@@ -2260,7 +2248,7 @@ class ChunkReader:
     COMPRESSORS = ("zstd", "gzip", "blosc")
 
     @classmethod
-    def forArray(cls, storeUrl, arrayPath, cache=None, keep=False):
+    def forArray(cls, storeUrl, arrayPath, cache=None):
         import urllib.parse
 
         url = f"{str(storeUrl).rstrip('/')}/{arrayPath.strip('/')}"
@@ -2303,9 +2291,7 @@ class ChunkReader:
             dtype = np.dtype(meta["data_type"]).newbyteorder("<" if endian == "l" else ">")
             fill = np.array(meta.get("fill_value") or 0, dtype=dtype.newbyteorder("="))
             generation = f"{response.getheader('ETag') or ''}|{response.getheader('Last-Modified') or ''}"
-            reader = cls(client, base, innerShape, dtype, names[1:], separator, shardShape, checksum, fill, generation, cache)
-            reader.keep = keep  # a coarse level: its cache entries are the last the cache drops
-            return reader
+            return cls(client, base, innerShape, dtype, names[1:], separator, shardShape, checksum, fill, generation, cache)
         except Exception:  # noqa: BLE001 - fall back to ngff-zarr
             logging.debug(f"OME-Zarr: {url} is read through ngff-zarr", exc_info=True)
             return None
@@ -2326,7 +2312,6 @@ class ChunkReader:
         self.indexBytes = int(np.prod(self.perShard)) * 16 + (4 if checksum else 0) if self.sharded else 0
         self.generation = generation if generation.strip("|") else None  # no version: nothing is cached
         self.cache = cache
-        self.keep = False
         self.indexes = {}  # shard key -> (n, 2) uint64 array of (offset, nbytes), or None for a missing shard
         self.versions = {}  # shard key -> ETag (or date and size) the cached chunks of that shard are kept under
         self.fetching = {}  # shard key -> Event set once its index is in ``indexes`` (one fetch per shard)
@@ -2351,7 +2336,7 @@ class ChunkReader:
         """The bytes of an object, or of ``byteRange`` of it, from the disk cache or the server;
         b"" when the server has no such object."""
         if self.cache is not None and cacheKey is not None:
-            data = self.cache.get(cacheKey, keep=self.keep)
+            data = self.cache.get(cacheKey)
             if data is not None:
                 self.local.fromCache = True
                 with self.lock:
@@ -2366,7 +2351,7 @@ class ChunkReader:
         elif status not in (200, 206):
             raise OSError(f"HTTP {status} reading {path}")
         if self.cache is not None and cacheKey is not None:
-            self.cache.put(cacheKey, body, keep=self.keep)
+            self.cache.put(cacheKey, body)
         return body
 
     def shardIndex(self, shardKey):
@@ -2394,7 +2379,7 @@ class ChunkReader:
         """(index, version) of a shard; the cached index is used when the server says the shard is unchanged."""
         path = self.objectPath(shardKey)
         cacheKey = f"index|{path}"
-        cached = self.cache.get(cacheKey, keep=self.keep) if self.cache is not None else None
+        cached = self.cache.get(cacheKey) if self.cache is not None else None
         headers = {"Range": f"bytes=-{self.indexBytes}"}
         cachedVersion, cachedIndex = None, None
         if cached:  # version, newline, index bytes
@@ -2414,7 +2399,7 @@ class ChunkReader:
         if not version and response.getheader("Last-Modified"):
             version = f"{response.getheader('Last-Modified')} {response.getheader('Content-Range') or len(body)}"
         if version and self.cache is not None:
-            self.cache.put(cacheKey, version.encode("utf-8") + b"\n" + raw, keep=self.keep)
+            self.cache.put(cacheKey, version.encode("utf-8") + b"\n" + raw)
         return self.parseIndex(raw), version or None
 
     def parseIndex(self, raw):
@@ -3247,7 +3232,7 @@ class Streamer:
         """Show, in each view's corner, the resolution level it displays."""
         for viewName, view in self.viewWidgets():
             if viewName == "3D":
-                text = self.levelText(self.shown3D[0]) + self.unfitText() + self.cutText() if (self.volume3D is not None and self.shown3D) else ""
+                text = self.levelText(self.shown3D[0]) + self.unfitText() if (self.volume3D is not None and self.shown3D) else ""
             else:
                 request, overlay = self.views.get(viewName), self.overlays.get(viewName)
                 shown = int(overlay.GetAttribute("OMEZarr.Level")) if overlay is not None and overlay.GetScene() else None
@@ -3495,49 +3480,13 @@ class Streamer:
             dims = [stop - start for start, stop in region]
             if min(dims) <= 0:
                 return None
-            # Too deep for one texture: cut at the texture limit, the part nearest the camera kept
-            # (the user's choice over a coarser level: the texture then ends inside the specimen,
-            # which the label says). Too wide across the view: one level coarser.
-            trimmed = self.trimToTexture(level, region, direction, np.array(camera.GetFocalPoint()))
-            if trimmed is not None:
-                return {"level": level, "region": trimmed, "keys": self.levels[level].keys(trimmed), "shown": False,
-                        "cut": trimmed != region}
+            # The whole visible region or nothing at this level: a texture cut inside what the view
+            # sees ends the specimen at its face. What does not fit is shown one level coarser.
+            if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
+                return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
             if self.unfit3D is None:
                 self.unfit3D = (level, dims, int(np.prod(dims)) * itemSize)
         return None
-
-    def trimToTexture(self, level, region, direction, focal):
-        """``region`` of ``level`` cut down to one 3D texture: on the axis closest to the view
-        direction the part nearest the camera is kept, on the axes across the view the part around
-        the focal point, and the memory limit then shortens the depth further. None only when less
-        than a chunk of depth would be left."""
-        itemSize = np.dtype(self.dtype).itemsize
-        rasToIjk = np.linalg.inv(self.ijkToRas[level])
-        towards = rasToIjk[:3, :3] @ direction  # i, j, k
-        depthAxis = 2 - int(np.argmax(np.abs(towards)))  # z, y, x index
-        centre = (rasToIjk @ np.append(focal, 1.0))[:3][::-1]  # z, y, x
-        region = [tuple(r) for r in region]
-        for axis in range(3):
-            start, stop = region[axis]
-            if stop - start <= self.maxTextureDim:
-                continue
-            if axis == depthAxis:
-                region[axis] = (start, start + self.maxTextureDim) if towards[2 - axis] > 0 else (stop - self.maxTextureDim, stop)
-            else:
-                first = int(round(centre[axis] - self.maxTextureDim / 2.0))
-                first = min(max(first, start), stop - self.maxTextureDim)
-                region[axis] = (first, first + self.maxTextureDim)
-        dims = [stop - start for start, stop in region]
-        if int(np.prod(dims)) * itemSize > self.maxTextureBytes:
-            across = int(np.prod([d for axis, d in enumerate(dims) if axis != depthAxis]))
-            depth = int(self.maxTextureBytes // (itemSize * across))
-            edges = self.levels[level].edges[depthAxis]
-            chunk = int(edges[1] - edges[0]) if len(edges) > 1 else int(edges[-1])
-            if depth < min(dims[depthAxis], chunk):
-                return None  # not even a chunk of depth would fit
-            start, stop = region[depthAxis]
-            region[depthAxis] = (start, start + depth) if towards[2 - depthAxis] > 0 else (stop - depth, stop)
-        return tuple(region)
 
     def unfitText(self):
         """Why the 3D view shows no finer level, for its label; empty when it shows what it wants."""
@@ -3553,15 +3502,6 @@ class Streamer:
             limit = _("{gib:.1f} GiB").format(gib=self.maxTextureBytes / 2**30)
         return _(" · level {level} would need {x}×{y}×{z} voxels ({gib:.1f} GiB), over the 3D texture limit of {limit}").format(
             level=level, x=dims[2], y=dims[1], z=dims[0], gib=nbytes / 2**30, limit=limit
-        )
-
-    def cutText(self):
-        """Whether the texture shown was cut at the texture limit, for the 3D label."""
-        request = self.request3D
-        if request is None or not request.get("cut") or not request["shown"]:
-            return ""
-        return _(" · cut at the 3D texture limit ({side} per side, {gib:.1f} GiB): the far side is beyond it").format(
-            side=self.maxTextureDim, gib=self.maxTextureBytes / 2**30
         )
 
     def opacityLookup(self):
@@ -4042,15 +3982,8 @@ class OMEZarrFileReader:
                 if Settings.get(Settings.STREAM_3D, False):
                     with slicer.util.tryWithErrorDisplay(_("Failed to start volume rendering")):
                         streamer.enable3D()
-            else:
-                if scalars and Settings.get(Settings.STREAM_3D, False) and slicer.app.layoutManager() is not None:
-                    # Loaded whole (nothing to stream): rendered in 3D as it is, like a streamed store would be.
-                    with slicer.util.tryWithErrorDisplay(_("Failed to start volume rendering")):
-                        volumeRenderingLogic = slicer.modules.volumerendering.logic()
-                        display = volumeRenderingLogic.CreateDefaultVolumeRenderingNodes(scalars[0])
-                        display.SetVisibility(True)
-                if coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
-                    OMEZarrLogic.startAutoRefine(root)
+            elif coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
+                OMEZarrLogic.startAutoRefine(root)
         self.parent.loadedNodes = [node.GetID() for node in nodes]
         return True
 
@@ -5584,17 +5517,22 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertGreater(clearFar, back - 10.0)  # transparent: the rays see through to the back
         self.assertIsNone(depthWith([(0, 0.0), (10000, 0.0)]))  # nothing shown: nothing to read
 
-        # Too big for one texture: in depth the end nearest the camera is kept, across the view the
-        # part around the focal point; the memory limit then shortens the depth.
+        # A visible region too big for one texture at the fine level is shown whole at a coarser one,
+        # never cut: with the texture limited, the request moves to level 1.
         streamer.maxTextureDim, streamer.maxTextureBytes = 100, 1 << 30
-        region = ((0, 50), (0, 250), (0, 60))  # z, y, x: deep along y
-        ahead = np.array(streamer.ijkToRas[0][:3, 1]) / np.linalg.norm(streamer.ijkToRas[0][:3, 1])  # RAS of +j
-        focal = (streamer.ijkToRas[0] @ np.array([80.0, 50.0, 25.0, 1.0]))[:3]  # i=80, j=50, k=25
-        self.assertEqual(streamer.trimToTexture(0, region, ahead, focal), ((0, 50), (0, 100), (0, 60)))
-        self.assertEqual(streamer.trimToTexture(0, region, -ahead, focal), ((0, 50), (150, 250), (0, 60)))
-        self.assertEqual(streamer.trimToTexture(0, ((0, 50), (0, 250), (0, 160)), ahead, focal), ((0, 50), (0, 100), (30, 130)))
-        streamer.maxTextureBytes = 100 * 100 * 40 * np.dtype(streamer.dtype).itemsize  # memory: 40 deep at most
-        self.assertEqual(streamer.trimToTexture(0, ((0, 100), (0, 250), (0, 100)), ahead, focal), ((0, 100), (0, 40), (0, 100)))
+        propertyNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumePropertyNode")
+        opacity = vtk.vtkPiecewiseFunction()
+        for value, alpha in [(0, 0.0), (30, 0.0), (31, 1.0), (10000, 1.0)]:
+            opacity.AddPoint(value, alpha)
+        propertyNode.GetVolumeProperty().SetScalarOpacity(opacity)
+        display.SetAndObserveVolumePropertyNodeID(propertyNode.GetID())
+        cameraNode.SetPosition(*(center + [0.0, -60.0, 0.0]))  # close up: the view wants level 0
+        request = streamer.volumeRequest()
+        if request is None:  # the level already shown whole (the context) is the coarser level that fits
+            self.assertGreaterEqual(streamer.contextLevel, 1)
+        else:
+            self.assertGreater(request["level"], 0)
+            self.assertLessEqual(max(stop - start for start, stop in request["region"]), 100)
         OMEZarrLogic.stopStreaming(storePath, wait=True)
 
     def test_RequestPacing(self):
@@ -5791,25 +5729,15 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.waitFor(lambda: time.time() > deadline, 5.0)
 
         try:
-            # A GPU too small for level 0 (256 voxels a side): level 1 is read once as the fallback,
-            # and the view shows either that whole or a level-0 crop within the limit.
+            # A GPU too small for level 0 (256 voxels a side): level 1 is read once as the fallback.
             gpu(140)
             slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": 1 << 30})
             streamer = OMEZarrLogic.streamer(storePath)
             self.assertEqual(streamer.target, 0)
-
-            def fallbackReady():
-                shown = streamer.shown3D
-                return streamer.contextLevel == 1 and shown is not None and (
-                    shown[0] == 1 or max(stop - start for start, stop in shown[1]) <= 140
-                )
-
-            self.assertTrue(self.waitFor(fallbackReady, 20.0))
-            self.assertEqual(streamer.contextImage.GetDimensions()[::-1], tuple(multiscales.images[1].data.shape))
-            if streamer.shown3D[0] == 1:
-                np.testing.assert_array_equal(
-                    slicer.util.arrayFromVolume(streamer.volume3D), np.asarray(multiscales.images[1].data)
-                )
+            self.assertTrue(self.waitFor(lambda: streamer.contextLevel == 1 and streamer.shown3D[0] == 1, 20.0))
+            np.testing.assert_array_equal(
+                slicer.util.arrayFromVolume(streamer.volume3D), np.asarray(multiscales.images[1].data)
+            )
             OMEZarrLogic.stopStreaming(storePath)
 
             # A GPU that holds level 0: once streamed it is rendered whole and no longer follows the camera.
