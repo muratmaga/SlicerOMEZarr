@@ -5574,7 +5574,10 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         clearNear, clearFar = depthWith([(0, 0.0), (30, 0.0), (31, 0.002), (10000, 0.002)])
         self.assertGreaterEqual(opaqueNear, front - 10.0)  # starts at the skin, not at the camera
         self.assertLess(opaqueFar, back - 50.0)  # opaque: stops at the visible skin, well before the back
-        self.assertGreater(clearFar, back - 10.0)  # transparent: the rays see through to the back
+        # Transparent: the rays gather light well beyond the skin (they stop where they have most
+        # of what they gather in all, not at the back face).
+        self.assertGreater(clearFar, opaqueFar + 50.0)
+        self.assertLess(clearFar, back + 10.0)
         self.assertIsNone(depthWith([(0, 0.0), (10000, 0.0)]))  # nothing shown: nothing to read
 
         # Too big for one texture: every axis over the limit is clamped to it; in depth the end
