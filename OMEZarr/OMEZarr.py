@@ -532,7 +532,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             return None
         key = (normalizeStorePath(source), level)
         if key not in cls._chunkReaders:
-            cls._chunkReaders[key] = ChunkReader.forArray(source, datasets[level].path, DiskCache.instance())
+            cls._chunkReaders[key] = ChunkReader.forArray(source, datasets[level].path, DiskCache.instance(), keep=level > 0)
         return cls._chunkReaders[key]
 
     @staticmethod
@@ -2155,15 +2155,17 @@ class DiskCache:
             self.measured = True
         self.trimIfNeeded()
 
-    def path(self, key):
+    KEEP = "keep"  # subfolder of the entries dropped last (the coarse levels every session starts from)
+
+    def path(self, key, keep=False):
         import hashlib
 
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
-        return os.path.join(self.root, digest[:2], digest[2:])
+        return os.path.join(self.root, self.KEEP, digest[:2], digest[2:]) if keep else os.path.join(self.root, digest[:2], digest[2:])
 
-    def get(self, key):
+    def get(self, key, keep=False):
         """The bytes kept under ``key``, or None."""
-        path = self.path(key)
+        path = self.path(key, keep)
         try:
             with open(path, "rb") as file:
                 data = file.read()
@@ -2175,8 +2177,8 @@ class DiskCache:
             pass
         return data
 
-    def put(self, key, data):
-        path = self.path(key)
+    def put(self, key, data, keep=False):
+        path = self.path(key, keep)
         temporary = f"{path}.{threading.get_ident()}.tmp"
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2192,15 +2194,17 @@ class DiskCache:
 
     def trimIfNeeded(self):
         with self.lock:
-            if not self.measured or self.trimming or self.size <= self.limit:
-                return
+            if not self.measured or self.trimming or self.limit <= 0 or self.size <= self.limit:
+                return  # a limit of 0 means the cache is not used, not that it is emptied
             self.trimming = True
         threading.Thread(target=self.trim, name="OMEZarr cache", daemon=True).start()
 
     def trim(self):
-        """Drop the least recently used entries down to 90% of the limit."""
+        """Drop the least recently used entries down to 90% of the limit: the fine levels' first,
+        the kept (coarse) levels' only when those alone are over the limit."""
         try:
-            entries = sorted(self.entries(), key=lambda entry: entry[2])
+            keep = os.path.join(self.root, self.KEEP) + os.sep
+            entries = sorted(self.entries(), key=lambda entry: (entry[0].startswith(keep), entry[2]))
             total = sum(size for _path, size, _mtime in entries)
             for path, size, _mtime in entries:
                 if total <= 0.9 * self.limit:
@@ -2248,7 +2252,7 @@ class ChunkReader:
     COMPRESSORS = ("zstd", "gzip", "blosc")
 
     @classmethod
-    def forArray(cls, storeUrl, arrayPath, cache=None):
+    def forArray(cls, storeUrl, arrayPath, cache=None, keep=False):
         import urllib.parse
 
         url = f"{str(storeUrl).rstrip('/')}/{arrayPath.strip('/')}"
@@ -2291,7 +2295,9 @@ class ChunkReader:
             dtype = np.dtype(meta["data_type"]).newbyteorder("<" if endian == "l" else ">")
             fill = np.array(meta.get("fill_value") or 0, dtype=dtype.newbyteorder("="))
             generation = f"{response.getheader('ETag') or ''}|{response.getheader('Last-Modified') or ''}"
-            return cls(client, base, innerShape, dtype, names[1:], separator, shardShape, checksum, fill, generation, cache)
+            reader = cls(client, base, innerShape, dtype, names[1:], separator, shardShape, checksum, fill, generation, cache)
+            reader.keep = keep  # a coarse level: its cache entries are the last the cache drops
+            return reader
         except Exception:  # noqa: BLE001 - fall back to ngff-zarr
             logging.debug(f"OME-Zarr: {url} is read through ngff-zarr", exc_info=True)
             return None
@@ -2312,6 +2318,7 @@ class ChunkReader:
         self.indexBytes = int(np.prod(self.perShard)) * 16 + (4 if checksum else 0) if self.sharded else 0
         self.generation = generation if generation.strip("|") else None  # no version: nothing is cached
         self.cache = cache
+        self.keep = False
         self.indexes = {}  # shard key -> (n, 2) uint64 array of (offset, nbytes), or None for a missing shard
         self.versions = {}  # shard key -> ETag (or date and size) the cached chunks of that shard are kept under
         self.fetching = {}  # shard key -> Event set once its index is in ``indexes`` (one fetch per shard)
@@ -2336,7 +2343,7 @@ class ChunkReader:
         """The bytes of an object, or of ``byteRange`` of it, from the disk cache or the server;
         b"" when the server has no such object."""
         if self.cache is not None and cacheKey is not None:
-            data = self.cache.get(cacheKey)
+            data = self.cache.get(cacheKey, keep=self.keep)
             if data is not None:
                 self.local.fromCache = True
                 with self.lock:
@@ -2351,7 +2358,7 @@ class ChunkReader:
         elif status not in (200, 206):
             raise OSError(f"HTTP {status} reading {path}")
         if self.cache is not None and cacheKey is not None:
-            self.cache.put(cacheKey, body)
+            self.cache.put(cacheKey, body, keep=self.keep)
         return body
 
     def shardIndex(self, shardKey):
@@ -2379,7 +2386,7 @@ class ChunkReader:
         """(index, version) of a shard; the cached index is used when the server says the shard is unchanged."""
         path = self.objectPath(shardKey)
         cacheKey = f"index|{path}"
-        cached = self.cache.get(cacheKey) if self.cache is not None else None
+        cached = self.cache.get(cacheKey, keep=self.keep) if self.cache is not None else None
         headers = {"Range": f"bytes=-{self.indexBytes}"}
         cachedVersion, cachedIndex = None, None
         if cached:  # version, newline, index bytes
@@ -2399,7 +2406,7 @@ class ChunkReader:
         if not version and response.getheader("Last-Modified"):
             version = f"{response.getheader('Last-Modified')} {response.getheader('Content-Range') or len(body)}"
         if version and self.cache is not None:
-            self.cache.put(cacheKey, version.encode("utf-8") + b"\n" + raw)
+            self.cache.put(cacheKey, version.encode("utf-8") + b"\n" + raw, keep=self.keep)
         return self.parseIndex(raw), version or None
 
     def parseIndex(self, raw):
