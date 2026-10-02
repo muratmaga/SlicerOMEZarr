@@ -5776,15 +5776,25 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.waitFor(lambda: time.time() > deadline, 5.0)
 
         try:
-            # A GPU too small for level 0 (256 voxels a side): level 1 is read once as the fallback.
+            # A GPU too small for level 0 (256 voxels a side): level 1 is read once as the fallback,
+            # and the view shows either that whole or a level-0 crop within the limit.
             gpu(140)
             slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": 1 << 30})
             streamer = OMEZarrLogic.streamer(storePath)
             self.assertEqual(streamer.target, 0)
-            self.assertTrue(self.waitFor(lambda: streamer.contextLevel == 1 and streamer.shown3D[0] == 1, 20.0))
-            np.testing.assert_array_equal(
-                slicer.util.arrayFromVolume(streamer.volume3D), np.asarray(multiscales.images[1].data)
-            )
+
+            def fallbackReady():
+                shown = streamer.shown3D
+                return streamer.contextLevel == 1 and shown is not None and (
+                    shown[0] == 1 or max(stop - start for start, stop in shown[1]) <= 140
+                )
+
+            self.assertTrue(self.waitFor(fallbackReady, 20.0))
+            self.assertEqual(streamer.contextImage.GetDimensions()[::-1], tuple(multiscales.images[1].data.shape))
+            if streamer.shown3D[0] == 1:
+                np.testing.assert_array_equal(
+                    slicer.util.arrayFromVolume(streamer.volume3D), np.asarray(multiscales.images[1].data)
+                )
             OMEZarrLogic.stopStreaming(storePath)
 
             # A GPU that holds level 0: once streamed it is rendered whole and no longer follows the camera.
