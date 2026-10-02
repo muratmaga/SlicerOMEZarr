@@ -161,7 +161,7 @@ class Settings:
     STREAM_3D_MEMORY = "OMEZarr/StreamVolumeRenderingMemory"  # MiB a 3D texture may use, 0 = automatic
     STREAM_3D_SIDE = "OMEZarr/StreamVolumeRenderingTextureSide"  # voxels per side of a 3D texture, 0 = automatic
     DISK_CACHE = "OMEZarr/DiskCacheMiB"  # MiB of remote chunks kept on disk between sessions, 0 = off
-    DISK_CACHE_DIR = "OMEZarr/DiskCacheDirectory"  # empty = <Slicer cache>/OMEZarr
+    DISK_CACHE_DIR = "OMEZarr/DiskCacheDirectory"  # empty = DiskCache.defaultDirectory()
 
     @staticmethod
     def get(key, default):
@@ -2127,11 +2127,38 @@ class DiskCache:
         if threading.current_thread() is not threading.main_thread():
             return cls._instance if cls._instance is not None and cls._instance.limit > 0 else None
         limit = Settings.get(Settings.DISK_CACHE, DISK_CACHE_MIB) << 20
-        directory = Settings.get(Settings.DISK_CACHE_DIR, "") or os.path.join(slicer.app.cachePath, "OMEZarr")
+        directory = Settings.get(Settings.DISK_CACHE_DIR, "")
+        if not directory:
+            directory = cls.defaultDirectory()
+            if cls._instance is None or cls._instance.root != directory:
+                cls.moveFromSlicerCache(directory)
         if cls._instance is None or cls._instance.root != directory:
             cls._instance = cls(directory)
         cls._instance.limit = max(0, limit)
         return cls._instance if limit > 0 else None
+
+    @staticmethod
+    def defaultDirectory():
+        """``OMEZarr`` in the application's cache location (``~/.cache/slicer.org/Slicer`` on Linux,
+        ``~/Library/Caches/slicer.org/Slicer`` on macOS), beside Slicer's download cache, never in it:
+        Slicer prunes that one at every start, when its "Auto-prune" setting is on (the default), to
+        its "Cache size" setting (200 MB by default), removing whole top-level entries oldest first;
+        a folder of chunks in it was deleted at the next start."""
+        base = qt.QStandardPaths.writableLocation(qt.QStandardPaths.CacheLocation) or os.path.dirname(slicer.app.cachePath)
+        return os.path.join(base, "OMEZarr")
+
+    @staticmethod
+    def moveFromSlicerCache(directory, slicerCache=None):
+        """Move the folder earlier versions kept in Slicer's download cache to ``directory``, once."""
+        older = os.path.join(slicerCache or slicer.app.cachePath, "OMEZarr")
+        if not os.path.isdir(older) or os.path.exists(directory):
+            return
+        try:
+            os.makedirs(os.path.dirname(directory), exist_ok=True)
+            os.rename(older, directory)
+            logging.info(f"OME-Zarr: moved the disk cache out of Slicer's pruned download cache, to {directory}")
+        except OSError:
+            logging.warning(f"OME-Zarr: could not move the disk cache from {older} to {directory}", exc_info=True)
 
     def __init__(self, root):
         self.root = root
@@ -6245,6 +6272,23 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertGreater(OMEZarrLogic.maxBytesFromSettings(), FALLBACK_MAX_BYTES // 16)
         Settings.set(Settings.MAX_BYTES, 12345)
         self.assertEqual(OMEZarrLogic.maxBytesFromSettings(), 12345)
+
+        # The disk cache lives beside Slicer's download cache, never inside it: Slicer prunes that
+        # one at every start to its own (200 MB default) size, dropping whole folders.
+        default = os.path.normcase(os.path.abspath(DiskCache.defaultDirectory()))
+        pruned = os.path.normcase(os.path.abspath(slicer.app.cachePath))
+        self.assertFalse(default.startswith(pruned + os.sep))
+        self.assertNotEqual(default, pruned)
+        self.assertEqual(os.path.basename(default), "OMEZarr")
+        # A folder left in the pruned cache by earlier versions is moved to the new place, once.
+        older = os.path.join(self.tempDir, "SlicerIO", "OMEZarr")
+        newer = os.path.join(self.tempDir, "beside", "OMEZarr")
+        os.makedirs(os.path.join(older, "keep", "ab"))
+        with open(os.path.join(older, "keep", "ab", "cdef"), "wb") as file:
+            file.write(b"chunk")
+        DiskCache.moveFromSlicerCache(newer, slicerCache=os.path.join(self.tempDir, "SlicerIO"))
+        self.assertTrue(os.path.isfile(os.path.join(newer, "keep", "ab", "cdef")))
+        self.assertFalse(os.path.exists(older))
 
     def test_CancelledLoadLeavesNothing(self):
         self.delayDisplay("A cancelled load removes the nodes it added")
