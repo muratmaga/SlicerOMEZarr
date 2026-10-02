@@ -3232,7 +3232,7 @@ class Streamer:
         """Show, in each view's corner, the resolution level it displays."""
         for viewName, view in self.viewWidgets():
             if viewName == "3D":
-                text = self.levelText(self.shown3D[0]) + self.unfitText() if (self.volume3D is not None and self.shown3D) else ""
+                text = self.levelText(self.shown3D[0]) + self.unfitText() + self.cutText() if (self.volume3D is not None and self.shown3D) else ""
             else:
                 request, overlay = self.views.get(viewName), self.overlays.get(viewName)
                 shown = int(overlay.GetAttribute("OMEZarr.Level")) if overlay is not None and overlay.GetScene() else None
@@ -3480,13 +3480,37 @@ class Streamer:
             dims = [stop - start for start, stop in region]
             if min(dims) <= 0:
                 return None
-            # The whole visible region or nothing at this level: a texture cut inside what the view
-            # sees ends the specimen at its face. What does not fit is shown one level coarser.
-            if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
-                return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
+            # Too deep for one texture: cut at the texture limit, the part nearest the camera kept
+            # (the user's choice over a coarser level: the texture then ends inside the specimen,
+            # which the label says). Too wide across the view: one level coarser.
+            trimmed = self.trimToTexture(level, region, direction)
+            if trimmed is not None:
+                return {"level": level, "region": trimmed, "keys": self.levels[level].keys(trimmed), "shown": False,
+                        "cut": trimmed != region}
             if self.unfit3D is None:
                 self.unfit3D = (level, dims, int(np.prod(dims)) * itemSize)
         return None
+
+    def trimToTexture(self, level, region, direction):
+        """``region`` of ``level``, cut at its far end along the axis closest to the view direction
+        until it fits one 3D texture: what is nearest the camera is kept. None when it cannot fit
+        (too wide across the view, or less than a chunk deep would be left)."""
+        itemSize = np.dtype(self.dtype).itemsize
+        dims = [stop - start for start, stop in region]
+        if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
+            return region
+        towards = np.linalg.inv(self.ijkToRas[level])[:3, :3] @ direction  # i, j, k
+        axis = 2 - int(np.argmax(np.abs(towards)))  # z, y, x index of the depth axis
+        across = [d for a, d in enumerate(dims) if a != axis]
+        if max(across) > self.maxTextureDim:
+            return None
+        depth = min(self.maxTextureDim, self.maxTextureBytes // (itemSize * int(np.prod(across))))
+        if depth < min(dims[axis], 64):
+            return None
+        start, stop = region[axis]
+        trimmed = list(region)
+        trimmed[axis] = (start, start + depth) if towards[2 - axis] > 0 else (stop - depth, stop)
+        return tuple(trimmed)
 
     def unfitText(self):
         """Why the 3D view shows no finer level, for its label; empty when it shows what it wants."""
@@ -3502,6 +3526,15 @@ class Streamer:
             limit = _("{gib:.1f} GiB").format(gib=self.maxTextureBytes / 2**30)
         return _(" · level {level} would need {x}×{y}×{z} voxels ({gib:.1f} GiB), over the 3D texture limit of {limit}").format(
             level=level, x=dims[2], y=dims[1], z=dims[0], gib=nbytes / 2**30, limit=limit
+        )
+
+    def cutText(self):
+        """Whether the texture shown was cut at the texture limit, for the 3D label."""
+        request = self.request3D
+        if request is None or not request.get("cut") or not request["shown"]:
+            return ""
+        return _(" · cut at the 3D texture limit ({side} per side, {gib:.1f} GiB): the far side is beyond it").format(
+            side=self.maxTextureDim, gib=self.maxTextureBytes / 2**30
         )
 
     def opacityLookup(self):
@@ -5517,22 +5550,13 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertGreater(clearFar, back - 10.0)  # transparent: the rays see through to the back
         self.assertIsNone(depthWith([(0, 0.0), (10000, 0.0)]))  # nothing shown: nothing to read
 
-        # A visible region too big for one texture at the fine level is shown whole at a coarser one,
-        # never cut: with the texture limited, the request moves to level 1.
+        # Too deep for one texture: the far end is cut, the end nearest the camera kept.
         streamer.maxTextureDim, streamer.maxTextureBytes = 100, 1 << 30
-        propertyNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumePropertyNode")
-        opacity = vtk.vtkPiecewiseFunction()
-        for value, alpha in [(0, 0.0), (30, 0.0), (31, 1.0), (10000, 1.0)]:
-            opacity.AddPoint(value, alpha)
-        propertyNode.GetVolumeProperty().SetScalarOpacity(opacity)
-        display.SetAndObserveVolumePropertyNodeID(propertyNode.GetID())
-        cameraNode.SetPosition(*(center + [0.0, -60.0, 0.0]))  # close up: the view wants level 0
-        request = streamer.volumeRequest()
-        if request is None:  # the level already shown whole (the context) is the coarser level that fits
-            self.assertGreaterEqual(streamer.contextLevel, 1)
-        else:
-            self.assertGreater(request["level"], 0)
-            self.assertLessEqual(max(stop - start for start, stop in request["region"]), 100)
+        region = ((0, 50), (0, 250), (0, 60))  # z, y, x: deep along y
+        ahead = np.array(streamer.ijkToRas[0][:3, 1]) / np.linalg.norm(streamer.ijkToRas[0][:3, 1])  # RAS of +j
+        self.assertEqual(streamer.trimToTexture(0, region, ahead), ((0, 50), (0, 100), (0, 60)))
+        self.assertEqual(streamer.trimToTexture(0, region, -ahead), ((0, 50), (150, 250), (0, 60)))
+        self.assertIsNone(streamer.trimToTexture(0, ((0, 50), (0, 250), (0, 160)), ahead))  # too wide across the view
         OMEZarrLogic.stopStreaming(storePath, wait=True)
 
     def test_RequestPacing(self):
