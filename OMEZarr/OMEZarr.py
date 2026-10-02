@@ -4042,8 +4042,15 @@ class OMEZarrFileReader:
                 if Settings.get(Settings.STREAM_3D, False):
                     with slicer.util.tryWithErrorDisplay(_("Failed to start volume rendering")):
                         streamer.enable3D()
-            elif coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
-                OMEZarrLogic.startAutoRefine(root)
+            else:
+                if scalars and Settings.get(Settings.STREAM_3D, False) and slicer.app.layoutManager() is not None:
+                    # Loaded whole (nothing to stream): rendered in 3D as it is, like a streamed store would be.
+                    with slicer.util.tryWithErrorDisplay(_("Failed to start volume rendering")):
+                        volumeRenderingLogic = slicer.modules.volumerendering.logic()
+                        display = volumeRenderingLogic.CreateDefaultVolumeRenderingNodes(scalars[0])
+                        display.SetVisibility(True)
+                if coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
+                    OMEZarrLogic.startAutoRefine(root)
         self.parent.loadedNodes = [node.GetID() for node in nodes]
         return True
 
