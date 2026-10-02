@@ -3480,13 +3480,47 @@ class Streamer:
             dims = [stop - start for start, stop in region]
             if min(dims) <= 0:
                 return None
-            # The whole visible region or nothing at this level: a texture cut inside what the view
-            # sees ends the specimen at its face. What does not fit is shown one level coarser.
-            if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
-                return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
+            # Every axis over the texture limit is clamped to it (the user's rule): the viewing axis
+            # keeps the part nearest the camera, the others the span around the focal point.
+            clamped = self.clampToTexture(level, region, direction, np.array(camera.GetFocalPoint()))
+            if clamped is not None:
+                return {"level": level, "region": clamped, "keys": self.levels[level].keys(clamped), "shown": False}
             if self.unfit3D is None:
                 self.unfit3D = (level, dims, int(np.prod(dims)) * itemSize)
         return None
+
+    def clampToTexture(self, level, region, direction, focal):
+        """``region`` of ``level`` clamped to one 3D texture: each axis longer than the texture side
+        is cut to it, keeping the part nearest the camera on the axis closest to the view direction
+        and the part around the focal point on the others; the memory limit then shortens the
+        depth. None only when less than a chunk of depth would be left."""
+        itemSize = np.dtype(self.dtype).itemsize
+        rasToIjk = np.linalg.inv(self.ijkToRas[level])
+        towards = rasToIjk[:3, :3] @ direction  # i, j, k
+        depthAxis = 2 - int(np.argmax(np.abs(towards)))  # z, y, x index
+        centre = (rasToIjk @ np.append(focal, 1.0))[:3][::-1]  # z, y, x
+        region = [tuple(r) for r in region]
+        for axis in range(3):
+            start, stop = region[axis]
+            if stop - start <= self.maxTextureDim:
+                continue
+            if axis == depthAxis:
+                region[axis] = (start, start + self.maxTextureDim) if towards[2 - axis] > 0 else (stop - self.maxTextureDim, stop)
+            else:
+                first = int(round(centre[axis] - self.maxTextureDim / 2.0))
+                first = min(max(first, start), stop - self.maxTextureDim)
+                region[axis] = (first, first + self.maxTextureDim)
+        dims = [stop - start for start, stop in region]
+        if int(np.prod(dims)) * itemSize > self.maxTextureBytes:
+            across = int(np.prod([d for axis, d in enumerate(dims) if axis != depthAxis]))
+            depth = int(self.maxTextureBytes // (itemSize * across))
+            edges = self.levels[level].edges[depthAxis]
+            chunk = int(edges[1] - edges[0]) if len(edges) > 1 else int(edges[-1])
+            if depth < min(dims[depthAxis], chunk):
+                return None
+            start, stop = region[depthAxis]
+            region[depthAxis] = (start, start + depth) if towards[2 - depthAxis] > 0 else (stop - depth, stop)
+        return tuple(region)
 
     def unfitText(self):
         """Why the 3D view shows no finer level, for its label; empty when it shows what it wants."""
@@ -5517,22 +5551,18 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertGreater(clearFar, back - 10.0)  # transparent: the rays see through to the back
         self.assertIsNone(depthWith([(0, 0.0), (10000, 0.0)]))  # nothing shown: nothing to read
 
-        # A visible region too big for one texture at the fine level is shown whole at a coarser one,
-        # never cut: with the texture limited, the request moves to level 1.
+        # Too big for one texture: every axis over the limit is clamped to it; in depth the end
+        # nearest the camera is kept, across the view the part around the focal point; the memory
+        # limit then shortens the depth.
         streamer.maxTextureDim, streamer.maxTextureBytes = 100, 1 << 30
-        propertyNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVolumePropertyNode")
-        opacity = vtk.vtkPiecewiseFunction()
-        for value, alpha in [(0, 0.0), (30, 0.0), (31, 1.0), (10000, 1.0)]:
-            opacity.AddPoint(value, alpha)
-        propertyNode.GetVolumeProperty().SetScalarOpacity(opacity)
-        display.SetAndObserveVolumePropertyNodeID(propertyNode.GetID())
-        cameraNode.SetPosition(*(center + [0.0, -60.0, 0.0]))  # close up: the view wants level 0
-        request = streamer.volumeRequest()
-        if request is None:  # the level already shown whole (the context) is the coarser level that fits
-            self.assertGreaterEqual(streamer.contextLevel, 1)
-        else:
-            self.assertGreater(request["level"], 0)
-            self.assertLessEqual(max(stop - start for start, stop in request["region"]), 100)
+        region = ((0, 50), (0, 250), (0, 60))  # z, y, x: deep along y
+        ahead = np.array(streamer.ijkToRas[0][:3, 1]) / np.linalg.norm(streamer.ijkToRas[0][:3, 1])  # RAS of +j
+        focal = (streamer.ijkToRas[0] @ np.array([80.0, 50.0, 25.0, 1.0]))[:3]  # i=80, j=50, k=25
+        self.assertEqual(streamer.clampToTexture(0, region, ahead, focal), ((0, 50), (0, 100), (0, 60)))
+        self.assertEqual(streamer.clampToTexture(0, region, -ahead, focal), ((0, 50), (150, 250), (0, 60)))
+        self.assertEqual(streamer.clampToTexture(0, ((0, 50), (0, 250), (0, 160)), ahead, focal), ((0, 50), (0, 100), (30, 130)))
+        streamer.maxTextureBytes = 100 * 100 * 40 * np.dtype(streamer.dtype).itemsize  # memory: 40 deep at most
+        self.assertEqual(streamer.clampToTexture(0, ((0, 100), (0, 250), (0, 100)), ahead, focal), ((0, 100), (0, 40), (0, 100)))
         OMEZarrLogic.stopStreaming(storePath, wait=True)
 
     def test_RequestPacing(self):
@@ -5734,10 +5764,18 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": 1 << 30})
             streamer = OMEZarrLogic.streamer(storePath)
             self.assertEqual(streamer.target, 0)
-            self.assertTrue(self.waitFor(lambda: streamer.contextLevel == 1 and streamer.shown3D[0] == 1, 20.0))
-            np.testing.assert_array_equal(
-                slicer.util.arrayFromVolume(streamer.volume3D), np.asarray(multiscales.images[1].data)
+            self.assertTrue(
+                self.waitFor(
+                    lambda: streamer.contextLevel == 1
+                    and streamer.shown3D is not None
+                    and (streamer.shown3D[0] == 1 or max(stop - start for start, stop in streamer.shown3D[1]) <= 140),
+                    20.0,
+                )
             )
+            if streamer.shown3D[0] == 1:
+                np.testing.assert_array_equal(
+                    slicer.util.arrayFromVolume(streamer.volume3D), np.asarray(multiscales.images[1].data)
+                )
             OMEZarrLogic.stopStreaming(storePath)
 
             # A GPU that holds level 0: once streamed it is rendered whole and no longer follows the camera.
