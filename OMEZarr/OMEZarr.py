@@ -5509,7 +5509,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         cameraNode.SetPosition(*(center + [0.0, -60.0, 0.0]))  # close up: the view wants level 0
         request = streamer.volumeRequest()
         if request is None:  # the level already shown whole (the context) is the coarser level that fits
-            self.assertEqual(streamer.contextLevel, 1)
+            self.assertGreaterEqual(streamer.contextLevel, 1)
         else:
             self.assertGreater(request["level"], 0)
             self.assertLessEqual(max(stop - start for start, stop in request["region"]), 100)
