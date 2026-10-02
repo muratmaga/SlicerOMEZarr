@@ -5609,9 +5609,13 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         imageObserver = node3D.AddObserver(slicer.vtkMRMLVolumeNode.ImageDataModifiedEvent, checkImage)
         # Level 1 fits the GPU: once streamed it is the 3D fallback, sharing the volume node's voxels.
         self.assertTrue(self.waitFor(lambda: streamer.complete and streamer.contextLevel == 1, 20.0))
-        self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "1")
-        self.assertIs(node3D.GetImageData(), streamer.targetImageData)
-        np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), np.asarray(multiscales.images[1].data))
+        self.assertIs(streamer.contextImage, streamer.targetImageData)
+        # A fast machine may already show a level-0 texture for the close default camera; the
+        # fallback is checked once the camera is far away, below.
+        self.assertIn(node3D.GetAttribute("OMEZarr.Level"), ("1", "0"))
+        if node3D.GetAttribute("OMEZarr.Level") == "1":
+            self.assertIs(node3D.GetImageData(), streamer.targetImageData)
+            np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), np.asarray(multiscales.images[1].data))
         display = node3D.GetDisplayNode()
         self.assertTrue(display.IsA("vtkMRMLVolumeRenderingDisplayNode") and display.GetVisibility())
 
