@@ -44,9 +44,14 @@ read from S3 (314 MiB at 0.5 µm). Step by step with screenshots: [TUTORIAL.md](
 * `File → Save`, choose the "OME-Zarr image" format for a scalar or label map
   volume. Saving a label map into `<image>.ome.zarr/labels/<name>` registers
   it as a label of that image.
-* The **OME-Zarr** module lists the resolution levels of a store, loads a
-  chosen level, refines what a slice view shows, or loads the region under a
-  Markups ROI.
+* The **OME-Zarr** module lists the resolution levels of a store. Pick a
+  level, then either **Load selected level** (the level whole, as an ordinary
+  volume) or **Stream selected level** (the coarsest level at once, the
+  chosen one read in the background, slice views first). It also refines what
+  a slice view shows, loads the region under a Markups ROI, and creates a
+  segmentation whose geometry is that region at a chosen level, so the Segment
+  Editor works in a box instead of over the whole store. Every control has a
+  tooltip saying what it loads and what it costs.
 * From Python:
 
   ```python
@@ -59,9 +64,27 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
 
 ## What works
 
-* **Multiscales**: the finest level whose volumes fit the memory budget is
-  loaded. The budget defaults to a quarter of the free RAM and can be fixed in
-  the module settings. A message says which level was chosen.
+* **Multiscales**: a store opened without picking a level (drag-and-drop,
+  Add Data, the Python loader) loads the finest level that fits the memory
+  budget, streamed or whole per the module setting. The budget defaults to a
+  quarter of the free RAM and can be fixed in the module settings. A message
+  says which level was chosen. A level picked in the module is loaded exactly
+  as its button says, whole or streamed; the budget never overrides it.
+* **Segmentation in a box**: with a region of interest selected (the volume
+  rendering's cropping region while the store is rendered), the level table
+  shows the region's size at each level and the memory the Segment Editor
+  needs to edit it. "Create segmentation from the region at the selected
+  level" makes a segmentation with that box, plus a margin of ten empty voxels
+  on every side for dilation and smoothing to grow into, as its reference
+  geometry and the editor's source volume, so editing a large store costs the
+  box, not the store.
+* **One rendering, one region**: with "Volume-render in the 3D view" on, the
+  3D view shows one volume of the store, the streamed texture while
+  streaming or the level or region loaded last; each load hands the
+  rendering over rather than adding one, and when a stream ends its volume
+  keeps the rendering. The region selector crops whichever it is, None
+  shows the whole volume, and "New ROI in view" gives the store's one region,
+  starting as the rendering's cropping box.
 * **Refine view**: reloads the block shown by a slice view at the
   finest level that fits the budget, reading only the chunks it needs, and
   overlays it on the coarse volume in that view with the same window/level.
@@ -104,6 +127,19 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
   a level or a region of interest, refines slice views at full resolution, and
   holds the settings. It also registers the OME-Zarr file reader, file writer
   and drop handler.
+* **Convert to OME-Zarr** (Informatics): converts a large volume on this
+  computer to a multiscale store without loading it into Slicer. Inputs: NRRD
+  (`.nrrd`, `.nhdr`; raw, gzip or bzip2), a folder of slices (TIFF, PNG, BMP,
+  JPEG; NRecon folders with their log), or a multi-page TIFF. The input is read
+  in slabs by a separate Python process, so it can be larger than the memory
+  and Slicer stays responsive. An NRRD keeps its voxel size, origin and
+  orientation; oblique NRRDs are refused, because OME-Zarr 0.5 stores no
+  rotation. Every level is the exact block mean of the full-resolution voxels.
+  Shard size is an option: the default, 128, writes every 128³ chunk as its own
+  file, which suits a local disk; larger shards mean fewer files (network
+  drives, synced folders, object storage) and more memory while converting.
+  The converter also runs on its own:
+  `PythonSlicer OMEZarrConvert/OMEZarrConvertLib/to_omezarr.py <input> <out.ome.zarr> [--shard 384]`.
 
 ## Still to do
 
@@ -115,7 +151,8 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
 ## Development
 
 ```bash
-Slicer --additional-module-paths /path/to/SlicerOMEZarr/OMEZarr
+Slicer --additional-module-paths /path/to/SlicerOMEZarr/OMEZarr /path/to/SlicerOMEZarr/OMEZarrConvert
+python -m pytest OMEZarrConvert/OMEZarrConvertLib/test_to_omezarr.py  # converter checks, no Slicer needed
 Testing/run_headless_test.sh /path/to/Slicer                       # module self-test under Xvfb
 OMEZARR_TEST_REMOTE=1 Testing/run_headless_test.sh /path/to/Slicer # also test an IDR HTTPS store
 ```

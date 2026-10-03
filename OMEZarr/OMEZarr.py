@@ -104,6 +104,13 @@ HTTP_MAX_WAIT_S = 60.0  # longest pause asked by Retry-After that is honored as 
 HTTP_WINDOW_REQUESTS = 900
 HTTP_WINDOW_S = 10.0
 DISK_CACHE_MIB = 10240  # default size of the on-disk cache of remote chunks
+# A segmentation is edited in a box, never over the whole store: the Segment Editor allocates its
+# buffers over the segmentation's reference geometry (a modifier labelmap, the segment's labelmap
+# and an undo copy, one byte per voxel each, plus a copy of the source volume aligned to it). The
+# box is the region of interest at the chosen level plus a margin of zero voxels on every side,
+# so that dilation, smoothing and the like have room to grow past the region.
+SEGMENT_EDITOR_LABEL_BUFFERS = 3
+SEGMENTATION_MARGIN = 10  # voxels on each side of the region
 # Streamed volume rendering: one texture for what the 3D view shows. These are the fallbacks when
 # the GPU's limits cannot be read (macOS reports no video memory; Apple GPUs allow 2048 per side).
 STREAM_3D_MAX_BYTES = 2 << 30
@@ -225,6 +232,17 @@ def normalizeStorePath(path):
 
 def samePath(a, b):
     return a is not None and b is not None and normalizeStorePath(a) == normalizeStorePath(b)
+
+
+def sharedRegistry(name):
+    """A dict kept on ``slicer.modules``, outside this module: reloading the module (Reload in the
+    panel) makes a new OMEZarrLogic class, which must still find the streamers and refiners the
+    previous one started, or they run on with no panel able to stop them."""
+    registry = getattr(slicer.modules, name, None)
+    if not isinstance(registry, dict):
+        registry = {}
+        setattr(slicer.modules, name, registry)
+    return registry
 
 
 def joinStorePath(root, *parts):
@@ -895,24 +913,42 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @classmethod
     def fillVolumeNode(
-        cls, node, image, timeIndex, channelIndex, region, ijkToRas, userMessages, progress, label, dtype=None, reader=None
+        cls,
+        node,
+        image,
+        timeIndex,
+        channelIndex,
+        region,
+        ijkToRas,
+        userMessages,
+        progress,
+        label,
+        dtype=None,
+        reader=None,
+        pad=None,
     ):
         """Read a (z, y, x) volume straight into the node's image buffer.
 
         The vtkImageData is allocated first and the dask array is computed into a numpy
         view of its scalars, so peak memory is one copy of the volume, not two. ``dtype``
         overrides the stored type (label maps must be integer). ``reader``: the level's
-        ChunkReader, which reads remote chunks instead of dask.
+        ChunkReader, which reads remote chunks instead of dask. ``pad``: dim -> (before, after)
+        voxels of zeros around the data on that axis; ``ijkToRas`` is then the padded volume's.
         """
         from vtk.util import numpy_support
 
         sub, addZ = cls.spatialDaskArray(image, timeIndex, channelIndex, region, userMessages)
         shape = (1, *sub.shape) if addZ else tuple(sub.shape)
+        pads = [tuple(int(n) for n in (pad or {}).get(d, (0, 0))) for d in ("z", "y", "x")]
+        padded = tuple(n + before + after for n, (before, after) in zip(shape, pads, strict=True))
         dtype = np.dtype(dtype) if dtype else cls.vtkCompatibleDtype(sub.dtype)
         imageData = vtk.vtkImageData()
-        imageData.SetDimensions(int(shape[2]), int(shape[1]), int(shape[0]))
+        imageData.SetDimensions(int(padded[2]), int(padded[1]), int(padded[0]))
         imageData.AllocateScalars(numpy_support.get_vtk_array_type(dtype), 1)
-        view = numpy_support.vtk_to_numpy(imageData.GetPointData().GetScalars()).reshape(shape)
+        view = numpy_support.vtk_to_numpy(imageData.GetPointData().GetScalars()).reshape(padded)
+        if padded != shape:
+            view[:] = 0
+            view = view[tuple(slice(before, before + n) for n, (before, _after) in zip(shape, pads, strict=True))]
         if reader is not None and not addZ:
             grid = LevelChunks(image, timeIndex, channelIndex, reader)
             zyx = tuple(tuple(region[d]) if region and d in region else (0, n) for d, n in zip(("z", "y", "x"), grid.shape))
@@ -1117,9 +1153,14 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         for channelIndex in channels:
             label = descriptions[channelIndex]["label"] or (f"c{channelIndex}" if len(descriptions) > 1 else None)
             nodeName = f"{baseName}_{label}" if label else baseName
+            whole = not region and not asSequence and announceLevel  # a level loaded whole, not streamed
+            existing = cls.loadedWholeVolume(path, level, timeIndex, channelIndex) if whole else None
             if region:
                 nodeName += "_ROI"
-            nodeName = slicer.mrmlScene.GenerateUniqueName(nodeName)
+            elif whole:
+                nodeName += f" L{level}"  # the name says which level; loading it again refills this node
+            if existing is None:
+                nodeName = slicer.mrmlScene.GenerateUniqueName(nodeName)
             if asSequence:
                 sequence = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode", nodeName + "_sequence")
                 sequence.SetIndexName("time")
@@ -1148,7 +1189,9 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 )
                 sequences.append((sequence, descriptions[channelIndex]))
             else:
-                node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", nodeName)
+                node = existing or slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", nodeName)
+                if existing is not None and not node.GetName().endswith(f" L{level}"):
+                    node.SetName(nodeName)
                 cls.fillVolumeNode(
                     node, image, timeIndex, channelIndex, region, ijkToRas, userMessages, progress, nodeName,
                     reader=runResponsive(lambda: cls.chunkReader(multiscales, level)),
@@ -1156,7 +1199,8 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 cls.setNodeAttributes(
                     node, path, level, dims, timeIndex, channelIndex, lengthUnit, orientationSource, region
                 )
-                cls.setupDisplay(node, descriptions[channelIndex], multiChannel=len(descriptions) > 1)
+                if existing is None:  # a refilled node keeps its window, level and colours
+                    cls.setupDisplay(node, descriptions[channelIndex], multiChannel=len(descriptions) > 1)
                 nodes.append(node)
 
         if sequences:
@@ -1383,6 +1427,148 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             progress=progress,
         )
 
+    # ---- segmentation ----
+
+    @classmethod
+    def boxAtLevel(cls, image, rasBounds, margin=SEGMENTATION_MARGIN):
+        """The box a segmentation of ``rasBounds`` is edited in at this level: {"region"} the
+        index ranges (dim -> (start, stop)) of the bounds, {"box"} the region grown by ``margin``
+        voxels on every side (past the image's edges when the region touches them: those voxels
+        are zeros), {"dims"} the box's size (x, y, z)."""
+        region = cls.regionFromRasBounds(image, rasBounds)
+        box = {d: (start - margin, stop + margin) for d, (start, stop) in region.items()}
+        size = [box[d][1] - box[d][0] if d in box else cls.axisLength(image, d) for d in SPATIAL_DIMS]
+        return {"region": region, "box": box, "dims": size, "margin": margin}
+
+    @classmethod
+    def segmentationBoxes(cls, path, roiNode, multiscales=None):
+        """The box of a region of interest at every level, for a segmentation to be edited in:
+        one {"level", "region", "box", "dims" (x, y, z), "margin", "bytes"} per level (see
+        boxAtLevel), ``bytes`` being the Segment Editor's working set for it (two copies of the
+        source volume and SEGMENT_EDITOR_LABEL_BUFFERS bytes per voxel of labelmaps). Raises
+        ValueError when the region misses the image."""
+        multiscales = multiscales or cls.openMultiscales(path)
+        bounds = [0.0] * 6
+        roiNode.GetRASBounds(bounds)
+        itemSize = np.dtype(cls.vtkCompatibleDtype(multiscales.images[0].data.dtype)).itemsize
+        boxes = []
+        for level, image in enumerate(multiscales.images):
+            box = cls.boxAtLevel(image, bounds)
+            box["level"] = level
+            box["bytes"] = int(np.prod(box["dims"])) * (2 * itemSize + SEGMENT_EDITOR_LABEL_BUFFERS)
+            boxes.append(box)
+        return boxes
+
+    @classmethod
+    def workingVolumeNode(cls, segmentation):
+        """The volume holding the box ``segmentation`` is edited in: one per segmentation, so that
+        making another segmentation never pulls the ground from under an earlier one. Not saved
+        with the scene (it is re-read from the store), and removed with its segmentation."""
+        existing = cls.segmentationSource(segmentation)
+        if existing is not None:
+            return existing
+        node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLScalarVolumeNode", slicer.mrmlScene.GenerateUniqueName(segmentation.GetName() + "_source")
+        )
+        node.SetSaveWithScene(False)
+        node.SetAttribute("OMEZarr.Role", "segmentationSource")
+        node.SetAttribute("OMEZarr.Segmentation", segmentation.GetID())
+        cls.watchSegmentationSources()
+        return node
+
+    @staticmethod
+    def segmentationSource(segmentation):
+        """The source volume made for ``segmentation``, if it is still in the scene."""
+        for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+            if node.GetAttribute("OMEZarr.Role") == "segmentationSource" and node.GetAttribute("OMEZarr.Segmentation") == segmentation.GetID():
+                return node
+        return None
+
+    @classmethod
+    def watchSegmentationSources(cls):
+        """Once per scene: a source volume leaves the scene with its segmentation."""
+        observers = sharedRegistry("OMEZarrSceneObservers")
+        if observers.get("segmentationSources") is not None:
+            return
+
+        # VTK hands the removed node to a Python observer only when the callback declares its type.
+        @vtk.calldata_type(vtk.VTK_OBJECT)
+        def onNodeRemoved(caller, event, node):
+            if node is None or not node.IsA("vtkMRMLSegmentationNode"):
+                return
+            for source in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+                if source.GetAttribute("OMEZarr.Segmentation") == node.GetID():
+                    slicer.mrmlScene.RemoveNode(source)
+
+        # The scene survives module reloads, so the one observer is kept in a shared registry.
+        tag = slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeRemovedEvent, onNodeRemoved)
+        observers["segmentationSources"] = (tag, onNodeRemoved)
+
+    @staticmethod
+    def segmentEditorNode():
+        """The Segment Editor module's parameter node (created when the module has not made it yet)."""
+        node = slicer.mrmlScene.GetSingletonNode("SegmentEditor", "vtkMRMLSegmentEditorNode")
+        if node is None:
+            node = slicer.vtkMRMLSegmentEditorNode()
+            node.SetSingletonTag("SegmentEditor")
+            node = slicer.mrmlScene.AddNode(node)
+        return node
+
+    @classmethod
+    def createSegmentationFromRoi(cls, path, roiNode, level, timeIndex=0, name=None, userMessages=None, progress=None):
+        """A segmentation whose reference geometry is the region of interest's box at ``level``
+        (segmentationBoxes): the box's voxels are read into a source volume of its own and both
+        are selected in the Segment Editor. Returns {"segmentation", "sourceVolume", "box"}."""
+        multiscales = cls.openMultiscales(path)
+        level = int(level)
+        box = cls.segmentationBoxes(path, roiNode, multiscales)[level]
+        region = box["region"]
+        image = multiscales.images[level]
+        # The volume's origin is the box's corner; the region's voxels sit ``margin`` in from it.
+        ijkToRas, orientationSource = cls.regionIjkToRas(image, box["box"], userMessages)
+        segmentation = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", slicer.mrmlScene.GenerateUniqueName(name or cls.defaultNodeName(path) + "_segmentation")
+        )
+        source = cls.workingVolumeNode(segmentation)
+        reader = runResponsive(lambda: cls.chunkReader(multiscales, level))
+        pad = {d: (box["margin"], box["margin"]) for d in region}
+        try:
+            cls.fillVolumeNode(
+                source, image, timeIndex, 0, region, ijkToRas, userMessages, progress, source.GetName(), reader=reader, pad=pad
+            )
+        except BaseException:
+            slicer.mrmlScene.RemoveNode(segmentation)  # and its source, through the scene observer
+            raise
+        dims = list(image.dims)
+        lengthUnit = cls.lengthUnit(image)
+        cls.setNodeAttributes(source, path, level, dims, timeIndex, 0, lengthUnit, orientationSource, region)
+        source.SetAttribute("OMEZarr.Margin", str(box["margin"]))
+        if source.GetDisplayNode() is None:
+            source.CreateDefaultDisplayNodes()
+        cls.matchDisplay(source, path)
+
+        segmentation.CreateDefaultDisplayNodes()
+        segmentation.SetReferenceImageGeometryParameterFromVolumeNode(source)
+        cls.setNodeAttributes(segmentation, path, level, dims, timeIndex, 0, lengthUnit, orientationSource, region)
+        segmentation.SetAttribute("OMEZarr.Margin", str(box["margin"]))
+        editorNode = cls.segmentEditorNode()
+        editorNode.SetAndObserveSegmentationNode(segmentation)
+        editorNode.SetAndObserveSourceVolumeNode(source)
+        # The editor's selected segment belonged to the previous segmentation; the new one has
+        # no segments yet. Left in place, tools that read the selection (NNInteractive) look
+        # for a segment the new segmentation does not have.
+        editorNode.SetSelectedSegmentID(None)
+        logging.info(
+            "Segmentation %s: level %d, %d x %d x %d voxels (region %s plus a %d-voxel margin), editor working set %.2f GiB",
+            segmentation.GetName(),
+            level,
+            *box["dims"],
+            source.GetAttribute("OMEZarr.Region"),
+            box["margin"],
+            box["bytes"] / 2**30,
+        )
+        return {"segmentation": segmentation, "sourceVolume": source, "box": box}
+
     # ---- view-driven refinement ----
 
     @staticmethod
@@ -1393,18 +1579,16 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         if sliceWidget is None:
             raise ValueError(f"No slice view named '{sliceViewName}'")
         sliceNode = sliceWidget.mrmlSliceNode()
-        sliceToRas = slicer.util.arrayFromVTKMatrix(sliceNode.GetSliceToRAS())
         width, height, _depth = sliceNode.GetFieldOfView()
         thickness = min(width, height) / 2.0
-        corners = np.array(
-            [
-                [x, y, z, 1.0]
-                for x in (-width / 2, width / 2)
-                for y in (-height / 2, height / 2)
-                for z in (-thickness / 2, thickness / 2)
-            ]
-        )
-        ras = (sliceToRas @ corners.T).T[:, :3]
+        # The view's pixel-to-RAS mapping carries the pan, which SliceToRAS does not; the slab
+        # extends along the plane's normal (SliceToRAS's third column).
+        xyToRas = slicer.util.arrayFromVTKMatrix(sliceNode.GetXYToRAS())
+        normal = slicer.util.arrayFromVTKMatrix(sliceNode.GetSliceToRAS())[:3, 2]
+        normal = normal / (np.linalg.norm(normal) or 1.0)
+        dims = sliceNode.GetDimensions()
+        plane = (xyToRas @ np.array([[x, y, 0.0, 1.0] for x in (0.0, dims[0]) for y in (0.0, dims[1])]).T).T[:, :3]
+        ras = np.concatenate([plane + normal * (thickness / 2.0), plane - normal * (thickness / 2.0)])
         return [ras[:, 0].min(), ras[:, 0].max(), ras[:, 1].min(), ras[:, 1].max(), ras[:, 2].min(), ras[:, 2].max()]
 
     @staticmethod
@@ -1440,6 +1624,29 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                     return background
         candidates = [n for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode") if matches(n)]
         return candidates[-1] if candidates else None
+
+    @staticmethod
+    def loadedWholeVolume(path, level, timeIndex, channelIndex):
+        """The volume holding this level of the store whole (one time point and channel), not
+        streamed now and not a region: loading the level again refills it instead of adding a copy."""
+        streamer = OMEZarrLogic.streamer(path)
+        streamed = streamer.node if streamer is not None and not streamer.stopped else None
+        for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")[::-1]:
+            if (
+                node is not streamed
+                and not node.IsA("vtkMRMLLabelMapVolumeNode")
+                and samePath(node.GetAttribute("OMEZarr.Path"), path)
+                and node.GetAttribute("OMEZarr.Level") == str(level)
+                and node.GetAttribute("OMEZarr.TimeIndex") == str(timeIndex)
+                and node.GetAttribute("OMEZarr.Channel") == str(channelIndex)
+                and not any(
+                    node.GetAttribute(key)
+                    for key in ("OMEZarr.Region", "OMEZarr.Refined", "OMEZarr.Role", "OMEZarr.Streamed", "OMEZarr.Streamed3D")
+                )
+                and node.GetScene() is not None
+            ):
+                return node
+        return None
 
     @classmethod
     def matchDisplay(cls, node, path, sliceViewName=None):
@@ -1532,7 +1739,10 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     # ---- automatic refinement ----
 
-    _autoRefiners = {}
+    @staticmethod
+    def autoRefiners():
+        """path -> AutoRefiner, shared across module reloads."""
+        return sharedRegistry("OMEZarrAutoRefiners")
 
     DEFAULT_AUTO_REFINE_VIEWS = ("Red", "Yellow", "Green")
 
@@ -1546,38 +1756,48 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         if isinstance(sliceViewNames, str):
             sliceViewNames = (sliceViewNames,)
         refiner = AutoRefiner(str(path), list(sliceViewNames), delayMs, maxBytes)
-        cls._autoRefiners[str(path)] = refiner
+        cls.autoRefiners()[str(path)] = refiner
         return refiner
 
     @classmethod
     def stopAutoRefine(cls, path=None):
-        keys = [str(path)] if path is not None else list(cls._autoRefiners)
+        refiners = cls.autoRefiners()
+        keys = [str(path)] if path is not None else list(refiners)
         for key in keys:
-            refiner = cls._autoRefiners.pop(key, None)
+            refiner = refiners.pop(key, None)
             if refiner is not None:
                 refiner.stop()
 
     @classmethod
     def autoRefiner(cls, path):
-        return cls._autoRefiners.get(str(path))
+        return cls.autoRefiners().get(str(path))
 
     # ---- streaming ----
 
-    _streamers = {}
+    @staticmethod
+    def streamers():
+        """path -> Streamer, shared across module reloads."""
+        return sharedRegistry("OMEZarrStreamers")
+
     panel = None  # the module widget, refreshed by streamers while they read
 
     @classmethod
-    def streamingLevels(cls, multiscales, maxBytes=None, timeMode=None):
-        """(coarsest, target) levels when the store should be streamed, else None.
-
-        Streaming covers one 3D channel and one time point: it pays off when the level the
-        budget allows is finer than the coarsest one, so there is something to wait for.
-        """
+    def streamable(cls, multiscales, timeMode=None):
+        """Streaming covers one 3D channel and one time point."""
         base = multiscales.images[0]
         dims = list(base.dims)
         if "z" not in dims or len(cls.channelDescriptions(multiscales, base)) != 1:
-            return None
+            return False
         if cls.axisLength(base, "t") > 1 and (timeMode or Settings.get(Settings.TIME_MODE, "sequence")) == "sequence":
+            return False
+        return True
+
+    @classmethod
+    def streamingLevels(cls, multiscales, maxBytes=None, timeMode=None):
+        """(coarsest, target) levels when the store should be streamed, else None: it pays off
+        when the level the budget allows is finer than the coarsest one, so there is something
+        to wait for."""
+        if not cls.streamable(multiscales, timeMode):
             return None
         coarsest = len(multiscales.images) - 1
         target = cls.selectLevel(multiscales, maxBytes or cls.maxBytesFromSettings())
@@ -1589,22 +1809,91 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         cls.stopStreaming(path)
         cls.stopAutoRefine(path)
         streamer = Streamer(str(path), node, cls.openMultiscales(path), int(targetLevel), sliceViewNames, timeIndex)
-        cls._streamers[str(path)] = streamer
+        cls.streamers()[str(path)] = streamer
         return streamer
 
     @classmethod
     def stopStreaming(cls, path=None, wait=False):
         """Stop streaming ``path`` (all stores without one). ``wait``: also let the reader threads
         finish the chunk they are reading, as Python must not be finalized under them."""
-        keys = [str(path)] if path is not None else list(cls._streamers)
+        streamers = cls.streamers()
+        keys = [str(path)] if path is not None else list(streamers)
         for key in keys:
-            streamer = cls._streamers.pop(key, None)
+            streamer = streamers.pop(key, None)
             if streamer is not None:
                 streamer.stop(wait)
 
     @classmethod
     def streamer(cls, path):
-        return cls._streamers.get(str(path))
+        return cls.streamers().get(str(path))
+
+    NAME_CORNER = 2  # upper left of a view: the volume it shows
+    LEVEL_CORNER = 3  # upper right: its level
+
+    @staticmethod
+    def renderedVolume():
+        """The volume the 3D view volume-renders, if one is visible."""
+        for display in slicer.util.getNodesByClass("vtkMRMLVolumeRenderingDisplayNode"):
+            if display.GetVisibility() and display.GetVolumeNode() is not None:
+                return display.GetVolumeNode()
+        return None
+
+    @classmethod
+    def updateViewLabels(cls, clear=False):
+        """Each view names the volume it shows in its upper left corner and the level in the
+        upper right ("L1"). A slice view over a streamed volume shows the level of the plane laid
+        on it and "(loading L0)" while that plane is read; the 3D view names the volume it renders."""
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return
+        streamers = [s for s in cls.streamers().values() if not s.stopped]
+
+        def label(node, level=None):
+            level = node.GetAttribute("OMEZarr.Level") if level is None else level
+            name = re.sub(r" L\d+$", "", node.GetName())  # a level loaded whole carries its level in its name
+            return name, (f"L{level}" if level not in (None, "") else "")
+
+        views = []
+        for viewName in layoutManager.sliceViewNames():
+            sliceWidget = layoutManager.sliceWidget(viewName)
+            if sliceWidget is None:
+                continue
+            background = sliceWidget.sliceLogic().GetBackgroundLayer().GetVolumeNode()
+            name, level = "", ""
+            if background is not None:
+                name, level = label(background)
+                for streamer in streamers:
+                    if streamer.node is not background:
+                        continue
+                    overlay, request = streamer.overlays.get(viewName), streamer.views.get(viewName)
+                    if overlay is not None and overlay.GetScene() is not None:
+                        name, level = label(background, overlay.GetAttribute("OMEZarr.Level"))
+                    if request is not None and not request["shown"]:
+                        level += _(" (loading L{level})").format(level=request["level"])
+            views.append((sliceWidget.sliceView(), name, level))
+        if layoutManager.threeDViewCount:
+            rendered = cls.renderedVolume()
+            name, level = "", ""
+            if rendered is not None:
+                name, level = label(rendered)
+                for streamer in streamers:
+                    if streamer.volume3D is rendered and streamer.shown3D:
+                        name, level = label(streamer.node, streamer.shown3D[0])
+            views.append((layoutManager.threeDWidget(0).threeDView(), name, level))
+        for view, name, level in views:
+            if clear:
+                name, level = "", ""
+            try:
+                annotation = view.cornerAnnotation()
+            except AttributeError:
+                continue
+            changed = False
+            for corner, text in ((cls.NAME_CORNER, name), (cls.LEVEL_CORNER, level)):
+                if annotation.GetText(corner) != text:
+                    annotation.SetText(corner, text)
+                    changed = True
+            if changed:
+                view.scheduleRender()
 
     @classmethod
     def onAboutToQuit(cls):
@@ -2601,7 +2890,6 @@ class Streamer:
         self.displayEdited = False  # the 3D display (its transfer function) changed since the last update3D
         self.reusedChunks = 0  # chunks copied from the previous 3D texture instead of read again
         self.opacityCache = None  # (MTimes, opacity per value bin, low value, bins per value, unit distance mm)
-        self.unfit3D = None  # (level, dims z y x, bytes) the view wanted but no texture holds: shown in its label
         self.reads = collections.deque(maxlen=4096)  # (end time, decoded bytes, seconds, from disk) per chunk read
         self.lastStatus = 0.0
         self.idleShown = False
@@ -2897,9 +3185,11 @@ class Streamer:
             return None
         pixel = min(fov[0] / dims[0], fov[1] / dims[1])
         level = next((lv for lv in reversed(range(len(self.levels))) if self.spacing[lv] <= pixel * 1.001), 0)
-        sliceToRas = slicer.util.arrayFromVTKMatrix(sliceNode.GetSliceToRAS())
-        corners = np.array([[x, y, 0.0, 1.0] for x in (-fov[0] / 2, fov[0] / 2) for y in (-fov[1] / 2, fov[1] / 2)])
-        ras = sliceToRas @ corners.T
+        # The view's own pixel-to-RAS mapping: it carries the pan (an in-plane offset on the slice
+        # node that SliceToRAS does not), so the plane is where the view is, not where it started.
+        xyToRas = slicer.util.arrayFromVTKMatrix(sliceNode.GetXYToRAS())
+        corners = np.array([[x, y, 0.0, 1.0] for x in (0.0, dims[0]) for y in (0.0, dims[1])])
+        ras = xyToRas @ corners.T
         while level < self.shownLevel:
             region = self.planeRegion(level, ras)
             if region is None:
@@ -2916,7 +3206,9 @@ class Streamer:
         layoutManager = slicer.app.layoutManager()
         for viewName in self.sliceViewNames:
             sliceWidget = layoutManager.sliceWidget(viewName) if layoutManager else None
-            request = self.viewRequest(sliceWidget.mrmlSliceNode()) if sliceWidget is not None else None
+            # Only views showing this volume get its planes: a region loaded whole keeps its view.
+            showsVolume = sliceWidget is not None and sliceWidget.sliceLogic().GetBackgroundLayer().GetVolumeNode() is self.node
+            request = self.viewRequest(sliceWidget.mrmlSliceNode()) if showsVolume else None
             if request is None:
                 self.views.pop(viewName, None)
                 self.removeOverlay(viewName)
@@ -3259,42 +3551,9 @@ class Streamer:
 
     LEVEL_CORNER = 3  # upper right; Slicer's own slice annotations use the other corners
 
-    def levelText(self, level):
-        return _("OME-Zarr level {level} · {size:g} µm").format(level=level, size=round(self.spacing[level] * 1000, 1))
-
-    def viewWidgets(self):
-        layoutManager = slicer.app.layoutManager()
-        if layoutManager is None:
-            return []
-        widgets = []
-        for viewName in self.sliceViewNames:
-            sliceWidget = layoutManager.sliceWidget(viewName)
-            if sliceWidget is not None:
-                widgets.append((viewName, sliceWidget.sliceView()))
-        if layoutManager.threeDViewCount:
-            widgets.append(("3D", layoutManager.threeDWidget(0).threeDView()))
-        return widgets
-
     def updateLevelLabels(self, clear=False):
-        """Show, in each view's corner, the resolution level it displays."""
-        for viewName, view in self.viewWidgets():
-            if viewName == "3D":
-                text = self.levelText(self.shown3D[0]) + self.unfitText() if (self.volume3D is not None and self.shown3D) else ""
-            else:
-                request, overlay = self.views.get(viewName), self.overlays.get(viewName)
-                shown = int(overlay.GetAttribute("OMEZarr.Level")) if overlay is not None and overlay.GetScene() else None
-                text = self.levelText(shown if shown is not None else self.shownLevel)
-                if request is not None and not request["shown"]:
-                    text += _(" (loading level {level})").format(level=request["level"])
-            if clear:
-                text = ""
-            try:
-                annotation = view.cornerAnnotation()
-            except AttributeError:
-                continue
-            if annotation.GetText(self.LEVEL_CORNER) != text:
-                annotation.SetText(self.LEVEL_CORNER, text)
-                view.scheduleRender()
+        """Each view's corner names the volume it shows and its level (OMEZarrLogic.updateViewLabels)."""
+        OMEZarrLogic.updateViewLabels(clear)
 
     def levelState(self, level):
         """(mark, description) of a level for the module's level table."""
@@ -3390,6 +3649,10 @@ class Streamer:
         self.detectGpuLimits(widget)
         self.showContext3D()
         self.planContext()
+        # The default transfer function is derived from the node's window and level, so give the 3D
+        # node the streamed volume's display first (without it the rendering is a solid block).
+        node.CreateDefaultDisplayNodes()
+        self.copyDisplay(node)
         volumeRenderingLogic = slicer.modules.volumerendering.logic()
         display = volumeRenderingLogic.CreateDefaultVolumeRenderingNodes(node)
         display.SetVisibility(True)
@@ -3459,11 +3722,10 @@ class Streamer:
         ras = (self.ijkToRas[level] @ corners.T)[:3]
         return ras.min(axis=1), ras.max(axis=1)
 
-    def volumeRequest(self, finest=0):
-        """What the 3D view needs: the part of the volume inside the camera's view (and the
-        cropping ROI) between the depths it shows, at the coarsest level whose voxels are no larger
-        than a screen pixel at the focal point (never finer than ``finest``), within the texture
-        limits. None when the context level will do."""
+    def visibleBounds(self):
+        """What the 3D view shows: RAS points (3 x n) of the lattice cells inside the camera's
+        view (and the cropping ROI) between the depths its opacity shows, grown by one cell, and
+        the screen pixel size (mm) at the focal point. None when nothing is in view."""
         widget, cameraNode = self.cameraNode3D()
         if cameraNode is None:
             return None
@@ -3485,7 +3747,13 @@ class Streamer:
         ijk = np.stack([i.ravel(), j.ravel(), k.ravel(), np.ones(i.size)])
         ras = self.ijkToRas[self.contextLevel] @ ijk
         inside = (sides @ ras >= 0).all(axis=0)
-        display = self.volume3D.GetDisplayNode() if self.volume3D is not None else None
+        # The volume rendering display node, not the node's first display node: a scalar display
+        # node can come first (seen when another module shows the node in the slice views).
+        display = (
+            slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(self.volume3D)
+            if self.volume3D is not None
+            else None
+        )
         roi = display.GetROINode() if display is not None and display.GetCroppingEnabled() else None
         roiBounds = None
         if roi is not None:
@@ -3521,18 +3789,32 @@ class Streamer:
             pixel = 2.0 * camera.GetParallelScale() / height
         else:
             pixel = 2.0 * camera.GetDistance() * np.tan(np.radians(camera.GetViewAngle() / 2.0)) / height
+        return points, pixel
+
+    def regionAtLevel(self, points, level):
+        """The (z, y, x) index ranges at ``level`` spanning RAS ``points`` (3 x n), within the volume."""
+        index = np.linalg.inv(self.ijkToRas[level]) @ np.vstack([points[:3], np.ones(points.shape[1])])
+        region = []
+        for row, size in zip((2, 1, 0), self.levels[level].shape):
+            start = max(0, int(np.floor(index[row].min())))
+            stop = min(size, int(np.ceil(index[row].max())) + 1)
+            region.append((start, stop))
+        return tuple(region)
+
+    def volumeRequest(self, finest=0):
+        """What the 3D view needs: the part of the volume inside the camera's view (and the
+        cropping ROI) between the depths it shows, at the coarsest level whose voxels are no larger
+        than a screen pixel at the focal point (never finer than ``finest``), within the texture
+        limits. None when the context level will do."""
+        visible = self.visibleBounds()
+        if visible is None:
+            return None
+        points, pixel = visible
         level = next((lv for lv in reversed(range(len(self.levels))) if self.spacing[lv] <= pixel * 1.001), 0)
         level = max(level, finest)
         itemSize = np.dtype(self.dtype).itemsize
-        self.unfit3D = None
         for level in range(level, self.contextLevel):
-            index = np.linalg.inv(self.ijkToRas[level]) @ points
-            region = []
-            for row, size in zip((2, 1, 0), self.levels[level].shape):
-                start = max(0, int(np.floor(index[row].min())))
-                stop = min(size, int(np.ceil(index[row].max())) + 1)
-                region.append((start, stop))
-            region = tuple(region)
+            region = self.regionAtLevel(points, level)
             dims = [stop - start for start, stop in region]
             if min(dims) <= 0:
                 return None
@@ -3540,25 +3822,7 @@ class Streamer:
             # the specimen at its face, so a box too big for one texture is shown one level coarser.
             if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
                 return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
-            if self.unfit3D is None:
-                self.unfit3D = (level, dims, int(np.prod(dims)) * itemSize)
         return None
-
-    def unfitText(self):
-        """Why the 3D view shows no finer level, for its label; empty when it shows what it wants."""
-        if self.unfit3D is None:
-            return ""
-        level, dims, nbytes = self.unfit3D
-        shown = self.shown3D[0] if self.shown3D else self.contextLevel
-        if level >= shown:
-            return ""
-        if max(dims) > self.maxTextureDim:
-            limit = _("{side} per side").format(side=self.maxTextureDim)
-        else:
-            limit = _("{gib:.1f} GiB").format(gib=self.maxTextureBytes / 2**30)
-        return _(" · level {level} would need {x}×{y}×{z} voxels ({gib:.1f} GiB), over the 3D texture limit of {limit}").format(
-            level=level, x=dims[2], y=dims[1], z=dims[0], gib=nbytes / 2**30, limit=limit
-        )
 
     def opacityLookup(self):
         """(opacity per value bin, low value, bins per value unit, opacity unit distance in mm) of the
@@ -3921,16 +4185,38 @@ class Streamer:
         self.setVolume3D(image, ijkToRas, level)
         self.shown3D = (level, region)
 
+    def handOver3D(self):
+        """The volume node takes the 3D view over from the streamed texture when streaming ends,
+        with the same cropping and transfer function: the store keeps its one rendering."""
+        if self.volume3D is None or self.volume3D.GetScene() is None or self.node.GetScene() is None:
+            return
+        if slicer.mrmlScene.IsClosing() or slicer.mrmlScene.IsBatchProcessing():
+            return
+        logic = slicer.modules.volumerendering.logic()
+        old = logic.GetFirstVolumeRenderingDisplayNode(self.volume3D)
+        if old is None or not old.GetVisibility():
+            return
+        display = logic.GetFirstVolumeRenderingDisplayNode(self.node) or logic.CreateDefaultVolumeRenderingNodes(self.node)
+        if old.GetVolumePropertyNode() is not None and display.GetVolumePropertyNode() is not None:
+            display.GetVolumePropertyNode().Copy(old.GetVolumePropertyNode())
+        display.SetAndObserveROINodeID(old.GetROINodeID())
+        display.SetCroppingEnabled(old.GetCroppingEnabled())
+        display.SetVisibility(True)
+
     def stop(self, wait=False):
+        """``wait``: the application is shutting down (or a test is done), so the reader threads
+        are joined and the 3D view is not handed over."""
         if self.stopped:
             if wait:
                 self.joinReaders()
             return
+        if not wait:
+            self.handOver3D()
         self.disable3D(stopWhenDone=False)
-        self.updateLevelLabels(clear=not self.complete or self.node.GetScene() is None)
         if not self.complete and slicer.util.mainWindow():
             slicer.util.showStatusMessage("", 1)  # the streaming line does not time out by itself
         self.stopped = True
+        self.updateLevelLabels()  # the views keep naming what they show, without this streamer's planes
         self.viewTimer.stop()
         self.pollTimer.stop()
         self.yieldTimer.stop()
@@ -3998,13 +4284,14 @@ class OMEZarrFileReader:
             maxBytes = optional("maxBytes", int)
             timeMode = optional("timeMode", str)
             asLabelMap = optional("asLabelMap", lambda v: str(v).lower() in ("true", "1"))
+            stream = optional("stream", lambda v: str(v).lower() in ("true", "1"))
             with Progress(_("Loading OME-Zarr..."), properties["fileName"]) as progress:
                 # Reading the store's metadata (and probing for a label map) goes over the network:
                 # off the GUI thread, under the progress dialog, so a slow server cannot freeze Slicer.
                 progress(0, 1, _("Reading {name}...").format(name=os.path.basename(root.rstrip("/"))))
                 DiskCache.instance()  # set up from the settings here; the readers use it from their threads
                 streaming = None
-                if self.mayStream(properties, asLabelMap):
+                if self.mayStream(properties, asLabelMap, stream, level):
                     streaming = runResponsive(
                         lambda: self.streamingLevels(root, level, maxBytes, timeMode, asLabelMap),
                         lambda: progress(0, 1) or None,
@@ -4050,37 +4337,43 @@ class OMEZarrFileReader:
                         streamer.enable3D()
             elif coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
                 OMEZarrLogic.startAutoRefine(root)
+            OMEZarrLogic.updateViewLabels()
         self.parent.loadedNodes = [node.GetID() for node in nodes]
         return True
 
     @staticmethod
-    def mayStream(properties, asLabelMap):
-        """The streaming conditions that need the GUI thread (settings, views)."""
-        return bool(
-            not asLabelMap
-            and properties.get("show", True)
-            and Settings.get(Settings.STREAM, True)
-            and slicer.app.layoutManager() is not None
-        )
+    def mayStream(properties, asLabelMap, stream=None, level=None):
+        """Whether this load streams: as asked (``stream``), else by the setting for a load that
+        names no level. A level asked for without a word on streaming is loaded whole: it is
+        what the caller wants in memory. Needs the GUI thread (settings, views)."""
+        if asLabelMap or not properties.get("show", True) or slicer.app.layoutManager() is None:
+            return False
+        if stream is not None:
+            return bool(stream)
+        return level is None and Settings.get(Settings.STREAM, True)
 
     @staticmethod
     def streamingLevels(root, level, maxBytes, timeMode, asLabelMap):
-        """(shown, target) when this load should show a level at once and stream a finer target:
-        the coarsest level by default, or the level asked for when the budget allows a finer one.
+        """(shown, target) when this load streams: the coarsest level is shown at once and the
+        target read behind it, the level asked for or else the one the memory budget allows.
+        None when the store cannot be streamed, or the target is the coarsest level itself.
         Reads the store over the network: run it off the GUI thread."""
         if isBioformats2rawRoot(root) or isLabelStore(root):
             return None
         multiscales = OMEZarrLogic.openMultiscales(root)
         if asLabelMap is None and OMEZarrLogic.looksLikeLabelMap(multiscales):
             return None
-        levels = OMEZarrLogic.streamingLevels(multiscales, maxBytes, timeMode)
+        if level is None:
+            levels = OMEZarrLogic.streamingLevels(multiscales, maxBytes, timeMode)
+        else:
+            # The level asked for is read whole behind the coarsest; the slice views refine beyond
+            # it as they zoom, so even the coarsest level streams (nothing to read, views only).
+            coarsest = len(multiscales.images) - 1
+            levels = (coarsest, level) if OMEZarrLogic.streamable(multiscales, timeMode) and 0 <= level <= coarsest else None
         if levels is not None:
             for index in range(len(multiscales.images)):  # the streamer then has its readers at once
                 OMEZarrLogic.chunkReader(multiscales, index)
-        if levels is None or level is None:
-            return levels
-        target = levels[1]
-        return (level, target) if 0 <= level < len(multiscales.images) and target < level else None
+        return levels
 
 
 #
@@ -4215,6 +4508,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
 
         self.levelTable = qt.QTableWidget(0, 4)
         self.levelTable.setHorizontalHeaderLabels([_("Level"), _("Voxels (x, y, z)"), _("Spacing"), _("Memory")])
+        self.levelTable.setToolTip(
+            _(
+                "The store's resolution levels: select one, then Load (whole), Stream, Load region or Create "
+                "segmentation. Bold: the level the memory budget would pick. With a region of interest selected, "
+                "the columns show the region's box at each level and the memory the Segment Editor needs for it."
+            )
+        )
         self.levelTable.setTextElideMode(qt.Qt.ElideRight)
         self.levelTable.setWordWrap(False)
         self.levelTable.verticalHeader().setVisible(False)
@@ -4238,13 +4538,35 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.timeIndexSpinBox = qt.QSpinBox()
         self.timeIndexSpinBox.setRange(0, 0)
         self.timeIndexSpinBox.setSpecialValueText(_("all (sequence)"))
+        self.timeIndexSpinBox.setToolTip(
+            _("Time series only: the time point to load, or all of them as a Sequence (streaming needs one time point)")
+        )
         timeRow = qt.QHBoxLayout()
         timeRow.addWidget(self.timeIndexLabel)
         timeRow.addWidget(self.timeIndexSpinBox, 1)
         storeLayout.addLayout(timeRow)
 
         self.loadButton = qt.QPushButton(_("Load selected level"))
-        storeLayout.addWidget(self.loadButton)
+        self.loadButton.setToolTip(
+            _(
+                "Download the selected level whole, as an ordinary volume that any module can use: every chunk "
+                "of the level is read (and kept in the disk cache), and the volume takes the memory shown in the "
+                "table. Nothing is streamed afterwards. With volume rendering on, the volume is rendered as it is."
+            )
+        )
+        self.streamButton = qt.QPushButton(_("Stream selected level"))
+        self.streamButton.setToolTip(
+            _(
+                "Show the store at once from its coarsest level and read the selected level in the background, "
+                "the slice views' planes first; the volume switches to that level when it is complete and takes "
+                "its memory. With volume rendering on, the 3D view follows the camera at the resolution it needs. "
+                "Use this to look around before choosing a region to work on."
+            )
+        )
+        loadRow = qt.QHBoxLayout()
+        loadRow.addWidget(self.loadButton, 1)
+        loadRow.addWidget(self.streamButton, 1)
+        storeLayout.addLayout(loadRow)
 
         # -- Full resolution --
         refineBox = ctk.ctkCollapsibleButton()
@@ -4259,7 +4581,11 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.updateViewSelector()
         self.refineButton = qt.QPushButton(_("Refine view"))
         self.refineButton.setToolTip(
-            _("Reload the block shown by the slice view at the finest level that fits the memory budget")
+            _(
+                "Reload the block the slice view shows at the finest level that fits the memory budget and lay it "
+                "over the loaded volume in that view only; nothing else changes. Zoom in first: a view that shows "
+                "the whole specimen needs no finer level."
+            )
         )
         refineRow = qt.QHBoxLayout()
         refineRow.addWidget(self.viewSelector)
@@ -4267,16 +4593,18 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         refineLayout.addRow(_("2D view:"), refineRow)
 
         self.autoRefineCheckBox = qt.QCheckBox(_("Refine the slice views automatically while browsing"))
-        self.autoRefineCheckBox.setToolTip(_("Reloads a view's block after it has been still for half a second"))
+        self.autoRefineCheckBox.setToolTip(
+            _("Each slice view reloads the block it shows at the finest fitting level once it has been still for half a second")
+        )
         refineLayout.addRow(self.autoRefineCheckBox)
 
-        self.volumeRenderingCheckBox = qt.QCheckBox(_("Volume-render in the 3D view, at the resolution it shows"))
+        self.volumeRenderingCheckBox = qt.QCheckBox(_("Volume-render in the 3D view"))
         self.volumeRenderingCheckBox.checked = Settings.get(Settings.STREAM_3D, False)
         self.volumeRenderingCheckBox.setToolTip(
             _(
-                "Can be set before loading. Streamed stores are then rendered as they load: the 3D view holds "
-                "only what is in view (and in the cropping ROI), at the level its screen resolution needs, "
-                "and sharpens after the camera stops"
+                "Applies to what is loaded now and to the next load. A level loaded whole is rendered as it is. "
+                "A streamed store is rendered from what the 3D view shows (and the cropping region), at the "
+                "level its screen resolution needs, sharpening after the camera stops."
             )
         )
         refineLayout.addRow(self.volumeRenderingCheckBox)
@@ -4290,15 +4618,45 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.roiSelector.setMRMLScene(slicer.mrmlScene)
         self.createRoiButton = qt.QPushButton(_("New ROI in view"))
         self.createRoiButton.setToolTip(
-            _("Create a region of interest covering the middle of the selected slice view; drag its handles to adjust")
+            _(
+                "The region of interest to work in, shown and selected; drag its handles in any view. The store "
+                "has one: while it is volume-rendered, the rendering's cropping region (starting around the whole "
+                "volume, and the 3D view shows exactly what it holds); otherwise a region placed in the middle of "
+                "the selected slice view. Clicking again brings that region back rather than adding another. "
+                "With a region selected, the level table shows its size at each level."
+            )
+        )
+        self.roiSelector.setToolTip(
+            _(
+                "The region of interest that 'Load region' and 'Create segmentation' use. None: the whole "
+                "volume, the region's box hidden and the rendering uncropped. Pick a region to show its box, "
+                "crop the rendering to it and see its size per level in the table. The last entry of the list "
+                "deletes the current region."
+            )
         )
         roiRow = qt.QHBoxLayout()
         roiRow.addWidget(self.roiSelector, 1)
         roiRow.addWidget(self.createRoiButton)
         refineLayout.addRow(_("Region of interest:"), roiRow)
         self.loadRegionButton = qt.QPushButton(_("Load region at the selected level"))
-        self.loadRegionButton.setToolTip(_("Only the chunks the region intersects are read"))
+        self.loadRegionButton.setToolTip(
+            _(
+                "Load the region of interest at the selected level as an ordinary volume: only the chunks the "
+                "region intersects are read. A rotated region loads the axis-aligned box around it. With volume "
+                "rendering on, the loaded region takes the 3D view. The table shows its size and memory at each level."
+            )
+        )
         refineLayout.addRow(self.loadRegionButton)
+        self.segmentButton = qt.QPushButton(_("Create segmentation from the region at the selected level"))
+        self.segmentButton.setToolTip(
+            _(
+                "A segmentation to edit inside the region of interest: its box at the selected level, plus "
+                "a margin of {margin} empty voxels on every side for dilation and smoothing to grow into, "
+                "becomes the segmentation's geometry and the Segment Editor's source volume. With a region "
+                "selected, the table shows the box and the editor's memory at each level."
+            ).format(margin=SEGMENTATION_MARGIN)
+        )
+        refineLayout.addRow(self.segmentButton)
 
         self.statusLabel = qt.QLabel()
         self.statusLabel.wordWrap = True
@@ -4316,7 +4674,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.maxBytesSpinBox.setSuffix(" MiB")
         self.maxBytesSpinBox.setSpecialValueText(_("automatic (25% of free RAM)"))
         self.maxBytesSpinBox.setValue(Settings.get(Settings.MAX_BYTES, 0) >> 20)
-        self.maxBytesSpinBox.setToolTip(_("Budget for automatic level selection"))
+        self.maxBytesSpinBox.setToolTip(
+            _(
+                "The memory a load may take: it selects the level marked bold in the table, the level streaming "
+                "reads in the background when no level is picked, and the levels greyed out for a region. "
+                "The buttons always do what their level says; the budget never overrides a level you picked."
+            )
+        )
         settingsLayout.addRow(_("Memory budget:"), self.maxBytesSpinBox)
 
         self.orientationSelector = qt.QComboBox()
@@ -4372,12 +4736,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.streamCheckBox.checked = Settings.get(Settings.STREAM, True)
         self.streamCheckBox.setToolTip(
             _(
-                "Show a store at once from its coarsest level. The slice views then get the plane "
-                "they show at screen resolution first, and the level that fits the memory budget is "
-                "read in the background"
+                "How a store opened without picking a level (drag-and-drop, Add Data, the Python loader) is "
+                "loaded: streamed from its coarsest level with the level the memory budget allows read in the "
+                "background, or loaded whole at that level. The panel's own buttons say what they do and ignore "
+                "this setting."
             )
         )
-        settingsLayout.addRow(_("Stream large stores:"), self.streamCheckBox)
+        settingsLayout.addRow(_("Stream stores opened by drag-and-drop or Add Data:"), self.streamCheckBox)
 
         self.textureMemorySpinBox = qt.QSpinBox()
         self.textureMemorySpinBox.setRange(0, 1 << 20)
@@ -4440,16 +4805,24 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.inspectButton.connect("clicked(bool)", self.onInspect)
         self.pathEdit.connect("currentPathChanged(QString)", self.onPathChanged)
         self.loadButton.connect("clicked(bool)", self.onLoad)
+        self.streamButton.connect("clicked(bool)", self.onStream)
         self.refineButton.connect("clicked(bool)", self.onRefine)
         self.autoRefineCheckBox.connect("toggled(bool)", self.onAutoRefineToggled)
         self.volumeRenderingCheckBox.connect("toggled(bool)", self.onVolumeRenderingToggled)
         self.loadRegionButton.connect("clicked(bool)", self.onLoadRegion)
+        self.segmentButton.connect("clicked(bool)", self.onCreateSegmentation)
         self.createRoiButton.connect("clicked(bool)", self.onCreateRoi)
         self.levelTable.connect("itemSelectionChanged()", self.updateButtons)
         self.levelTable.connect("cellDoubleClicked(int,int)", lambda row, column: self.onLoad())
-        self.roiSelector.connect("currentNodeChanged(vtkMRMLNode*)", lambda node: self.updateButtons())
+        self.roiObserver = None  # (region of interest node, observer tags) of the selected region
+        self.roiBoxes = None  # the selected region's box per level, while the table shows them
+        self.roiTimer = qt.QTimer()  # the table follows the region once its handles stop moving
+        self.roiTimer.setSingleShot(True)
+        self.roiTimer.setInterval(300)
+        self.roiTimer.timeout.connect(lambda: (self.showRoiBoxes(), self.updateLevelStatus()))
+        self.roiSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onRoiChanged)
         self.updateButtons()
-        self.maxBytesSpinBox.connect("valueChanged(int)", lambda mib: Settings.set(Settings.MAX_BYTES, int(mib) << 20))
+        self.maxBytesSpinBox.connect("valueChanged(int)", self.onMaxBytesChanged)
         self.orientationSelector.connect("currentTextChanged(QString)", lambda t: Settings.set(Settings.ORIENTATION, t))
         self.loadLabelsCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.LOAD_LABELS, bool(b)))
         self.labelsAsSegmentationCheckBox.connect(
@@ -4548,10 +4921,14 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
     def updateButtons(self):
         hasStore = self.path is not None
         self.loadButton.setEnabled(hasStore and self.selectedLevel() >= 0)
+        self.streamButton.setEnabled(hasStore and self.selectedLevel() >= 0)
         self.refineButton.setEnabled(hasStore)
         self.createRoiButton.setEnabled(hasStore)
         self.autoRefineCheckBox.setEnabled(hasStore)
         self.loadRegionButton.setEnabled(hasStore and self.roiSelector.currentNode() is not None)
+        self.segmentButton.setEnabled(
+            hasStore and self.roiSelector.currentNode() is not None and self.selectedLevel() >= 0
+        )
 
     def fitTableHeight(self):
         """Size the table to its rows so that it never shows an empty area."""
@@ -4617,6 +4994,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             ]
         )
         self.levelTable.selectRow(self.logic.selectLevel(self.multiscales, self.logic.maxBytesFromSettings()))
+        self.showRoiBoxes()
         self.updateLevelStatus()
 
     @staticmethod
@@ -4632,8 +5010,11 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         recommended = self.logic.selectLevel(self.multiscales, self.logic.maxBytesFromSettings())
         streamer = OMEZarrLogic.streamer(self.path)
         if streamer is not None:
-            self.legendLabel.text = _(
-                "Bold: the level the memory budget selects. ▸ shown · ✓ downloaded · ↓ being read · ◐ parts read for the views."
+            self.legendLabel.text = (
+                _(
+                    "Bold: the level the memory budget selects. ▸ shown · ✓ downloaded · ↓ being read · ◐ parts read for the views."
+                )
+                + self.roiLegend()
             )
             for row in range(self.levelTable.rowCount):
                 mark, note = streamer.levelState(row) if row < len(streamer.levels) else ("", "")
@@ -4651,7 +5032,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
                     if column == 0:
                         item.setToolTip(". ".join(notes))
             return
-        self.legendLabel.text = _("Bold: the level the memory budget selects. ✓: loaded in the scene.")
+        self.legendLabel.text = _("Bold: the level the memory budget selects. ✓: loaded in the scene.") + self.roiLegend()
         loaded, regions = set(), set()
         for node in slicer.util.getNodesByClass("vtkMRMLVolumeNode"):
             if samePath(node.GetAttribute("OMEZarr.Path"), self.path) and node.GetAttribute("OMEZarr.Level"):
@@ -4675,15 +5056,158 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
                 if column == 0:
                     item.setToolTip(". ".join(notes))
 
-    def onLoad(self):
-        if not self.path or self.selectedLevel() < 0:
-            return
-        properties = {"level": self.selectedLevel()}
+    def loadProperties(self, stream):
+        properties = {"level": self.selectedLevel(), "stream": stream}
         if self.timeIndexSpinBox.value >= 0:
             properties["timeIndex"] = self.timeIndexSpinBox.value
+        return properties
+
+    def onLoad(self):
+        """The selected level, whole, as an ordinary volume; rendered when volume rendering is on."""
+        if not self.path or self.selectedLevel() < 0:
+            return
+        node = None
         with slicer.util.tryWithErrorDisplay(_("Failed to load level"), waitCursor=True):
-            slicer.util.loadNodeFromFile(self.path, "OMEZarr", properties)
+            node = slicer.util.loadNodeFromFile(self.path, "OMEZarr", self.loadProperties(stream=False))
+        if node is None or not node.IsA("vtkMRMLScalarVolumeNode"):
+            self.updateLevelStatus()
+            return
+        text = self.describeNodes(_("Level {level} loaded whole").format(level=node.GetAttribute("OMEZarr.Level")), [node])
+        if Settings.get(Settings.STREAM_3D, False):
+            self.showInThreeD(node)
+            text += _(" · rendered in the 3D view")
+        else:
+            text += _(" · not rendered (volume rendering is off)")
+        self.statusLabel.text = text
         self.updateLevelStatus()
+        OMEZarrLogic.updateViewLabels()
+
+    def onStream(self):
+        """The coarsest level at once, the selected level read behind it."""
+        if not self.path or self.selectedLevel() < 0:
+            return
+        node = None
+        with slicer.util.tryWithErrorDisplay(_("Failed to stream"), waitCursor=True):
+            node = slicer.util.loadNodeFromFile(self.path, "OMEZarr", self.loadProperties(stream=True))
+        streamer = OMEZarrLogic.streamer(self.path)
+        if node is None or streamer is None:
+            if node is not None:
+                self.statusLabel.text = self.describeNodes(
+                    _("Level {level} loaded whole (this store cannot be streamed)").format(level=node.GetAttribute("OMEZarr.Level")), [node]
+                )
+            self.updateLevelStatus()
+            return
+        shown = node.GetAttribute("OMEZarr.Level")
+        if str(streamer.target) == shown:
+            text = _("Streaming: level {shown} shown; the slice views refine as you zoom in").format(shown=shown)
+        else:
+            text = _("Streaming: level {shown} shown now, level {target} read in the background").format(
+                shown=shown, target=streamer.target
+            )
+        if streamer.volume3D is not None:
+            self.renderStreamed(streamer)  # the store's one rendering, cropped to the selected region
+            text += _(" · 3D view follows the camera")
+        elif Settings.get(Settings.STREAM_3D, False):
+            text += _(" · no 3D view to render in")
+        else:
+            text += _(" · not rendered (volume rendering is off)")
+        self.statusLabel.text = text
+        self.updateLevelStatus()
+
+    # -- the store's one rendering: the 3D view shows at most one volume of the store, the
+    # streamed texture while streaming with 3D on, else the level or region loaded last, and the
+    # selected region crops whichever it is --
+
+    def storeDisplays(self):
+        """Every volume rendering display of a volume of this store."""
+        return [
+            display
+            for display in slicer.util.getNodesByClass("vtkMRMLVolumeRenderingDisplayNode")
+            if display.GetVolumeNode() is not None
+            and samePath(display.GetVolumeNode().GetAttribute("OMEZarr.Path"), self.path)
+        ]
+
+    def storeRendering(self):
+        """The visible volume rendering display of this store, if any."""
+        for display in self.storeDisplays():
+            if display.GetVisibility():
+                return display
+        return None
+
+    def hideStoreRenderings(self, keep=None):
+        """Nothing of the store in the 3D view but ``keep`` (a volume node): the streamed texture
+        is dropped unless it is the one kept."""
+        streamer = OMEZarrLogic.streamer(self.path) if self.path else None
+        if streamer is not None and streamer.volume3D is not None and streamer.volume3D is not keep:
+            streamer.disable3D(stopWhenDone=False)
+        for display in self.storeDisplays():
+            if display.GetVolumeNode() is not keep and display.GetVisibility():
+                display.SetVisibility(False)
+
+    def applyCrop(self, display, roiNode):
+        """Crop ``display`` to the region (none: uncropped). The region's box is shown."""
+        if roiNode is None:
+            display.SetCroppingEnabled(False)
+            return
+        if display.GetROINode() is not roiNode:
+            display.SetAndObserveROINodeID(roiNode.GetID())
+        display.SetCroppingEnabled(True)
+        roiNode.SetDisplayVisibility(True)
+
+    def showInThreeD(self, node):
+        """``node`` (a level or region loaded as an ordinary volume) becomes the store's rendering,
+        cropped to the selected region."""
+        self.hideStoreRenderings(keep=node)
+        display = self.renderVolume(node, True)
+        if display is not None:
+            self.applyCrop(display, self.roiSelector.currentNode())
+        return display
+
+    def renderStreamed(self, streamer):
+        """The streamed texture becomes the store's rendering, cropped to the selected region."""
+        node = streamer.enable3D()
+        self.hideStoreRenderings(keep=node)
+        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(node)
+        if display is not None:
+            self.applyCrop(display, self.roiSelector.currentNode())
+        return node
+
+    @staticmethod
+    def renderVolume(node, enabled):
+        """Volume-render an ordinary (not streamed) volume in the 3D view, or hide its rendering."""
+        logic = slicer.modules.volumerendering.logic()
+        display = logic.GetFirstVolumeRenderingDisplayNode(node)
+        if display is None:
+            if not enabled:
+                return None
+            display = logic.CreateDefaultVolumeRenderingNodes(node)
+        display.SetVisibility(bool(enabled))
+        layoutManager = slicer.app.layoutManager()
+        if enabled and layoutManager is not None and layoutManager.threeDViewCount:
+            layoutManager.threeDWidget(0).threeDView().resetFocalPoint()
+        OMEZarrLogic.updateViewLabels()
+        return display
+
+    def loadedVolume(self):
+        """The volume loaded whole from this store: the one the selected slice view shows when it
+        is from this store, else the latest."""
+        return OMEZarrLogic.sourceVolumeNode(self.path, 0, self.viewSelector.currentData or "Red")
+
+    def loadedVolumes(self):
+        """Every volume loaded whole from this store (no regions, nothing a streamer owns)."""
+        streamer = OMEZarrLogic.streamer(self.path)
+        streamed = streamer.node if streamer is not None and not streamer.stopped else None
+        return [
+            n
+            for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            if n is not streamed
+            and not n.IsA("vtkMRMLLabelMapVolumeNode")
+            and samePath(n.GetAttribute("OMEZarr.Path"), self.path)
+            and not any(
+                n.GetAttribute(key)
+                for key in ("OMEZarr.Region", "OMEZarr.Refined", "OMEZarr.Role", "OMEZarr.Streamed", "OMEZarr.Streamed3D")
+            )
+        ]
 
     def describeNodes(self, prefix, nodes):
         volumes = scalarVolumes(nodes)
@@ -4730,44 +5254,97 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             OMEZarrLogic.startAutoRefine(self.path)
 
     def onVolumeRenderingToggled(self, enabled):
-        """A preference, usable before any store is chosen: streamed stores are volume-rendered as
-        they load, and a store already streaming starts or stops at once."""
+        """A preference, usable before any store is chosen: what is loaded from this store now
+        (streamed or whole) is rendered or hidden at once, and so is the next load."""
         Settings.set(Settings.STREAM_3D, bool(enabled))
         streamer = OMEZarrLogic.streamer(self.path) if self.path else None
         if not enabled:
-            if streamer is not None:
-                streamer.disable3D()
-            self.statusLabel.text = ""
+            # Off means nothing of the store in the 3D view: the streamed texture, every level
+            # loaded whole, every region, a leftover of an earlier session of the panel.
+            had = (streamer is not None and streamer.volume3D is not None) or self.storeRendering() is not None
+            if self.path:
+                self.hideStoreRenderings()
+            self.statusLabel.text = _("3D view: rendering off") if had else ""
+            OMEZarrLogic.updateViewLabels()
             return
-        if streamer is None:
-            self.statusLabel.text = _("The 3D view will render the next store you load (streamed)")
+        if streamer is not None:
+            try:
+                node = self.renderStreamed(streamer)
+                self.statusLabel.text = _("3D view: rendering {name}, following the camera").format(name=node.GetName())
+            except ValueError as e:
+                self.statusLabel.text = str(e)
             return
-        try:
-            node = streamer.enable3D()
-            self.statusLabel.text = _("3D view: rendering {name}").format(name=node.GetName())
-        except ValueError as e:
-            self.statusLabel.text = str(e)
+        shown = self.shownVolume() if self.path else None
+        if shown is not None:
+            self.showInThreeD(shown)
+            self.statusLabel.text = _("3D view: rendering {name}").format(name=shown.GetName())
+            return
+        self.statusLabel.text = _("The 3D view will render the next level you load or stream")
+
+    def shownVolume(self):
+        """The volume of this store to render when volume rendering is turned on: the one the
+        selected slice view shows (a level or a region), else the level loaded whole last."""
+        sliceWidget = slicer.app.layoutManager().sliceWidget(self.viewSelector.currentData or "Red")
+        if sliceWidget is not None:
+            background = sliceWidget.sliceLogic().GetBackgroundLayer().GetVolumeNode()
+            if (
+                background is not None
+                and background.IsA("vtkMRMLScalarVolumeNode")
+                and not background.IsA("vtkMRMLLabelMapVolumeNode")
+                and samePath(background.GetAttribute("OMEZarr.Path"), self.path)
+                and not background.GetAttribute("OMEZarr.Refined")
+                and not background.GetAttribute("OMEZarr.Role")
+            ):
+                return background
+        return self.loadedVolume()
 
     def cleanup(self):
-        if OMEZarrLogic.panel is self:
-            OMEZarrLogic.panel = None
+        # Background work first: nothing later in here may leave a streamer running unseen.
         OMEZarrLogic.stopAutoRefine()
         OMEZarrLogic.stopStreaming()
+        self.roiTimer.stop()
+        self.watchRoi(None)  # the region stays as it is shown
+        if OMEZarrLogic.panel is self:
+            OMEZarrLogic.panel = None
+
+    def storeRoi(self):
+        """The region of interest this store already has, when it has one: its rendering's
+        cropping region, else the selected region, else the region made for it."""
+        roiNode = self.cropRoi()
+        if roiNode is not None:
+            return roiNode
+        roiNode = self.roiSelector.currentNode()
+        if roiNode is not None:
+            return roiNode
+        for node in slicer.util.getNodesByClass("vtkMRMLMarkupsROINode"):
+            if samePath(node.GetAttribute("OMEZarr.Path"), self.path):
+                return node
+        return None
 
     def onCreateRoi(self):
-        """A region of interest already placed: the middle half of what the slice view shows."""
-        view = self.viewSelector.currentData
-        bounds = self.logic.sliceViewRasBounds(view)
-        center = [(bounds[i] + bounds[i + 1]) / 2.0 for i in (0, 2, 4)]
-        size = [(bounds[i + 1] - bounds[i]) / 2.0 for i in (0, 2, 4)]
-        roiNode = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLMarkupsROINode", slicer.mrmlScene.GenerateUniqueName("OME-Zarr region")
-        )
-        roiNode.CreateDefaultDisplayNodes()
-        roiNode.SetCenter(*center)
-        roiNode.SetSize(*size)
-        roiNode.GetDisplayNode().SetHandlesInteractive(True)
-        roiNode.GetDisplayNode().SetFillOpacity(0.1)
+        """The store's region of interest, shown and selected; made when the store has none yet,
+        placed in the middle half of what the slice view shows. Clicking again brings the same
+        region back rather than adding another."""
+        # While the store is volume-rendered (streamed or not), the region is the rendering's
+        # cropping region, so the 3D view (and the texture streamed for it) shows exactly what the
+        # region holds. The cropping region starts around the whole volume (or where the user left
+        # it), to be shrunk by its handles; a plain region starts in the middle of the slice view.
+        roiNode = self.storeRoi()
+        if roiNode is None:
+            view = self.viewSelector.currentData
+            bounds = self.logic.sliceViewRasBounds(view)
+            center = [(bounds[i] + bounds[i + 1]) / 2.0 for i in (0, 2, 4)]
+            size = [(bounds[i + 1] - bounds[i]) / 2.0 for i in (0, 2, 4)]
+            roiNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsROINode", slicer.mrmlScene.GenerateUniqueName("OME-Zarr region")
+            )
+            roiNode.CreateDefaultDisplayNodes()
+            roiNode.SetCenter(*center)
+            roiNode.SetSize(*size)
+            roiNode.GetDisplayNode().SetHandlesInteractive(True)
+            roiNode.GetDisplayNode().SetFillOpacity(0.1)
+            roiNode.SetAttribute("OMEZarr.Path", normalizeStorePath(self.path))
+        roiNode.SetDisplayVisibility(True)
         self.roiSelector.setCurrentNode(roiNode)
         self.statusLabel.text = _(
             "Drag the handles of the region in the slice views to adjust it, select a level above, "
@@ -4797,7 +5374,176 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         scalars = scalarVolumes(nodes)
         if scalars:
             slicer.util.setSliceViewerLayers(background=scalars[0], fit=True)
-        self.statusLabel.text = self.describeNodes(roiNode.GetName(), nodes)
+        text = self.describeNodes(
+            _("Region loaded at level {level} as {name}").format(level=max(0, self.selectedLevel()), name=scalars[0].GetName())
+            if scalars
+            else roiNode.GetName(),
+            nodes,
+        )
+        if self.roiRotated(roiNode):
+            text += _(" · the axis-aligned box around the rotated region")
+        text += _(" · shown in the slice views")
+        if scalars and Settings.get(Settings.STREAM_3D, False):
+            self.showInThreeD(scalars[0])  # the loaded region takes the 3D view
+            text += _(" and rendered in the 3D view")
+        self.statusLabel.text = text
+        self.updateLevelStatus()
+        OMEZarrLogic.updateViewLabels()
+
+    def cropRoi(self):
+        """The cropping region of the store's rendering (streamed or not), when it has one:
+        made fitted to the rendered volume when the rendering has none yet."""
+        display = self.storeRendering() if self.path else None
+        if display is None:
+            return None
+        # Cropping first: the logic creates the region hidden unless cropping is already on.
+        display.SetCroppingEnabled(True)
+        if display.GetROINode() is None:
+            slicer.modules.volumerendering.logic().CreateROINode(display)  # fitted to the volume
+        roiNode = display.GetROINode()
+        roiNode.SetAttribute("OMEZarr.Path", normalizeStorePath(self.path))
+        roiNode.SetDisplayVisibility(True)
+        return roiNode
+
+    def watchRoi(self, roiNode):
+        """Observe the selected region's handles (none: stop observing). Returns the region observed before."""
+        previous = None
+        if self.roiObserver is not None:
+            previous, tags = self.roiObserver
+            for tag in tags:
+                previous.RemoveObserver(tag)
+            self.roiObserver = None
+        if roiNode is not None:
+            events = (vtk.vtkCommand.ModifiedEvent, slicer.vtkMRMLMarkupsNode.PointModifiedEvent)
+            self.roiObserver = (roiNode, [roiNode.AddObserver(event, self.onRoiModified) for event in events])
+        return previous
+
+    def onRoiChanged(self, roiNode):
+        """Follow the selected region of interest: its box is the one shown, the rendering is cropped
+        to it and the level table shows its box at each level. None: the box of the region selected
+        before is hidden, the rendering uncropped, the table back to the whole levels."""
+        previous = self.watchRoi(roiNode)
+        if previous is not None and previous is not roiNode and previous.GetScene() is not None:
+            previous.SetDisplayVisibility(False)
+        if roiNode is not None:
+            roiNode.SetDisplayVisibility(True)
+        self.cropTo(roiNode)
+        self.showRoiBoxes()
+        self.updateLevelStatus()
+        self.updateButtons()
+
+    def cropTo(self, roiNode):
+        """The store's rendering, streamed or not, shows what the selected region holds: its
+        cropping follows the selection, and no region means the whole volume."""
+        display = self.storeRendering() if self.path else None
+        if display is not None:
+            self.applyCrop(display, roiNode)
+
+    @staticmethod
+    def roiRotated(roiNode):
+        """Whether the region is rotated against the world axes (its loaded box is then the axis-aligned box around it)."""
+        matrix = roiNode.GetObjectToNodeMatrix()
+        return any(abs(matrix.GetElement(i, j) - (1.0 if i == j else 0.0)) > 1e-6 for i in range(3) for j in range(3))
+
+    def regionVolumes(self):
+        """Regions of this store loaded as volumes."""
+        return [
+            n
+            for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            if samePath(n.GetAttribute("OMEZarr.Path"), self.path)
+            and n.GetAttribute("OMEZarr.Region")
+            and not n.GetAttribute("OMEZarr.Refined")
+            and not n.GetAttribute("OMEZarr.Role")
+        ]
+
+    def onRoiModified(self, caller=None, event=None):
+        self.roiTimer.start()  # once the handles stop moving
+
+    def showRoiBoxes(self):
+        """With a region of interest selected, the table shows its box at each level (plus the
+        margin) and the Segment Editor's working set for it, instead of the whole level."""
+        if not self.path or self.multiscales is None or self.levelTable.rowCount == 0:
+            return
+        roiNode = self.roiSelector.currentNode()
+        boxes = None
+        if roiNode is not None:
+            try:
+                boxes = self.logic.segmentationBoxes(self.path, roiNode, self.multiscales)
+            except ValueError:
+                boxes = None  # the region misses the image: the table shows the whole levels
+        self.roiBoxes = boxes
+        self.levelTable.setHorizontalHeaderLabels(
+            [
+                _("Level"),
+                _("Region (x, y, z)") if boxes else _("Voxels (x, y, z)"),
+                _("Spacing"),
+                _("Editor memory") if boxes else _("Memory"),
+            ]
+        )
+        budget = self.logic.maxBytesFromSettings()
+        for row, level in enumerate(self.logic.levelInfo(self.multiscales)):
+            if boxes:
+                voxels = " × ".join(str(n) for n in boxes[row]["dims"])
+                memory = self.formatBytes(boxes[row]["bytes"])
+                over = boxes[row]["bytes"] > budget
+            else:
+                shape = dict(zip(level["dims"], level["shape"], strict=False))
+                voxels = " × ".join(str(shape[d]) for d in SPATIAL_DIMS if d in shape)
+                memory = self.formatBytes(level["bytes"])
+                over = False
+            for column, value in ((1, voxels), (3, memory)):
+                item = self.levelTable.item(row, column)
+                if item is None:
+                    continue
+                item.setText(value)
+                item.setToolTip(value + (_(" (over the memory budget)") if over else ""))
+                item.setForeground(qt.QBrush(qt.QColor("gray")) if over else qt.QBrush())
+
+    def roiLegend(self):
+        if not self.roiBoxes:
+            return ""
+        return _(
+            " Region and Editor memory: the selected region's box at each level, plus a margin of {margin} "
+            "empty voxels on every side, and the Segment Editor's memory to edit it; grey: over the memory budget."
+        ).format(margin=SEGMENTATION_MARGIN)
+
+    def onMaxBytesChanged(self, mib):
+        Settings.set(Settings.MAX_BYTES, int(mib) << 20)
+        self.showRoiBoxes()
+        self.updateLevelStatus()
+
+    def onCreateSegmentation(self):
+        roiNode = self.roiSelector.currentNode()
+        level = self.selectedLevel()
+        if roiNode is None or level < 0 or not self.path:
+            return
+        try:
+            with Progress(_("Reading the segmentation's region...")) as progress:
+                result = self.logic.createSegmentationFromRoi(
+                    self.path, roiNode, level, timeIndex=max(0, self.timeIndexSpinBox.value), progress=progress
+                )
+        except InterruptedError:
+            self.statusLabel.text = _("Segmentation: cancelled")
+            return
+        except ValueError as e:
+            self.statusLabel.text = _("Segmentation: {error}").format(error=e)
+            return
+        box = result["box"]
+        text = _(
+            "{name}: level {level} · {x} × {y} × {z} voxels with the {margin}-voxel margin · editor working set {size}"
+        ).format(
+            name=result["segmentation"].GetName(),
+            level=box["level"],
+            x=box["dims"][0],
+            y=box["dims"][1],
+            z=box["dims"][2],
+            margin=box["margin"],
+            size=self.formatBytes(box["bytes"]),
+        )
+        budget = self.logic.maxBytesFromSettings()
+        if box["bytes"] > budget:
+            text += _(" · over the memory budget of {budget}").format(budget=self.formatBytes(budget))
+        self.statusLabel.text = text
         self.updateLevelStatus()
 
 
@@ -4859,6 +5605,9 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_RoundTripFromSlicerVolume()
             self.test_LevelSelection()
             self.test_RegionLoading()
+            self.test_SegmentationFromRoi()
+            self.test_LoadButtonsChooseTheMode()
+            self.test_ViewsFollowThePan()
             self.test_MicroscopyAxes()
             self.test_Labels()
             self.test_TimeSeries()
@@ -4996,6 +5745,309 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         expectedOrigin = (ijkToRas @ np.array([i0, j0, k0, 1.0]))[:3]
         np.testing.assert_allclose(self.ijkToRasArray(nodes[0])[:3, 3], expectedOrigin, atol=1e-6)
 
+    def test_SegmentationFromRoi(self):
+        self.delayDisplay("A segmentation from a region of interest has the region's box at the chosen level as its geometry")
+        chunk = 32
+        mrHead, storePath = self.writeMRHeadStore(chunks=chunk)
+        full = slicer.util.arrayFromVolume(mrHead)
+        ijkToRas = self.ijkToRasArray(mrHead)
+        slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 0})
+        # Sub-block in IJK: i 40..100, j 60..120, k 20..50 (half-open), as a region of interest.
+        i0, i1, j0, j1, k0, k1 = 40, 100, 60, 120, 20, 50
+        corners = np.array([[i, j, k, 1.0] for i in (i0, i1 - 1) for j in (j0, j1 - 1) for k in (k0, k1 - 1)])
+        ras = (ijkToRas @ corners.T).T[:, :3]
+        roi = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode")
+        roi.SetCenter(*((ras.min(axis=0) + ras.max(axis=0)) / 2.0))
+        roi.SetSize(*(ras.max(axis=0) - ras.min(axis=0)))
+
+        # One box per level: the region's exact voxels plus the margin on every side, and the editor's working set.
+        m = SEGMENTATION_MARGIN
+        boxes = OMEZarrLogic.segmentationBoxes(storePath, roi)
+        self.assertEqual([b["level"] for b in boxes], [0, 1, 2])
+        region = boxes[0]["region"]
+        self.assertEqual(region, {"x": (i0, i1), "y": (j0, j1), "z": (k0, k1)})
+        self.assertEqual(boxes[0]["box"], {"x": (i0 - m, i1 + m), "y": (j0 - m, j1 + m), "z": (k0 - m, k1 + m)})
+        dims = [i1 - i0 + 2 * m, j1 - j0 + 2 * m, k1 - k0 + 2 * m]
+        self.assertEqual(boxes[0]["dims"], dims)
+        itemSize = full.dtype.itemsize
+        self.assertEqual(boxes[0]["bytes"], int(np.prod(dims)) * (2 * itemSize + SEGMENT_EDITOR_LABEL_BUFFERS))
+        self.assertLess(boxes[1]["bytes"], boxes[0]["bytes"])
+
+        result = OMEZarrLogic.createSegmentationFromRoi(storePath, roi, 0)
+        (z0, z1), (y0, y1), (x0, x1) = (region[d] for d in ("z", "y", "x"))
+        # The source volume holds the region's voxels inside a margin of zeros, on the level's grid.
+        source = result["sourceVolume"]
+        array = slicer.util.arrayFromVolume(source)
+        self.assertEqual(list(array.shape), dims[::-1])
+        np.testing.assert_array_equal(array[m:-m, m:-m, m:-m], full[z0:z1, y0:y1, x0:x1])
+        border = array.copy()
+        border[m:-m, m:-m, m:-m] = 0
+        self.assertEqual(int(border.max()), 0)
+        np.testing.assert_allclose(
+            self.ijkToRasArray(source)[:3, 3], (ijkToRas @ [x0 - m, y0 - m, z0 - m, 1.0])[:3], atol=1e-6
+        )
+        self.assertFalse(source.GetSaveWithScene())
+        self.assertEqual(source.GetAttribute("OMEZarr.Role"), "segmentationSource")
+        self.assertEqual(source.GetAttribute("OMEZarr.Margin"), str(m))
+
+        # The segmentation's reference geometry is the box: same matrix, the box's extent.
+        segmentation = result["segmentation"]
+        geometryString = segmentation.GetSegmentation().GetConversionParameter("Reference image geometry")
+        matrix = vtk.vtkMatrix4x4()
+        extent = [0] * 6
+        self.assertTrue(slicer.vtkSegmentationConverter.DeserializeImageGeometry(geometryString, matrix, extent))
+        np.testing.assert_allclose(slicer.util.arrayFromVTKMatrix(matrix), self.ijkToRasArray(source), atol=1e-6)
+        boxExtent = [0, dims[0] - 1, 0, dims[1] - 1, 0, dims[2] - 1]
+        self.assertEqual(extent, boxExtent)
+        self.assertEqual(segmentation.GetAttribute("OMEZarr.Level"), "0")
+
+        # The Segment Editor has both selected and sizes its buffers to the box, not to the store.
+        editorNode = OMEZarrLogic.segmentEditorNode()
+        self.assertIs(editorNode.GetSegmentationNode(), segmentation)
+        self.assertIs(editorNode.GetSourceVolumeNode(), source)
+        segmentation.GetSegmentation().AddEmptySegment("test")
+        editorNode.SetSelectedSegmentID("test")
+        editorWidget = slicer.qMRMLSegmentEditorWidget()
+        editorWidget.setMRMLScene(slicer.mrmlScene)
+        editorWidget.setMRMLSegmentEditorNode(editorNode)
+        editorWidget.setActiveEffectByName("Threshold")
+        effect = editorWidget.activeEffect()
+        self.assertIsNotNone(effect)
+        self.assertEqual(list(effect.defaultModifierLabelmap().GetExtent()), boxExtent)
+        self.assertEqual(list(effect.sourceVolumeImageData().GetExtent()), boxExtent)
+        editorWidget.setActiveEffectByName("")
+        editorWidget.setMRMLSegmentEditorNode(None)
+        editorWidget.deleteLater()
+
+        # A second segmentation gets a source volume of its own: the first keeps its box and voxels.
+        firstVoxels = slicer.util.arrayFromVolume(source).copy()
+        self.assertEqual(editorNode.GetSelectedSegmentID(), "test")  # a segment of the first segmentation
+        again = OMEZarrLogic.createSegmentationFromRoi(storePath, roi, 1)
+        second = again["sourceVolume"]
+        # The editor no longer points at a segment of the first segmentation.
+        self.assertIn(editorNode.GetSelectedSegmentID(), (None, ""))
+        self.assertIs(editorNode.GetSegmentationNode(), again["segmentation"])
+        self.assertIs(editorNode.GetSourceVolumeNode(), second)
+        self.assertIsNot(second, source)
+        self.assertEqual(list(second.GetImageData().GetDimensions()), boxes[1]["dims"])
+        self.assertEqual(again["segmentation"].GetAttribute("OMEZarr.Level"), "1")
+        self.assertIs(OMEZarrLogic.segmentationSource(segmentation), source)
+        self.assertIs(OMEZarrLogic.segmentationSource(again["segmentation"]), second)
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(source), firstVoxels)
+        geometryString = segmentation.GetSegmentation().GetConversionParameter("Reference image geometry")
+        self.assertTrue(slicer.vtkSegmentationConverter.DeserializeImageGeometry(geometryString, matrix, extent))
+        self.assertEqual(extent, boxExtent)
+        # Removing a segmentation removes its source volume, and only that one.
+        slicer.mrmlScene.RemoveNode(again["segmentation"])
+        self.assertIsNone(second.GetScene())
+        self.assertIsNotNone(source.GetScene())
+
+        # In the panel, a selected region turns the level table into its box per level.
+        if slicer.util.mainWindow() is not None:
+            slicer.util.selectModule("OMEZarr")
+            widget = slicer.modules.OMEZarrWidget
+            widget.roiSelector.setCurrentNode(None)  # a region left selected by an earlier test
+            widget.pathEdit.currentPath = self.tempDir  # not a store: the panel forgets a store written earlier at this path
+            widget.pathEdit.currentPath = storePath
+            self.assertEqual(widget.levelTable.item(0, 1).text(), "256 × 256 × 130")
+            widget.roiSelector.setCurrentNode(roi)
+            boxText = " × ".join(str(n) for n in dims)
+            self.assertEqual(widget.levelTable.item(0, 1).text(), boxText)
+            self.assertEqual(widget.levelTable.item(0, 3).text(), widget.formatBytes(boxes[0]["bytes"]))
+            self.assertEqual(widget.levelTable.horizontalHeaderItem(1).text(), "Region (x, y, z)")
+            widget.levelTable.selectRow(1)
+            self.assertTrue(widget.segmentButton.enabled)
+            # Moving the region updates the table once the handles stop.
+            roi.SetSize(*(2.0 * (ras.max(axis=0) - ras.min(axis=0))))
+            self.assertTrue(self.waitFor(lambda: widget.levelTable.item(0, 1).text() != boxText, 5.0))
+            widget.roiSelector.setCurrentNode(None)
+            self.assertEqual(widget.levelTable.item(0, 1).text(), "256 × 256 × 130")
+            self.assertEqual(widget.levelTable.horizontalHeaderItem(1).text(), "Voxels (x, y, z)")
+            self.assertFalse(widget.segmentButton.enabled)
+        slicer.util.resetSliceViews()  # the editor zoomed the views on the box: later tests expect whole views
+
+    def test_LoadButtonsChooseTheMode(self):
+        self.delayDisplay("'Load selected level' loads whole and 'Stream selected level' streams, whatever the setting")
+        if slicer.util.mainWindow() is None:
+            return
+        OMEZarrLogic.stopStreaming(wait=True)  # a streamer of this store left by an earlier test
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        Settings.set(Settings.STREAM, True)  # the setting is for stores opened without a level
+        Settings.set(Settings.STREAM_3D, True)
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        slicer.util.selectModule("OMEZarr")
+        widget = slicer.modules.OMEZarrWidget
+        widget.roiSelector.setCurrentNode(None)
+        widget.pathEdit.currentPath = self.tempDir
+        widget.pathEdit.currentPath = storePath
+        widget.levelTable.selectRow(1)
+        self.assertTrue(widget.loadButton.enabled and widget.streamButton.enabled)
+
+        # Load: the level whole, no streamer, rendered because volume rendering is on.
+        widget.onLoad()
+        node = OMEZarrLogic.loadedWholeVolume(storePath, 1, 0, 0)
+        self.assertIsNotNone(node)
+        self.assertIs(widget.loadedVolume(), node)  # shown in the slice views
+        self.assertEqual(node.GetAttribute("OMEZarr.Level"), "1")
+        self.assertIsNone(OMEZarrLogic.streamer(storePath))
+        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(node)
+        self.assertIsNotNone(display)
+        self.assertTrue(display.GetVisibility())
+        self.assertIn("loaded whole", widget.statusLabel.text)
+        self.assertIn("rendered in the 3D view", widget.statusLabel.text)
+        # The checkbox acts on the loaded volume at once (while the slice views show it).
+        widget.onVolumeRenderingToggled(False)
+        self.assertFalse(display.GetVisibility())
+        widget.onVolumeRenderingToggled(True)
+        self.assertTrue(display.GetVisibility())
+        # The name says which level; loading the level again refills the node instead of adding a copy.
+        self.assertTrue(node.GetName().endswith(" L1"))
+        volumes = len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"))
+        widget.onLoad()
+        self.assertIs(OMEZarrLogic.loadedWholeVolume(storePath, 1, 0, 0), node)
+        self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")), volumes)
+        widget.levelTable.selectRow(2)
+        widget.onLoad()
+        coarse = OMEZarrLogic.loadedWholeVolume(storePath, 2, 0, 0)
+        self.assertIsNot(coarse, node)  # another level is another node (or a refilled leftover of that level)
+        self.assertTrue(coarse.GetName().endswith(" L2"))
+        self.assertEqual(coarse.GetAttribute("OMEZarr.Level"), "2")
+        slicer.mrmlScene.RemoveNode(coarse)
+        widget.levelTable.selectRow(1)
+        slicer.mrmlScene.RemoveNode(node)
+
+        # Stream: the coarsest level shown, the selected level the target, the 3D view following.
+        widget.onStream()
+        streamer = OMEZarrLogic.streamer(storePath)
+        self.assertIsNotNone(streamer)
+        self.assertEqual(streamer.target, 1)
+        self.assertEqual(streamer.node.GetAttribute("OMEZarr.Level"), "2")
+        self.assertIsNotNone(streamer.volume3D)
+        self.assertIn("Streaming", widget.statusLabel.text)
+        self.assertTrue(self.waitFor(lambda: streamer.node.GetAttribute("OMEZarr.Level") == "1", 20.0))
+        OMEZarrLogic.stopStreaming(storePath, wait=True)
+        Settings.set(Settings.STREAM_3D, False)
+        Settings.set(Settings.STREAM, False)
+
+    def test_OneRenderingAcrossModes(self):
+        self.delayDisplay("The 3D view holds one rendering of the store, cropped to the selected region, whatever is loaded")
+        if slicer.util.mainWindow() is None:
+            return
+        OMEZarrLogic.stopStreaming(wait=True)
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        Settings.set(Settings.STREAM, True)
+        Settings.set(Settings.STREAM_3D, True)
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        slicer.util.selectModule("OMEZarr")
+        widget = slicer.modules.OMEZarrWidget
+        widget.roiSelector.setCurrentNode(None)
+        widget.pathEdit.currentPath = self.tempDir
+        widget.pathEdit.currentPath = storePath
+        logic = slicer.modules.volumerendering.logic()
+
+        def rendered():
+            return [d.GetVolumeNode() for d in widget.storeDisplays() if d.GetVisibility()]
+
+        def cropped(node):
+            display = logic.GetFirstVolumeRenderingDisplayNode(node)
+            return display is not None and display.GetCroppingEnabled() and display.GetROINode() is roi
+
+        # A level loaded whole is rendered; "New ROI in view" gives that rendering's cropping box.
+        widget.levelTable.selectRow(2)
+        widget.onLoad()
+        level2 = OMEZarrLogic.loadedWholeVolume(storePath, 2, 0, 0)
+        self.assertEqual(rendered(), [level2])
+        widget.onCreateRoi()
+        roi = widget.roiSelector.currentNode()
+        self.assertIsNotNone(roi)
+        self.assertTrue(cropped(level2))
+        self.assertTrue(samePath(roi.GetAttribute("OMEZarr.Path"), storePath))
+        roi.SetSize(20.0, 20.0, 20.0)  # a box inside the volume
+
+        # A region loaded takes the rendering over, cropped to the same box; the level is hidden.
+        widget.levelTable.selectRow(1)
+        widget.onLoadRegion()
+        region = widget.regionVolumes()[-1]
+        self.assertEqual(rendered(), [region])
+        self.assertTrue(cropped(region))
+
+        # Streaming takes it over: the streamed texture, cropped to the same box, nothing else.
+        widget.onStream()
+        streamer = OMEZarrLogic.streamer(storePath)
+        self.assertIsNotNone(streamer)
+        node3D = streamer.volume3D
+        self.assertIsNotNone(node3D)
+        self.assertEqual(rendered(), [node3D])
+        self.assertTrue(cropped(node3D))
+        # The selector crops whichever rendering it is, and the checkbox shows or hides it.
+        widget.roiSelector.setCurrentNode(None)
+        self.assertFalse(logic.GetFirstVolumeRenderingDisplayNode(node3D).GetCroppingEnabled())
+        widget.roiSelector.setCurrentNode(roi)
+        self.assertTrue(cropped(node3D))
+        widget.onVolumeRenderingToggled(False)
+        self.assertEqual(rendered(), [])
+        self.assertIsNone(streamer.volume3D)
+        widget.onVolumeRenderingToggled(True)
+        self.assertIsNotNone(streamer.volume3D)
+        self.assertEqual(rendered(), [streamer.volume3D])
+        self.assertTrue(cropped(streamer.volume3D))
+
+        # When streaming ends, the streamed volume takes the rendering over with the same crop.
+        self.assertTrue(self.waitFor(lambda: streamer.complete, 20.0))
+        base = streamer.node
+        OMEZarrLogic.stopStreaming(storePath)
+        self.assertEqual(rendered(), [base])
+        self.assertTrue(cropped(base))
+        # And a level loaded whole takes over from that.
+        widget.levelTable.selectRow(2)
+        widget.onLoad()
+        self.assertEqual(rendered(), [OMEZarrLogic.loadedWholeVolume(storePath, 2, 0, 0)])
+        self.assertTrue(cropped(rendered()[0]))
+        widget.onVolumeRenderingToggled(False)
+        self.assertEqual(rendered(), [])
+        widget.roiSelector.setCurrentNode(None)
+        Settings.set(Settings.STREAM_3D, False)
+        Settings.set(Settings.STREAM, False)
+        slicer.util.resetSliceViews()
+
+    def test_ViewsFollowThePan(self):
+        self.delayDisplay("A panned slice view gets the plane where it is, not where it started")
+        OMEZarrLogic.stopStreaming(wait=True)
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        Settings.set(Settings.STREAM, True)
+        Settings.set(Settings.STREAM_3D, False)
+        budget = OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4  # level 1: the streamer keeps serving the views
+        slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": budget})
+        streamer = OMEZarrLogic.streamer(storePath)
+        sliceNode = self.centerRedViewOn(mrHead, 40.0)
+        self.assertTrue(self.waitFor(lambda: streamer.views.get("Red", {}).get("shown", False), 30.0))
+        before = streamer.views["Red"]["region"]
+
+        def centerIndex():
+            dims = sliceNode.GetDimensions()
+            center = slicer.util.arrayFromVTKMatrix(sliceNode.GetXYToRAS()) @ np.array([dims[0] / 2.0, dims[1] / 2.0, 0.0, 1.0])
+            return np.linalg.inv(streamer.ijkToRas[0]) @ center
+
+        def contains(region, index):
+            return all(start <= index[2 - axis] < stop for axis, (start, stop) in enumerate(region))
+
+        self.assertTrue(contains(before, centerIndex()))
+        # Pan: Slicer moves an in-plane offset on the slice node, not its SliceToRAS origin.
+        sliceNode.SetXYZOrigin(25.0, 15.0, 0.0)
+        self.assertTrue(self.waitFor(lambda: streamer.views.get("Red", {}).get("shown", False) and streamer.views["Red"]["region"] != before, 30.0))
+        self.assertTrue(contains(streamer.views["Red"]["region"], centerIndex()))
+        # The bounds the panel uses for 'Refine view' and 'New ROI in view' follow the pan too.
+        bounds = OMEZarrLogic.sliceViewRasBounds("Red")
+        dims = sliceNode.GetDimensions()
+        center = slicer.util.arrayFromVTKMatrix(sliceNode.GetXYToRAS()) @ np.array([dims[0] / 2.0, dims[1] / 2.0, 0.0, 1.0])
+        for axis in range(3):
+            self.assertLessEqual(bounds[2 * axis], center[axis])
+            self.assertGreaterEqual(bounds[2 * axis + 1], center[axis])
+        sliceNode.SetXYZOrigin(0.0, 0.0, 0.0)
+        OMEZarrLogic.stopStreaming(storePath, wait=True)
+        Settings.set(Settings.STREAM, False)
+
     def writeMicroscopyStore(self, name="cells", withTime=False):
         import ngff_zarr
         from ngff_zarr import Omero, OmeroChannel, OmeroWindow
@@ -5057,7 +6109,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.delayDisplay("c,z,y,x microscopy store in micrometres, two channels")
         data, storePath = self.writeMicroscopyStore()
         nodes = OMEZarrLogic.loadImage(storePath, level=0)
-        self.assertEqual([n.GetName() for n in nodes], ["cells_DAPI", "cells_GFP"])
+        self.assertEqual([n.GetName() for n in nodes], ["cells_DAPI L0", "cells_GFP L0"])
         self.assertEqual(nodes[0].GetDisplayNode().GetColorNodeID(), "vtkMRMLColorTableNodeBlue")
         self.assertEqual(nodes[1].GetDisplayNode().GetColorNodeID(), "vtkMRMLColorTableNodeGreen")
         self.assertAlmostEqual(nodes[1].GetDisplayNode().GetWindow(), 2300.0)
@@ -5290,6 +6342,37 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         sliceNode.JumpSliceByCentering(center[0] - 25.0, center[1], center[2])
         self.assertFalse(self.waitFor(lambda: refiner.refreshCount > stopped, timeoutSeconds=1.0))
 
+    def test_RegistriesSurviveReload(self):
+        self.delayDisplay("A reloaded module (a new logic class) still finds and stops the streamer started before it")
+        import importlib.util
+
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        Settings.set(Settings.STREAM_3D, True)
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 1, "stream": True})
+        streamer = OMEZarrLogic.streamer(storePath)
+        self.assertIsNotNone(streamer)
+        node3D = streamer.volume3D
+        self.assertIsNotNone(node3D)
+        refiner = OMEZarrLogic.startAutoRefine(storePath, ("Red",))
+        self.assertIs(OMEZarrLogic.streamer(storePath), streamer)
+        # What Reload in the panel does first: execute the module file again as a new module,
+        # whose OMEZarrLogic is a different class with no registries of its own.
+        spec = importlib.util.spec_from_file_location("OMEZarrReloaded", __file__)
+        reloaded = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reloaded)
+        newLogic = reloaded.OMEZarrLogic
+        self.assertIsNot(newLogic, OMEZarrLogic)
+        self.assertIs(newLogic.streamer(storePath), streamer)
+        self.assertIs(newLogic.autoRefiner(storePath), refiner)
+        newLogic.stopAutoRefine()
+        newLogic.stopStreaming()
+        self.assertTrue(streamer.stopped)
+        self.assertIsNone(node3D.GetScene())  # the streamed 3D node went with it
+        self.assertIsNone(OMEZarrLogic.streamer(storePath))
+        self.assertIsNone(OMEZarrLogic.autoRefiner(storePath))
+        Settings.set(Settings.STREAM_3D, False)
+
     def centerRedViewOn(self, volumeNode, fieldOfView):
         sliceNode = slicer.app.layoutManager().sliceWidget("Red").mrmlSliceNode()
         sliceNode.SetOrientationToAxial()
@@ -5365,6 +6448,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.delayDisplay("Streaming ends with the full-resolution volume and nothing else in the scene")
         mrHead, storePath = self.writeMRHeadStore(chunks=32)
         Settings.set(Settings.STREAM, True)
+        Settings.set(Settings.STREAM_3D, False)  # with a 3D view attached the streamer stays on for it
         self.centerRedViewOn(mrHead, 40.0)
         # Hold every chunk read, so the load is seen returning before any of them.
         gate = threading.Event()
@@ -5394,14 +6478,27 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         streamed = [n for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode") if n.GetAttribute("OMEZarr.Streamed")]
         self.assertEqual(streamed, [])
 
-        # A level picked in the module panel is shown at once, and the budget's finer level streamed in.
-        picked = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 2, "maxBytes": 1 << 30})
-        self.assertEqual(picked.GetAttribute("OMEZarr.Level"), "2")
-        self.assertTrue(self.waitFor(lambda: picked.GetAttribute("OMEZarr.Level") == "0", 20.0))
-        # Picking the level the budget allows (or a finer one) loads it directly.
-        direct = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 0, "maxBytes": 1 << 30})
-        self.assertEqual(direct.GetAttribute("OMEZarr.Level"), "0")
+        # A level asked for is loaded whole, whatever the setting: it is what the caller wants in memory.
+        direct = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 1, "maxBytes": 1 << 30})
+        self.assertEqual(direct.GetAttribute("OMEZarr.Level"), "1")
         self.assertIsNone(OMEZarrLogic.streamer(storePath))
+        # Asked to stream, the coarsest level shows first and the level asked for is the target.
+        picked = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 1, "stream": True, "maxBytes": 1 << 30})
+        self.assertEqual(picked.GetAttribute("OMEZarr.Level"), "2")
+        self.assertEqual(OMEZarrLogic.streamer(storePath).target, 1)
+        self.assertTrue(self.waitFor(lambda: picked.GetAttribute("OMEZarr.Level") == "1", 20.0))
+        OMEZarrLogic.stopStreaming(storePath, wait=True)
+        # Streaming the coarsest level reads nothing behind it, but the views still refine on zoom.
+        coarse = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 2, "stream": True})
+        self.assertEqual(coarse.GetAttribute("OMEZarr.Level"), "2")
+        streamer = OMEZarrLogic.streamer(storePath)
+        self.assertIsNotNone(streamer)
+        self.assertEqual(streamer.target, 2)
+        self.centerRedViewOn(mrHead, 40.0)
+        self.assertTrue(self.waitFor(lambda: streamer.views.get("Red", {}).get("shown", False), 20.0))
+        self.assertEqual(streamer.views["Red"]["level"], 0)
+        self.assertEqual(coarse.GetAttribute("OMEZarr.Level"), "2")  # the volume itself stays coarse
+        OMEZarrLogic.stopStreaming(storePath, wait=True)
 
         # With streaming off, the same load returns the full level straight away.
         Settings.set(Settings.STREAM, False)
@@ -5674,8 +6771,13 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         if node3D.GetAttribute("OMEZarr.Level") == "1":
             self.assertIs(node3D.GetImageData(), streamer.targetImageData)
             np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), np.asarray(multiscales.images[1].data))
-        display = node3D.GetDisplayNode()
-        self.assertTrue(display.IsA("vtkMRMLVolumeRenderingDisplayNode") and display.GetVisibility())
+        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(node3D)
+        self.assertTrue(display is not None and display.GetVisibility())
+        # Its transfer function came from the streamed volume's window and level, as for a plain load.
+        sourceDisplay = streamer.node.GetDisplayNode()
+        scalarDisplay = node3D.GetVolumeDisplayNode()
+        self.assertIsNotNone(scalarDisplay)
+        self.assertEqual((scalarDisplay.GetWindow(), scalarDisplay.GetLevel()), (sourceDisplay.GetWindow(), sourceDisplay.GetLevel()))
 
         widget = slicer.app.layoutManager().threeDWidget(0)
         cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(widget.mrmlViewNode())
@@ -5700,9 +6802,12 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertIsNone(streamer.request3D)
         self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "1")
         streamer.updateLevelLabels()
-        self.assertIn("level 1", widget.threeDView().cornerAnnotation().GetText(Streamer.LEVEL_CORNER))
+        annotation3D = widget.threeDView().cornerAnnotation()
+        self.assertEqual(annotation3D.GetText(OMEZarrLogic.NAME_CORNER), streamer.node.GetName())
+        self.assertEqual(annotation3D.GetText(OMEZarrLogic.LEVEL_CORNER), "L1")
         redLabel = slicer.app.layoutManager().sliceWidget("Red").sliceView().cornerAnnotation()
-        self.assertIn("OME-Zarr level", redLabel.GetText(Streamer.LEVEL_CORNER))
+        self.assertEqual(redLabel.GetText(OMEZarrLogic.NAME_CORNER), streamer.node.GetName())
+        self.assertTrue(redLabel.GetText(OMEZarrLogic.LEVEL_CORNER).startswith("L"))
 
         # Close up, the view needs level 0, but only the part of the volume in front of the camera.
         lookFrom(60.0)
@@ -5762,6 +6867,28 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertTrue(self.waitFor(insideRoi, 20.0))
         (z0, z1), (y0, y1), (x0, x1) = streamer.shown3D[1]
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), full[z0:z1, y0:y1, x0:x1])
+
+        # The panel's "New ROI in view" takes the cropping region, shown, rather than placing a new one.
+        if slicer.util.mainWindow() is not None:
+            slicer.util.selectModule("OMEZarr")
+            widget = slicer.modules.OMEZarrWidget
+            widget.pathEdit.currentPath = storePath
+            widget.onCreateRoi()
+            self.assertIs(widget.roiSelector.currentNode(), roi)
+            self.assertTrue(roi.GetDisplayVisibility())
+            # The selection drives the cropping and the box: none means the whole volume, box hidden.
+            widget.roiSelector.setCurrentNode(None)
+            self.assertFalse(display.GetCroppingEnabled())
+            self.assertFalse(roi.GetDisplayVisibility())
+            widget.roiSelector.setCurrentNode(roi)
+            self.assertTrue(display.GetCroppingEnabled())
+            self.assertTrue(roi.GetDisplayVisibility())
+            # Clicking "New ROI in view" again brings the same region back, not another one.
+            rois = len(slicer.util.getNodesByClass("vtkMRMLMarkupsROINode"))
+            widget.onCreateRoi()
+            self.assertIs(widget.roiSelector.currentNode(), roi)
+            self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLMarkupsROINode")), rois)
+            widget.roiSelector.setCurrentNode(None)
 
         node3D.RemoveObserver(imageObserver)
         self.assertEqual(mismatches, [])
@@ -5960,7 +7087,9 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.assertTrue(reader.sharded)
             self.assertEqual(reader.perShard, (2, 2, 2))
             # One index per shard touched, then one range per non-empty chunk: never a whole shard.
-            keys = {key for r in streamer.views.values() if r["level"] == 0 for key in r["keys"]}
+            # Only the Red view was waited for: another view zoomed in by an earlier test may have
+            # asked for its level-0 chunks without their shard indexes being read yet.
+            keys = set(streamer.views["Red"]["keys"])
             shards = {tuple(k // 2 for k in key) for key in keys}
             self.assertLessEqual(shards, set(reader.indexes))
             self.assertEqual(reader.indexReads, len(reader.indexes))  # each shard's index read once, then kept
@@ -6082,7 +7211,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(len(bioformats2rawSeries(root)), 2)
         self.assertEqual(str(slicer.app.coreIOManager().fileType(root)), "OMEZarr")
         nodes = OMEZarrLogic.loadImage(root, level=0)
-        self.assertEqual([n.GetName() for n in nodes], ["converted_0", "converted_1"])
+        self.assertEqual([n.GetName() for n in nodes], ["converted_0", "converted_1"])  # label maps: no level suffix
         for node, array in zip(nodes, arrays, strict=True):
             np.testing.assert_array_equal(slicer.util.arrayFromVolume(node), array)
         first = slicer.util.loadNodeFromFile(root, "OMEZarr", {"level": 0})
@@ -6224,6 +7353,13 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertIsNotNone(roiNode)
         self.assertTrue(widget.loadRegionButton.enabled)
         self.assertGreater(min(roiNode.GetSize()), 0.0)
+        # Deselected, the region's box is hidden; "New ROI in view" brings the same one back.
+        widget.roiSelector.setCurrentNode(None)
+        self.assertFalse(roiNode.GetDisplayVisibility())
+        self.assertFalse(widget.loadRegionButton.enabled)
+        widget.onCreateRoi()
+        self.assertIs(widget.roiSelector.currentNode(), roiNode)
+        self.assertTrue(roiNode.GetDisplayVisibility())
 
         def regionNodes():
             nodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
