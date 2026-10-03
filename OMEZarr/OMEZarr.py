@@ -1122,9 +1122,14 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         for channelIndex in channels:
             label = descriptions[channelIndex]["label"] or (f"c{channelIndex}" if len(descriptions) > 1 else None)
             nodeName = f"{baseName}_{label}" if label else baseName
+            whole = not region and not asSequence and announceLevel  # a level loaded whole, not streamed
+            existing = cls.loadedWholeVolume(path, level, timeIndex, channelIndex) if whole else None
             if region:
                 nodeName += "_ROI"
-            nodeName = slicer.mrmlScene.GenerateUniqueName(nodeName)
+            elif whole:
+                nodeName += f" L{level}"  # the name says which level; loading it again refills this node
+            if existing is None:
+                nodeName = slicer.mrmlScene.GenerateUniqueName(nodeName)
             if asSequence:
                 sequence = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSequenceNode", nodeName + "_sequence")
                 sequence.SetIndexName("time")
@@ -1153,7 +1158,9 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 )
                 sequences.append((sequence, descriptions[channelIndex]))
             else:
-                node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", nodeName)
+                node = existing or slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", nodeName)
+                if existing is not None and not node.GetName().endswith(f" L{level}"):
+                    node.SetName(nodeName)
                 cls.fillVolumeNode(
                     node, image, timeIndex, channelIndex, region, ijkToRas, userMessages, progress, nodeName,
                     reader=runResponsive(lambda: cls.chunkReader(multiscales, level)),
@@ -1161,7 +1168,8 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                 cls.setNodeAttributes(
                     node, path, level, dims, timeIndex, channelIndex, lengthUnit, orientationSource, region
                 )
-                cls.setupDisplay(node, descriptions[channelIndex], multiChannel=len(descriptions) > 1)
+                if existing is None:  # a refilled node keeps its window, level and colours
+                    cls.setupDisplay(node, descriptions[channelIndex], multiChannel=len(descriptions) > 1)
                 nodes.append(node)
 
         if sequences:
@@ -1541,6 +1549,29 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                     return background
         candidates = [n for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode") if matches(n)]
         return candidates[-1] if candidates else None
+
+    @staticmethod
+    def loadedWholeVolume(path, level, timeIndex, channelIndex):
+        """The volume holding this level of the store whole (one time point and channel), not
+        streamed now and not a region: loading the level again refills it instead of adding a copy."""
+        streamer = OMEZarrLogic.streamer(path)
+        streamed = streamer.node if streamer is not None and not streamer.stopped else None
+        for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")[::-1]:
+            if (
+                node is not streamed
+                and not node.IsA("vtkMRMLLabelMapVolumeNode")
+                and samePath(node.GetAttribute("OMEZarr.Path"), path)
+                and node.GetAttribute("OMEZarr.Level") == str(level)
+                and node.GetAttribute("OMEZarr.TimeIndex") == str(timeIndex)
+                and node.GetAttribute("OMEZarr.Channel") == str(channelIndex)
+                and not any(
+                    node.GetAttribute(key)
+                    for key in ("OMEZarr.Region", "OMEZarr.Refined", "OMEZarr.Role", "OMEZarr.Streamed", "OMEZarr.Streamed3D")
+                )
+                and node.GetScene() is not None
+            ):
+                return node
+        return None
 
     @classmethod
     def matchDisplay(cls, node, path, sliceViewName=None):
@@ -5536,6 +5567,18 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertTrue(display.GetVisibility())
         self.assertIn("loaded whole", widget.statusLabel.text)
         self.assertIn("rendered in the 3D view", widget.statusLabel.text)
+        # The name says which level; loading the level again refills the node instead of adding a copy.
+        self.assertTrue(node.GetName().endswith(" L1"))
+        volumes = len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"))
+        widget.onLoad()
+        self.assertIs(widget.loadedVolume(), node)
+        self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")), volumes)
+        widget.levelTable.selectRow(2)
+        widget.onLoad()
+        self.assertTrue(widget.loadedVolume().GetName().endswith(" L2"))
+        self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")), volumes + 1)
+        slicer.mrmlScene.RemoveNode(widget.loadedVolume())
+        widget.levelTable.selectRow(1)
         # The checkbox acts on the loaded volume at once.
         widget.onVolumeRenderingToggled(False)
         self.assertFalse(display.GetVisibility())
