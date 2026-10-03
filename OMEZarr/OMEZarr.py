@@ -1554,6 +1554,10 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         editorNode = cls.segmentEditorNode()
         editorNode.SetAndObserveSegmentationNode(segmentation)
         editorNode.SetAndObserveSourceVolumeNode(source)
+        # The editor's selected segment belonged to the previous segmentation; the new one has
+        # no segments yet. Left in place, tools that read the selection (NNInteractive) look
+        # for a segment the new segmentation does not have.
+        editorNode.SetSelectedSegmentID(None)
         logging.info(
             "Segmentation %s: level %d, %d x %d x %d voxels (region %s plus a %d-voxel margin), editor working set %.2f GiB",
             segmentation.GetName(),
@@ -5817,8 +5821,13 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
 
         # A second segmentation gets a source volume of its own: the first keeps its box and voxels.
         firstVoxels = slicer.util.arrayFromVolume(source).copy()
+        self.assertEqual(editorNode.GetSelectedSegmentID(), "test")  # a segment of the first segmentation
         again = OMEZarrLogic.createSegmentationFromRoi(storePath, roi, 1)
         second = again["sourceVolume"]
+        # The editor no longer points at a segment of the first segmentation.
+        self.assertIn(editorNode.GetSelectedSegmentID(), (None, ""))
+        self.assertIs(editorNode.GetSegmentationNode(), again["segmentation"])
+        self.assertIs(editorNode.GetSourceVolumeNode(), second)
         self.assertIsNot(second, source)
         self.assertEqual(list(second.GetImageData().GetDimensions()), boxes[1]["dims"])
         self.assertEqual(again["segmentation"].GetAttribute("OMEZarr.Level"), "1")
