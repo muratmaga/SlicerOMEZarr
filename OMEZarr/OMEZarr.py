@@ -1743,7 +1743,8 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     def streamer(cls, path):
         return cls._streamers.get(str(path))
 
-    LEVEL_CORNER = 3  # upper right of a view; Slicer's own slice annotations use the other corners
+    NAME_CORNER = 2  # upper left of a view: the volume it shows
+    LEVEL_CORNER = 3  # upper right: its level
 
     @staticmethod
     def renderedVolume():
@@ -1755,9 +1756,9 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @classmethod
     def updateViewLabels(cls, clear=False):
-        """Each view's corner names the volume it shows and its level, "name · L1". A slice view
-        over a streamed volume shows the level of the plane laid on it and "(loading L0)" while
-        that plane is read; the 3D view names the volume it renders."""
+        """Each view names the volume it shows in its upper left corner and the level in the
+        upper right ("L1"). A slice view over a streamed volume shows the level of the plane laid
+        on it and "(loading L0)" while that plane is read; the 3D view names the volume it renders."""
         layoutManager = slicer.app.layoutManager()
         if layoutManager is None:
             return
@@ -1765,7 +1766,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
         def label(node, level=None):
             level = node.GetAttribute("OMEZarr.Level") if level is None else level
-            return node.GetName() + (f" · L{level}" if level not in (None, "") else "")
+            return node.GetName(), (f"L{level}" if level not in (None, "") else "")
 
         views = []
         for viewName in layoutManager.sliceViewNames():
@@ -1773,36 +1774,40 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             if sliceWidget is None:
                 continue
             background = sliceWidget.sliceLogic().GetBackgroundLayer().GetVolumeNode()
-            text = ""
+            name, level = "", ""
             if background is not None:
-                text = label(background)
+                name, level = label(background)
                 for streamer in streamers:
                     if streamer.node is not background:
                         continue
                     overlay, request = streamer.overlays.get(viewName), streamer.views.get(viewName)
                     if overlay is not None and overlay.GetScene() is not None:
-                        text = label(background, overlay.GetAttribute("OMEZarr.Level"))
+                        name, level = label(background, overlay.GetAttribute("OMEZarr.Level"))
                     if request is not None and not request["shown"]:
-                        text += _(" (loading L{level})").format(level=request["level"])
-            views.append((sliceWidget.sliceView(), text))
+                        level += _(" (loading L{level})").format(level=request["level"])
+            views.append((sliceWidget.sliceView(), name, level))
         if layoutManager.threeDViewCount:
             rendered = cls.renderedVolume()
-            text = ""
+            name, level = "", ""
             if rendered is not None:
-                text = label(rendered)
+                name, level = label(rendered)
                 for streamer in streamers:
                     if streamer.volume3D is rendered and streamer.shown3D:
-                        text = label(streamer.node, streamer.shown3D[0])
-            views.append((layoutManager.threeDWidget(0).threeDView(), text))
-        for view, text in views:
+                        name, level = label(streamer.node, streamer.shown3D[0])
+            views.append((layoutManager.threeDWidget(0).threeDView(), name, level))
+        for view, name, level in views:
             if clear:
-                text = ""
+                name, level = "", ""
             try:
                 annotation = view.cornerAnnotation()
             except AttributeError:
                 continue
-            if annotation.GetText(cls.LEVEL_CORNER) != text:
-                annotation.SetText(cls.LEVEL_CORNER, text)
+            changed = False
+            for corner, text in ((cls.NAME_CORNER, name), (cls.LEVEL_CORNER, level)):
+                if annotation.GetText(corner) != text:
+                    annotation.SetText(corner, text)
+                    changed = True
+            if changed:
                 view.scheduleRender()
 
     @classmethod
@@ -3114,7 +3119,9 @@ class Streamer:
         layoutManager = slicer.app.layoutManager()
         for viewName in self.sliceViewNames:
             sliceWidget = layoutManager.sliceWidget(viewName) if layoutManager else None
-            request = self.viewRequest(sliceWidget.mrmlSliceNode()) if sliceWidget is not None else None
+            # Only views showing this volume get its planes: a region loaded whole keeps its view.
+            showsVolume = sliceWidget is not None and sliceWidget.sliceLogic().GetBackgroundLayer().GetVolumeNode() is self.node
+            request = self.viewRequest(sliceWidget.mrmlSliceNode()) if showsVolume else None
             if request is None:
                 self.views.pop(viewName, None)
                 self.removeOverlay(viewName)
@@ -4518,7 +4525,8 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.loadRegionButton.setToolTip(
             _(
                 "Load the region of interest at the selected level as an ordinary volume: only the chunks the "
-                "region intersects are read. The table shows its size and memory at each level."
+                "region intersects are read. A rotated region loads the axis-aligned box around it. With volume "
+                "rendering on, the loaded region takes the 3D view. The table shows its size and memory at each level."
             )
         )
         refineLayout.addRow(self.loadRegionButton)
@@ -5079,8 +5087,11 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             self.statusLabel.text = _("3D view: rendering off") if (streamer or allLoaded) else ""
             return
         if streamer is not None:
+            for other in self.loadedVolumes() + self.regionVolumes():  # one rendering at a time
+                self.renderVolume(other, False)
             try:
                 node = streamer.enable3D()
+                self.cropTo(self.roiSelector.currentNode())
                 self.statusLabel.text = _("3D view: rendering {name}, following the camera").format(name=node.GetName())
             except ValueError as e:
                 self.statusLabel.text = str(e)
@@ -5149,7 +5160,22 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         scalars = scalarVolumes(nodes)
         if scalars:
             slicer.util.setSliceViewerLayers(background=scalars[0], fit=True)
-        self.statusLabel.text = self.describeNodes(roiNode.GetName(), nodes)
+        text = self.describeNodes(
+            _("Region loaded at level {level} as {name}").format(level=max(0, self.selectedLevel()), name=scalars[0].GetName())
+            if scalars
+            else roiNode.GetName(),
+            nodes,
+        )
+        if self.roiRotated(roiNode):
+            text += _(" · the axis-aligned box around the rotated region")
+        text += _(" · shown in the slice views")
+        if scalars and Settings.get(Settings.STREAM_3D, False):
+            streamer = OMEZarrLogic.streamer(self.path)
+            if streamer is not None and streamer.volume3D is not None:
+                streamer.disable3D(stopWhenDone=False)  # the loaded region takes the 3D view
+            self.renderVolume(scalars[0], True)
+            text += _(" and rendered in the 3D view")
+        self.statusLabel.text = text
         self.updateLevelStatus()
         OMEZarrLogic.updateViewLabels()
 
@@ -5179,9 +5205,44 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         if roiNode is not None:
             events = (vtk.vtkCommand.ModifiedEvent, slicer.vtkMRMLMarkupsNode.PointModifiedEvent)
             self.roiObserver = (roiNode, [roiNode.AddObserver(event, self.onRoiModified) for event in events])
+        self.cropTo(roiNode)
         self.showRoiBoxes()
         self.updateLevelStatus()
         self.updateButtons()
+
+    def cropTo(self, roiNode):
+        """The streamed 3D view shows what the selected region holds: its cropping follows the
+        selection, and no region means the whole volume. The region's box stays where it is."""
+        streamer = OMEZarrLogic.streamer(self.path) if self.path else None
+        if streamer is None or streamer.volume3D is None:
+            return
+        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(streamer.volume3D)
+        if display is None:
+            return
+        if roiNode is None:
+            display.SetCroppingEnabled(False)
+            return
+        if display.GetROINode() is not roiNode:
+            display.SetAndObserveROINodeID(roiNode.GetID())
+        display.SetCroppingEnabled(True)
+        roiNode.SetDisplayVisibility(True)
+
+    @staticmethod
+    def roiRotated(roiNode):
+        """Whether the region is rotated against the world axes (its loaded box is then the axis-aligned box around it)."""
+        matrix = roiNode.GetObjectToNodeMatrix()
+        return any(abs(matrix.GetElement(i, j) - (1.0 if i == j else 0.0)) > 1e-6 for i in range(3) for j in range(3))
+
+    def regionVolumes(self):
+        """Regions of this store loaded as volumes."""
+        return [
+            n
+            for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            if samePath(n.GetAttribute("OMEZarr.Path"), self.path)
+            and n.GetAttribute("OMEZarr.Region")
+            and not n.GetAttribute("OMEZarr.Refined")
+            and not n.GetAttribute("OMEZarr.Role")
+        ]
 
     def onRoiModified(self, caller=None, event=None):
         self.roiTimer.start()  # once the handles stop moving
@@ -6345,9 +6406,12 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertIsNone(streamer.request3D)
         self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "1")
         streamer.updateLevelLabels()
-        self.assertEqual(widget.threeDView().cornerAnnotation().GetText(Streamer.LEVEL_CORNER), f"{streamer.node.GetName()} · L1")
+        annotation3D = widget.threeDView().cornerAnnotation()
+        self.assertEqual(annotation3D.GetText(OMEZarrLogic.NAME_CORNER), streamer.node.GetName())
+        self.assertEqual(annotation3D.GetText(OMEZarrLogic.LEVEL_CORNER), "L1")
         redLabel = slicer.app.layoutManager().sliceWidget("Red").sliceView().cornerAnnotation()
-        self.assertTrue(redLabel.GetText(Streamer.LEVEL_CORNER).startswith(streamer.node.GetName() + " · L"))
+        self.assertEqual(redLabel.GetText(OMEZarrLogic.NAME_CORNER), streamer.node.GetName())
+        self.assertTrue(redLabel.GetText(OMEZarrLogic.LEVEL_CORNER).startswith("L"))
 
         # Close up, the view needs level 0, but only the part of the volume in front of the camera.
         lookFrom(60.0)
@@ -6416,6 +6480,11 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             widget.onCreateRoi()
             self.assertIs(widget.roiSelector.currentNode(), roi)
             self.assertTrue(roi.GetDisplayVisibility())
+            # The selection drives the cropping: none means the whole volume.
+            widget.roiSelector.setCurrentNode(None)
+            self.assertFalse(display.GetCroppingEnabled())
+            widget.roiSelector.setCurrentNode(roi)
+            self.assertTrue(display.GetCroppingEnabled())
             widget.roiSelector.setCurrentNode(None)
 
         node3D.RemoveObserver(imageObserver)
