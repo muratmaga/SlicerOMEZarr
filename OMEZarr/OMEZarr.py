@@ -4992,6 +4992,22 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         is from this store, else the latest."""
         return OMEZarrLogic.sourceVolumeNode(self.path, 0, self.viewSelector.currentData or "Red")
 
+    def loadedVolumes(self):
+        """Every volume loaded whole from this store (no regions, nothing a streamer owns)."""
+        streamer = OMEZarrLogic.streamer(self.path)
+        streamed = streamer.node if streamer is not None and not streamer.stopped else None
+        return [
+            n
+            for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            if n is not streamed
+            and not n.IsA("vtkMRMLLabelMapVolumeNode")
+            and samePath(n.GetAttribute("OMEZarr.Path"), self.path)
+            and not any(
+                n.GetAttribute(key)
+                for key in ("OMEZarr.Region", "OMEZarr.Refined", "OMEZarr.Role", "OMEZarr.Streamed", "OMEZarr.Streamed3D")
+            )
+        ]
+
     def describeNodes(self, prefix, nodes):
         volumes = scalarVolumes(nodes)
         if not volumes:
@@ -5045,9 +5061,10 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         if not enabled:
             if streamer is not None:
                 streamer.disable3D()
-            if loaded is not None:
-                self.renderVolume(loaded, False)
-            self.statusLabel.text = _("3D view: rendering off") if (streamer or loaded) else ""
+            allLoaded = self.loadedVolumes() if self.path else []
+            for node in allLoaded:  # every level of this store loaded whole
+                self.renderVolume(node, False)
+            self.statusLabel.text = _("3D view: rendering off") if (streamer or allLoaded) else ""
             return
         if streamer is not None:
             try:
@@ -5565,6 +5582,11 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertTrue(display.GetVisibility())
         self.assertIn("loaded whole", widget.statusLabel.text)
         self.assertIn("rendered in the 3D view", widget.statusLabel.text)
+        # The checkbox acts on the loaded volume at once (while the slice views show it).
+        widget.onVolumeRenderingToggled(False)
+        self.assertFalse(display.GetVisibility())
+        widget.onVolumeRenderingToggled(True)
+        self.assertTrue(display.GetVisibility())
         # The name says which level; loading the level again refills the node instead of adding a copy.
         self.assertTrue(node.GetName().endswith(" L1"))
         volumes = len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"))
@@ -5579,11 +5601,6 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(coarse.GetAttribute("OMEZarr.Level"), "2")
         slicer.mrmlScene.RemoveNode(coarse)
         widget.levelTable.selectRow(1)
-        # The checkbox acts on the loaded volume at once.
-        widget.onVolumeRenderingToggled(False)
-        self.assertFalse(display.GetVisibility())
-        widget.onVolumeRenderingToggled(True)
-        self.assertTrue(display.GetVisibility())
         slicer.mrmlScene.RemoveNode(node)
 
         # Stream: the coarsest level shown, the selected level the target, the 3D view following.
