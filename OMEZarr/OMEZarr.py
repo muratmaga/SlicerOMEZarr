@@ -1410,23 +1410,19 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     @classmethod
     def segmentationBoxForView(cls, path, multiscales=None, maxBytes=None, timeIndex=0):
-        """Where a segmentation made now would live: the block the 3D view shows (already in
-        memory for it), else what the slice views show together; at the finest level whose
-        Segment Editor working set fits the memory budget (the coarsest level when none does);
-        grown outward to whole chunks.
+        """Where a segmentation made now would live: what the 3D view shows (the part of the
+        volume in front of the camera, down to the depth its opacity shows), else what the slice
+        views show together; at the finest level whose Segment Editor working set fits the memory
+        budget (the coarsest level when none does); grown outward to whole chunks.
 
         Returns {"level", "region" (dim -> (start, stop)), "dims" (x, y, z), "bytes" (the working
         set), "source" (where the block came from), "bounds" (RAS)}.
         """
         streamer = cls.streamer(path)
-        if (
-            streamer is not None
-            and streamer.volume3D is not None
-            and streamer.shown3D is not None
-            and streamer.shown3D[0] != streamer.contextLevel
-        ):
-            low, high = streamer.regionRasBounds(*streamer.shown3D)
-            bounds = [low[0], high[0], low[1], high[1], low[2], high[2]]
+        visible = streamer.visibleBounds() if streamer is not None and streamer.volume3D is not None else None
+        if visible is not None:
+            points, _pixel = visible
+            bounds = [float(v) for axis in range(3) for v in (points[axis].min(), points[axis].max())]
             source = "3D view"
         else:
             bounds = cls.viewsRasBounds()
@@ -3608,11 +3604,10 @@ class Streamer:
         ras = (self.ijkToRas[level] @ corners.T)[:3]
         return ras.min(axis=1), ras.max(axis=1)
 
-    def volumeRequest(self, finest=0):
-        """What the 3D view needs: the part of the volume inside the camera's view (and the
-        cropping ROI) between the depths it shows, at the coarsest level whose voxels are no larger
-        than a screen pixel at the focal point (never finer than ``finest``), within the texture
-        limits. None when the context level will do."""
+    def visibleBounds(self):
+        """What the 3D view shows: RAS points (3 x n) of the lattice cells inside the camera's
+        view (and the cropping ROI) between the depths its opacity shows, grown by one cell, and
+        the screen pixel size (mm) at the focal point. None when nothing is in view."""
         widget, cameraNode = self.cameraNode3D()
         if cameraNode is None:
             return None
@@ -3676,18 +3671,33 @@ class Streamer:
             pixel = 2.0 * camera.GetParallelScale() / height
         else:
             pixel = 2.0 * camera.GetDistance() * np.tan(np.radians(camera.GetViewAngle() / 2.0)) / height
+        return points, pixel
+
+    def regionAtLevel(self, points, level):
+        """The (z, y, x) index ranges at ``level`` spanning RAS ``points`` (3 x n), within the volume."""
+        index = np.linalg.inv(self.ijkToRas[level]) @ np.vstack([points[:3], np.ones(points.shape[1])])
+        region = []
+        for row, size in zip((2, 1, 0), self.levels[level].shape):
+            start = max(0, int(np.floor(index[row].min())))
+            stop = min(size, int(np.ceil(index[row].max())) + 1)
+            region.append((start, stop))
+        return tuple(region)
+
+    def volumeRequest(self, finest=0):
+        """What the 3D view needs: the part of the volume inside the camera's view (and the
+        cropping ROI) between the depths it shows, at the coarsest level whose voxels are no larger
+        than a screen pixel at the focal point (never finer than ``finest``), within the texture
+        limits. None when the context level will do."""
+        visible = self.visibleBounds()
+        if visible is None:
+            return None
+        points, pixel = visible
         level = next((lv for lv in reversed(range(len(self.levels))) if self.spacing[lv] <= pixel * 1.001), 0)
         level = max(level, finest)
         itemSize = np.dtype(self.dtype).itemsize
         self.unfit3D = None
         for level in range(level, self.contextLevel):
-            index = np.linalg.inv(self.ijkToRas[level]) @ points
-            region = []
-            for row, size in zip((2, 1, 0), self.levels[level].shape):
-                start = max(0, int(np.floor(index[row].min())))
-                stop = min(size, int(np.ceil(index[row].max())) + 1)
-                region.append((start, stop))
-            region = tuple(region)
+            region = self.regionAtLevel(points, level)
             dims = [stop - start for start, stop in region]
             if min(dims) <= 0:
                 return None
