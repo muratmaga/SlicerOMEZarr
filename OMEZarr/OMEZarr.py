@@ -1391,60 +1391,35 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     # ---- segmentation ----
 
     @classmethod
-    def viewsRasBounds(cls, sliceViewNames=None):
-        """RAS bounds of what the slice views show together: the intersection of their blocks,
-        or the first view's block when they share nothing."""
-        layoutManager = slicer.app.layoutManager()
-        names = [n for n in (sliceViewNames or cls.DEFAULT_AUTO_REFINE_VIEWS) if layoutManager.sliceWidget(n) is not None]
-        if not names:
-            raise ValueError("No slice view to take the region from")
-        blocks = [cls.sliceViewRasBounds(n) for n in names]
-        bounds = list(blocks[0])
-        for block in blocks[1:]:
-            for axis in range(3):
-                bounds[2 * axis] = max(bounds[2 * axis], block[2 * axis])
-                bounds[2 * axis + 1] = min(bounds[2 * axis + 1], block[2 * axis + 1])
-        if any(bounds[2 * axis] >= bounds[2 * axis + 1] for axis in range(3)):
-            return blocks[0]
-        return bounds
+    def boxAtLevel(cls, image, rasBounds):
+        """The index ranges (dim -> (start, stop)) of ``rasBounds`` at this level, grown outward
+        to whole chunks, and the box's size (x, y, z)."""
+        region = cls.regionFromRasBounds(image, rasBounds)
+        dims = list(image.dims)
+        for d, (start, stop) in region.items():
+            edges = np.concatenate([[0], np.cumsum(image.data.chunks[dims.index(d)])]).astype(int)
+            first = int(np.searchsorted(edges, start, side="right")) - 1
+            last = int(np.searchsorted(edges, stop - 1, side="right"))
+            region[d] = (int(edges[first]), int(edges[last]))
+        size = [region[d][1] - region[d][0] if d in region else cls.axisLength(image, d) for d in SPATIAL_DIMS]
+        return region, size
 
     @classmethod
-    def segmentationBoxForView(cls, path, multiscales=None, maxBytes=None, timeIndex=0):
-        """Where a segmentation made now would live: what the 3D view shows (the part of the
-        volume in front of the camera, down to the depth its opacity shows), else what the slice
-        views show together; at the finest level whose Segment Editor working set fits the memory
-        budget (the coarsest level when none does); grown outward to whole chunks.
-
-        Returns {"level", "region" (dim -> (start, stop)), "dims" (x, y, z), "bytes" (the working
-        set), "source" (where the block came from), "bounds" (RAS)}.
-        """
-        streamer = cls.streamer(path)
-        visible = streamer.visibleBounds() if streamer is not None and streamer.volume3D is not None else None
-        if visible is not None:
-            points, _pixel = visible
-            bounds = [float(v) for axis in range(3) for v in (points[axis].min(), points[axis].max())]
-            source = "3D view"
-        else:
-            bounds = cls.viewsRasBounds()
-            source = "slice views"
+    def segmentationBoxes(cls, path, roiNode, multiscales=None):
+        """The box of a region of interest at every level, for a segmentation to be edited in:
+        one {"level", "region", "dims" (x, y, z), "bytes"} per level, ``bytes`` being the Segment
+        Editor's working set for it (two copies of the source volume and SEGMENT_EDITOR_LABEL_BUFFERS
+        bytes per voxel of labelmaps). Raises ValueError when the region misses the image."""
         multiscales = multiscales or cls.openMultiscales(path)
-        budget = maxBytes or cls.maxBytesFromSettings()
+        bounds = [0.0] * 6
+        roiNode.GetRASBounds(bounds)
         itemSize = np.dtype(cls.vtkCompatibleDtype(multiscales.images[0].data.dtype)).itemsize
-        choice = None
+        boxes = []
         for level, image in enumerate(multiscales.images):
-            region = cls.regionFromRasBounds(image, bounds)
-            dims = list(image.dims)
-            for d, (start, stop) in region.items():
-                edges = np.concatenate([[0], np.cumsum(image.data.chunks[dims.index(d)])]).astype(int)
-                first = int(np.searchsorted(edges, start, side="right")) - 1
-                last = int(np.searchsorted(edges, stop - 1, side="right"))
-                region[d] = (int(edges[first]), int(edges[last]))
-            size = [region[d][1] - region[d][0] if d in region else cls.axisLength(image, d) for d in SPATIAL_DIMS]
+            region, size = cls.boxAtLevel(image, bounds)
             cost = int(np.prod(size)) * (2 * itemSize + SEGMENT_EDITOR_LABEL_BUFFERS)
-            choice = {"level": level, "region": region, "dims": size, "bytes": cost, "source": source, "bounds": bounds}
-            if cost <= budget:
-                break
-        return choice
+            boxes.append({"level": level, "region": region, "dims": size, "bytes": cost})
+        return boxes
 
     @classmethod
     def workingVolumeNode(cls, path):
@@ -1468,32 +1443,15 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
             node = slicer.mrmlScene.AddNode(node)
         return node
 
-    @staticmethod
-    def boxNode(segmentation, source):
-        """A locked region of interest drawing the segmentation's geometry in every view."""
-        bounds = [0.0] * 6
-        source.GetRASBounds(bounds)
-        box = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", segmentation.GetName() + " box")
-        box.CreateDefaultDisplayNodes()
-        box.SetCenter(*[(bounds[i] + bounds[i + 1]) / 2.0 for i in (0, 2, 4)])
-        box.SetSize(*[bounds[i + 1] - bounds[i] for i in (0, 2, 4)])
-        box.SetLocked(True)
-        box.SetSaveWithScene(False)
-        box.SetAttribute("OMEZarr.Role", "segmentationBox")
-        box.SetAttribute("OMEZarr.Segmentation", segmentation.GetID())
-        display = box.GetDisplayNode()
-        display.SetHandlesInteractive(False)
-        display.SetFillOpacity(0.1)
-        return box
-
     @classmethod
-    def createSegmentationForView(cls, path, timeIndex=0, name=None, maxBytes=None, userMessages=None, progress=None):
-        """A segmentation whose reference geometry is the box the views show (segmentationBoxForView):
-        the box's voxels are read into the store's working volume, both are selected in the Segment
-        Editor, and a locked ROI draws the box. Returns {"segmentation", "sourceVolume", "box", "geometry"}."""
+    def createSegmentationFromRoi(cls, path, roiNode, level, timeIndex=0, name=None, userMessages=None, progress=None):
+        """A segmentation whose reference geometry is the region of interest's box at ``level``
+        (segmentationBoxes): the box's voxels are read into the store's working volume and both
+        are selected in the Segment Editor. Returns {"segmentation", "sourceVolume", "box"}."""
         multiscales = cls.openMultiscales(path)
-        geometry = cls.segmentationBoxForView(path, multiscales, maxBytes, timeIndex)
-        level, region = geometry["level"], geometry["region"]
+        level = int(level)
+        box = cls.segmentationBoxes(path, roiNode, multiscales)[level]
+        region = box["region"]
         image = multiscales.images[level]
         ijkToRas, orientationSource = cls.regionIjkToRas(image, region, userMessages)
         source = cls.workingVolumeNode(path)
@@ -1513,20 +1471,18 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         segmentation.CreateDefaultDisplayNodes()
         segmentation.SetReferenceImageGeometryParameterFromVolumeNode(source)
         cls.setNodeAttributes(segmentation, path, level, dims, timeIndex, 0, lengthUnit, orientationSource, region)
-        box = cls.boxNode(segmentation, source)
         editorNode = cls.segmentEditorNode()
         editorNode.SetAndObserveSegmentationNode(segmentation)
         editorNode.SetAndObserveSourceVolumeNode(source)
         logging.info(
-            "Segmentation %s: level %d, %d x %d x %d voxels, region %s, editor working set %.2f GiB, from the %s",
+            "Segmentation %s: level %d, %d x %d x %d voxels, region %s, editor working set %.2f GiB",
             segmentation.GetName(),
             level,
-            *geometry["dims"],
+            *box["dims"],
             source.GetAttribute("OMEZarr.Region"),
-            geometry["bytes"] / 2**30,
-            geometry["source"],
+            box["bytes"] / 2**30,
         )
-        return {"segmentation": segmentation, "sourceVolume": source, "box": box, "geometry": geometry}
+        return {"segmentation": segmentation, "sourceVolume": source, "box": box}
 
     # ---- view-driven refinement ----
 
@@ -4464,14 +4420,15 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.loadRegionButton = qt.QPushButton(_("Load region at the selected level"))
         self.loadRegionButton.setToolTip(_("Only the chunks the region intersects are read"))
         refineLayout.addRow(self.loadRegionButton)
-        self.segmentViewButton = qt.QPushButton(_("Create segmentation for the view"))
-        self.segmentViewButton.setToolTip(
+        self.segmentButton = qt.QPushButton(_("Create segmentation from the region at the selected level"))
+        self.segmentButton.setToolTip(
             _(
-                "A segmentation over the block the 3D view shows (or the slice views together), at the finest "
-                "level whose Segment Editor buffers fit the memory budget; its box is drawn in the views"
+                "A segmentation to edit inside the region of interest: its box at the selected level (grown "
+                "to whole chunks) becomes the segmentation's geometry and the Segment Editor's source volume. "
+                "With a region selected, the table shows the box and the editor's memory at each level."
             )
         )
-        refineLayout.addRow(self.segmentViewButton)
+        refineLayout.addRow(self.segmentButton)
 
         self.statusLabel = qt.QLabel()
         self.statusLabel.wordWrap = True
@@ -4617,13 +4574,19 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.autoRefineCheckBox.connect("toggled(bool)", self.onAutoRefineToggled)
         self.volumeRenderingCheckBox.connect("toggled(bool)", self.onVolumeRenderingToggled)
         self.loadRegionButton.connect("clicked(bool)", self.onLoadRegion)
-        self.segmentViewButton.connect("clicked(bool)", self.onSegmentView)
+        self.segmentButton.connect("clicked(bool)", self.onCreateSegmentation)
         self.createRoiButton.connect("clicked(bool)", self.onCreateRoi)
         self.levelTable.connect("itemSelectionChanged()", self.updateButtons)
         self.levelTable.connect("cellDoubleClicked(int,int)", lambda row, column: self.onLoad())
-        self.roiSelector.connect("currentNodeChanged(vtkMRMLNode*)", lambda node: self.updateButtons())
+        self.roiObserver = None  # (region of interest node, observer tags) of the selected region
+        self.roiBoxes = None  # the selected region's box per level, while the table shows them
+        self.roiTimer = qt.QTimer()  # the table follows the region once its handles stop moving
+        self.roiTimer.setSingleShot(True)
+        self.roiTimer.setInterval(300)
+        self.roiTimer.timeout.connect(lambda: (self.showRoiBoxes(), self.updateLevelStatus()))
+        self.roiSelector.connect("currentNodeChanged(vtkMRMLNode*)", self.onRoiChanged)
         self.updateButtons()
-        self.maxBytesSpinBox.connect("valueChanged(int)", lambda mib: Settings.set(Settings.MAX_BYTES, int(mib) << 20))
+        self.maxBytesSpinBox.connect("valueChanged(int)", self.onMaxBytesChanged)
         self.orientationSelector.connect("currentTextChanged(QString)", lambda t: Settings.set(Settings.ORIENTATION, t))
         self.loadLabelsCheckBox.connect("toggled(bool)", lambda b: Settings.set(Settings.LOAD_LABELS, bool(b)))
         self.labelsAsSegmentationCheckBox.connect(
@@ -4726,7 +4689,9 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.createRoiButton.setEnabled(hasStore)
         self.autoRefineCheckBox.setEnabled(hasStore)
         self.loadRegionButton.setEnabled(hasStore and self.roiSelector.currentNode() is not None)
-        self.segmentViewButton.setEnabled(hasStore)
+        self.segmentButton.setEnabled(
+            hasStore and self.roiSelector.currentNode() is not None and self.selectedLevel() >= 0
+        )
 
     def fitTableHeight(self):
         """Size the table to its rows so that it never shows an empty area."""
@@ -4792,6 +4757,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             ]
         )
         self.levelTable.selectRow(self.logic.selectLevel(self.multiscales, self.logic.maxBytesFromSettings()))
+        self.showRoiBoxes()
         self.updateLevelStatus()
 
     @staticmethod
@@ -4807,8 +4773,11 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         recommended = self.logic.selectLevel(self.multiscales, self.logic.maxBytesFromSettings())
         streamer = OMEZarrLogic.streamer(self.path)
         if streamer is not None:
-            self.legendLabel.text = _(
-                "Bold: the level the memory budget selects. ▸ shown · ✓ downloaded · ↓ being read · ◐ parts read for the views."
+            self.legendLabel.text = (
+                _(
+                    "Bold: the level the memory budget selects. ▸ shown · ✓ downloaded · ↓ being read · ◐ parts read for the views."
+                )
+                + self.roiLegend()
             )
             for row in range(self.levelTable.rowCount):
                 mark, note = streamer.levelState(row) if row < len(streamer.levels) else ("", "")
@@ -4826,7 +4795,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
                     if column == 0:
                         item.setToolTip(". ".join(notes))
             return
-        self.legendLabel.text = _("Bold: the level the memory budget selects. ✓: loaded in the scene.")
+        self.legendLabel.text = _("Bold: the level the memory budget selects. ✓: loaded in the scene.") + self.roiLegend()
         loaded, regions = set(), set()
         for node in slicer.util.getNodesByClass("vtkMRMLVolumeNode"):
             if samePath(node.GetAttribute("OMEZarr.Path"), self.path) and node.GetAttribute("OMEZarr.Level"):
@@ -4924,6 +4893,8 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             self.statusLabel.text = str(e)
 
     def cleanup(self):
+        self.roiTimer.stop()
+        self.onRoiChanged(None)
         if OMEZarrLogic.panel is self:
             OMEZarrLogic.panel = None
         OMEZarrLogic.stopAutoRefine()
@@ -4935,9 +4906,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         bounds = self.logic.sliceViewRasBounds(view)
         center = [(bounds[i] + bounds[i + 1]) / 2.0 for i in (0, 2, 4)]
         size = [(bounds[i + 1] - bounds[i]) / 2.0 for i in (0, 2, 4)]
-        roiNode = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLMarkupsROINode", slicer.mrmlScene.GenerateUniqueName("OME-Zarr region")
-        )
+        # While the store is volume-rendered, the region is the rendering's cropping region, so
+        # the 3D view (and the texture streamed for it) shows exactly what the region holds.
+        roiNode = self.cropRoi()
+        if roiNode is None:
+            roiNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsROINode", slicer.mrmlScene.GenerateUniqueName("OME-Zarr region")
+            )
         roiNode.CreateDefaultDisplayNodes()
         roiNode.SetCenter(*center)
         roiNode.SetSize(*size)
@@ -4975,13 +4950,98 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.statusLabel.text = self.describeNodes(roiNode.GetName(), nodes)
         self.updateLevelStatus()
 
-    def onSegmentView(self):
-        if not self.path:
+    def cropRoi(self):
+        """The cropping region of the streamed 3D node of this store, when it is rendered."""
+        streamer = OMEZarrLogic.streamer(self.path) if self.path else None
+        if streamer is None or streamer.volume3D is None:
+            return None
+        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(streamer.volume3D)
+        if display is None:
+            return None
+        if display.GetROINode() is None:
+            slicer.modules.volumerendering.logic().CreateROINode(display)
+        display.SetCroppingEnabled(True)
+        return display.GetROINode()
+
+    def onRoiChanged(self, roiNode):
+        """Follow the selected region of interest: the level table shows its box at each level."""
+        if self.roiObserver is not None:
+            node, tags = self.roiObserver
+            for tag in tags:
+                node.RemoveObserver(tag)
+            self.roiObserver = None
+        if roiNode is not None:
+            events = (vtk.vtkCommand.ModifiedEvent, slicer.vtkMRMLMarkupsNode.PointModifiedEvent)
+            self.roiObserver = (roiNode, [roiNode.AddObserver(event, self.onRoiModified) for event in events])
+        self.showRoiBoxes()
+        self.updateLevelStatus()
+        self.updateButtons()
+
+    def onRoiModified(self, caller=None, event=None):
+        self.roiTimer.start()  # once the handles stop moving
+
+    def showRoiBoxes(self):
+        """With a region of interest selected, the table shows its box at each level (grown to
+        whole chunks) and the Segment Editor's working set for it, instead of the whole level."""
+        if not self.path or self.multiscales is None or self.levelTable.rowCount == 0:
+            return
+        roiNode = self.roiSelector.currentNode()
+        boxes = None
+        if roiNode is not None:
+            try:
+                boxes = self.logic.segmentationBoxes(self.path, roiNode, self.multiscales)
+            except ValueError:
+                boxes = None  # the region misses the image: the table shows the whole levels
+        self.roiBoxes = boxes
+        self.levelTable.setHorizontalHeaderLabels(
+            [
+                _("Level"),
+                _("Region (x, y, z)") if boxes else _("Voxels (x, y, z)"),
+                _("Spacing"),
+                _("Editor memory") if boxes else _("Memory"),
+            ]
+        )
+        budget = self.logic.maxBytesFromSettings()
+        for row, level in enumerate(self.logic.levelInfo(self.multiscales)):
+            if boxes:
+                voxels = " × ".join(str(n) for n in boxes[row]["dims"])
+                memory = self.formatBytes(boxes[row]["bytes"])
+                over = boxes[row]["bytes"] > budget
+            else:
+                shape = dict(zip(level["dims"], level["shape"], strict=False))
+                voxels = " × ".join(str(shape[d]) for d in SPATIAL_DIMS if d in shape)
+                memory = self.formatBytes(level["bytes"])
+                over = False
+            for column, value in ((1, voxels), (3, memory)):
+                item = self.levelTable.item(row, column)
+                if item is None:
+                    continue
+                item.setText(value)
+                item.setToolTip(value + (_(" (over the memory budget)") if over else ""))
+                item.setForeground(qt.QBrush(qt.QColor("gray")) if over else qt.QBrush())
+
+    def roiLegend(self):
+        if not self.roiBoxes:
+            return ""
+        return _(
+            " Region and Editor memory: the selected region's box at each level, grown to whole chunks, "
+            "and the Segment Editor's memory to edit it; grey: over the memory budget."
+        )
+
+    def onMaxBytesChanged(self, mib):
+        Settings.set(Settings.MAX_BYTES, int(mib) << 20)
+        self.showRoiBoxes()
+        self.updateLevelStatus()
+
+    def onCreateSegmentation(self):
+        roiNode = self.roiSelector.currentNode()
+        level = self.selectedLevel()
+        if roiNode is None or level < 0 or not self.path:
             return
         try:
-            with Progress(_("Reading the segmentation's box...")) as progress:
-                result = self.logic.createSegmentationForView(
-                    self.path, timeIndex=max(0, self.timeIndexSpinBox.value), progress=progress
+            with Progress(_("Reading the segmentation's region...")) as progress:
+                result = self.logic.createSegmentationFromRoi(
+                    self.path, roiNode, level, timeIndex=max(0, self.timeIndexSpinBox.value), progress=progress
                 )
         except InterruptedError:
             self.statusLabel.text = _("Segmentation: cancelled")
@@ -4989,18 +5049,19 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         except ValueError as e:
             self.statusLabel.text = _("Segmentation: {error}").format(error=e)
             return
-        geometry = result["geometry"]
-        self.statusLabel.text = _(
-            "{name}: level {level} · {x} × {y} × {z} voxels · editor working set {size} · from the {source}"
-        ).format(
+        box = result["box"]
+        text = _("{name}: level {level} · {x} × {y} × {z} voxels · editor working set {size}").format(
             name=result["segmentation"].GetName(),
-            level=geometry["level"],
-            x=geometry["dims"][0],
-            y=geometry["dims"][1],
-            z=geometry["dims"][2],
-            size=self.formatBytes(geometry["bytes"]),
-            source=geometry["source"],
+            level=box["level"],
+            x=box["dims"][0],
+            y=box["dims"][1],
+            z=box["dims"][2],
+            size=self.formatBytes(box["bytes"]),
         )
+        budget = self.logic.maxBytesFromSettings()
+        if box["bytes"] > budget:
+            text += _(" · over the memory budget of {budget}").format(budget=self.formatBytes(budget))
+        self.statusLabel.text = text
         self.updateLevelStatus()
 
 
@@ -5062,7 +5123,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_RoundTripFromSlicerVolume()
             self.test_LevelSelection()
             self.test_RegionLoading()
-            self.test_SegmentationForView()
+            self.test_SegmentationFromRoi()
             self.test_MicroscopyAxes()
             self.test_Labels()
             self.test_TimeSeries()
@@ -5200,37 +5261,37 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         expectedOrigin = (ijkToRas @ np.array([i0, j0, k0, 1.0]))[:3]
         np.testing.assert_allclose(self.ijkToRasArray(nodes[0])[:3, 3], expectedOrigin, atol=1e-6)
 
-    def test_SegmentationForView(self):
-        self.delayDisplay("A segmentation for the view has the box the views show as its geometry")
+    def test_SegmentationFromRoi(self):
+        self.delayDisplay("A segmentation from a region of interest has the region's box at the chosen level as its geometry")
         chunk = 32
         mrHead, storePath = self.writeMRHeadStore(chunks=chunk)
         full = slicer.util.arrayFromVolume(mrHead)
         ijkToRas = self.ijkToRasArray(mrHead)
         slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 0})
-        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
-        bounds = [0.0] * 6
-        mrHead.GetRASBounds(bounds)
-        center = [(bounds[0] + bounds[1]) / 2, (bounds[2] + bounds[3]) / 2, (bounds[4] + bounds[5]) / 2]
-        # Three orthogonal views, 60 mm wide on the same point: together they show a 30 mm cube.
-        for viewName, orient in (("Red", "Axial"), ("Yellow", "Sagittal"), ("Green", "Coronal")):
-            sliceNode = slicer.app.layoutManager().sliceWidget(viewName).mrmlSliceNode()
-            getattr(sliceNode, f"SetOrientationTo{orient}")()
-            sliceNode.JumpSliceByCentering(*center)
-            sliceNode.SetFieldOfView(60.0, 60.0, 1.0)
-        slicer.app.processEvents()
+        # Sub-block in IJK: i 40..100, j 60..120, k 20..50 (half-open), as a region of interest.
+        i0, i1, j0, j1, k0, k1 = 40, 100, 60, 120, 20, 50
+        corners = np.array([[i, j, k, 1.0] for i in (i0, i1 - 1) for j in (j0, j1 - 1) for k in (k0, k1 - 1)])
+        ras = (ijkToRas @ corners.T).T[:, :3]
+        roi = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode")
+        roi.SetCenter(*((ras.min(axis=0) + ras.max(axis=0)) / 2.0))
+        roi.SetSize(*(ras.max(axis=0) - ras.min(axis=0)))
 
-        result = OMEZarrLogic.createSegmentationForView(storePath)
-        geometry = result["geometry"]
-        self.assertEqual(geometry["level"], 0)
-        self.assertEqual(geometry["source"], "slice views")
-        region = geometry["region"]
-        shape = dict(zip(("z", "y", "x"), full.shape))
-        for d, (start, stop) in region.items():
-            self.assertEqual(start % chunk, 0)
-            self.assertTrue(stop % chunk == 0 or stop == shape[d])
-            self.assertLess(stop - start, shape[d])  # a box, not the volume
+        # One box per level: the region grown outward to whole chunks, and the editor's working set.
+        boxes = OMEZarrLogic.segmentationBoxes(storePath, roi)
+        self.assertEqual([b["level"] for b in boxes], [0, 1, 2])
+        region = boxes[0]["region"]
+        self.assertEqual(region, {"x": (32, 128), "y": (32, 128), "z": (0, 64)})
+        self.assertEqual(boxes[0]["dims"], [96, 96, 64])
+        itemSize = full.dtype.itemsize
+        self.assertEqual(boxes[0]["bytes"], 96 * 96 * 64 * (2 * itemSize + SEGMENT_EDITOR_LABEL_BUFFERS))
+        self.assertLess(boxes[1]["bytes"], boxes[0]["bytes"])
+        for b in boxes:
+            for d, (start, stop) in b["region"].items():
+                self.assertEqual(start % chunk, 0)
+                self.assertTrue(stop % chunk == 0 or stop == OMEZarrLogic.axisLength(OMEZarrLogic.openMultiscales(storePath).images[b["level"]], d))
+
+        result = OMEZarrLogic.createSegmentationFromRoi(storePath, roi, 0)
         (z0, z1), (y0, y1), (x0, x1) = (region[d] for d in ("z", "y", "x"))
-
         # The working volume holds exactly the box, on the level's grid.
         source = result["sourceVolume"]
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(source), full[z0:z1, y0:y1, x0:x1])
@@ -5245,20 +5306,14 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         extent = [0] * 6
         self.assertTrue(slicer.vtkSegmentationConverter.DeserializeImageGeometry(geometryString, matrix, extent))
         np.testing.assert_allclose(slicer.util.arrayFromVTKMatrix(matrix), self.ijkToRasArray(source), atol=1e-6)
-        self.assertEqual(extent, [0, x1 - x0 - 1, 0, y1 - y0 - 1, 0, z1 - z0 - 1])
+        boxExtent = [0, x1 - x0 - 1, 0, y1 - y0 - 1, 0, z1 - z0 - 1]
+        self.assertEqual(extent, boxExtent)
+        self.assertEqual(segmentation.GetAttribute("OMEZarr.Level"), "0")
 
-        # The box is drawn by a locked ROI over the working volume, and the editor has both selected.
-        box = result["box"]
-        boxBounds, sourceBounds = [0.0] * 6, [0.0] * 6
-        box.GetRASBounds(boxBounds)
-        source.GetRASBounds(sourceBounds)
-        np.testing.assert_allclose(boxBounds, sourceBounds, atol=1e-3)
-        self.assertTrue(box.GetLocked())
+        # The Segment Editor has both selected and sizes its buffers to the box, not to the store.
         editorNode = OMEZarrLogic.segmentEditorNode()
         self.assertIs(editorNode.GetSegmentationNode(), segmentation)
         self.assertIs(editorNode.GetSourceVolumeNode(), source)
-
-        # The Segment Editor sizes its buffers to the box, not to the store.
         segmentation.GetSegmentation().AddEmptySegment("test")
         editorNode.SetSelectedSegmentID("test")
         editorWidget = slicer.qMRMLSegmentEditorWidget()
@@ -5267,24 +5322,39 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         editorWidget.setActiveEffectByName("Threshold")
         effect = editorWidget.activeEffect()
         self.assertIsNotNone(effect)
-        boxExtent = [0, x1 - x0 - 1, 0, y1 - y0 - 1, 0, z1 - z0 - 1]
         self.assertEqual(list(effect.defaultModifierLabelmap().GetExtent()), boxExtent)
         self.assertEqual(list(effect.sourceVolumeImageData().GetExtent()), boxExtent)
         editorWidget.setActiveEffectByName("")
         editorWidget.setMRMLSegmentEditorNode(None)
         editorWidget.deleteLater()
 
-        # Made again, the store's working volume is reused rather than added.
+        # Made again at level 1, the store's working volume is reused and holds the level-1 box.
         before = len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"))
-        again = OMEZarrLogic.createSegmentationForView(storePath)
+        again = OMEZarrLogic.createSegmentationFromRoi(storePath, roi, 1)
         self.assertIs(again["sourceVolume"], source)
         self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")), before)
+        self.assertEqual(list(source.GetImageData().GetDimensions()), boxes[1]["dims"])
+        self.assertEqual(again["segmentation"].GetAttribute("OMEZarr.Level"), "1")
 
-        # A budget too small for level 0 moves the box to a coarser level whose working set fits
-        # (a box is at least one chunk per axis at every level, so a small one may skip a level).
-        small = OMEZarrLogic.segmentationBoxForView(storePath, maxBytes=geometry["bytes"] // 2)
-        self.assertGreater(small["level"], 0)
-        self.assertLessEqual(small["bytes"], geometry["bytes"] // 2)
+        # In the panel, a selected region turns the level table into its box per level.
+        if slicer.util.mainWindow() is not None:
+            slicer.util.selectModule("OMEZarr")
+            widget = slicer.modules.OMEZarrWidget
+            widget.pathEdit.currentPath = storePath
+            self.assertEqual(widget.levelTable.item(0, 1).text(), "256 × 256 × 130")
+            widget.roiSelector.setCurrentNode(roi)
+            self.assertEqual(widget.levelTable.item(0, 1).text(), "96 × 96 × 64")
+            self.assertEqual(widget.levelTable.item(0, 3).text(), widget.formatBytes(boxes[0]["bytes"]))
+            self.assertEqual(widget.levelTable.horizontalHeaderItem(1).text(), "Region (x, y, z)")
+            widget.levelTable.selectRow(1)
+            self.assertTrue(widget.segmentButton.enabled)
+            # Moving the region updates the table once the handles stop.
+            roi.SetSize(*(2.0 * (ras.max(axis=0) - ras.min(axis=0))))
+            self.assertTrue(self.waitFor(lambda: widget.levelTable.item(0, 1).text() != "96 × 96 × 64", 5.0))
+            widget.roiSelector.setCurrentNode(None)
+            self.assertEqual(widget.levelTable.item(0, 1).text(), "256 × 256 × 130")
+            self.assertEqual(widget.levelTable.horizontalHeaderItem(1).text(), "Voxels (x, y, z)")
+            self.assertFalse(widget.segmentButton.enabled)
 
     def writeMicroscopyStore(self, name="cells", withTime=False):
         import ngff_zarr
