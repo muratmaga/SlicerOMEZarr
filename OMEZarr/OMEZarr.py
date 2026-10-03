@@ -5540,6 +5540,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.delayDisplay("'Load selected level' loads whole and 'Stream selected level' streams, whatever the setting")
         if slicer.util.mainWindow() is None:
             return
+        OMEZarrLogic.stopStreaming(wait=True)  # a streamer of this store left by an earlier test
         mrHead, storePath = self.writeMRHeadStore(chunks=32)
         Settings.set(Settings.STREAM, True)  # the setting is for stores opened without a level
         Settings.set(Settings.STREAM_3D, True)
