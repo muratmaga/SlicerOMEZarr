@@ -80,10 +80,11 @@ def slab_rows(shard, levels):
 
 
 def estimated_memory(shape, dtype, shard, levels):
-    """Bytes the conversion needs at its peak: the slab, the coarse means and the temporaries
-    (the 38 GB dry skull, 3882 slices in 512-slice slabs, peaked near 2.1 slabs)."""
+    """Bytes the conversion needs at its peak: the slab, the coarse means and the temporaries, plus
+    the Python process itself. Measured on Scan_0006 (1288x1332x1545 uint16, raw NRRD): 1.18 GB at
+    128-voxel shards, 3.45 GB at 384; this gives 1.47 and 3.40."""
     rows = min(slab_rows(shard, levels), shape[0])
-    return int(2.2 * rows * shape[1] * shape[2] * np.dtype(dtype).itemsize)
+    return int(2.2 * rows * shape[1] * shape[2] * np.dtype(dtype).itemsize) + (500 << 20)
 
 
 def sample_slices(depth, samples=SAMPLE_SLICES, seed=0):
