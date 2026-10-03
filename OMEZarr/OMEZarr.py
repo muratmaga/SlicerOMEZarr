@@ -1460,16 +1460,48 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         return boxes
 
     @classmethod
-    def workingVolumeNode(cls, path):
-        """The one volume per store holding the box a segmentation is edited in; not saved with the scene."""
-        for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
-            if node.GetAttribute("OMEZarr.Role") == "segmentationSource" and samePath(node.GetAttribute("OMEZarr.Path"), path):
-                return node
+    def workingVolumeNode(cls, segmentation):
+        """The volume holding the box ``segmentation`` is edited in: one per segmentation, so that
+        making another segmentation never pulls the ground from under an earlier one. Not saved
+        with the scene (it is re-read from the store), and removed with its segmentation."""
+        existing = cls.segmentationSource(segmentation)
+        if existing is not None:
+            return existing
         node = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLScalarVolumeNode", slicer.mrmlScene.GenerateUniqueName(cls.defaultNodeName(path) + "_segmentation_source")
+            "vtkMRMLScalarVolumeNode", slicer.mrmlScene.GenerateUniqueName(segmentation.GetName() + "_source")
         )
         node.SetSaveWithScene(False)
+        node.SetAttribute("OMEZarr.Role", "segmentationSource")
+        node.SetAttribute("OMEZarr.Segmentation", segmentation.GetID())
+        cls.watchSegmentationSources()
         return node
+
+    @staticmethod
+    def segmentationSource(segmentation):
+        """The source volume made for ``segmentation``, if it is still in the scene."""
+        for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+            if node.GetAttribute("OMEZarr.Role") == "segmentationSource" and node.GetAttribute("OMEZarr.Segmentation") == segmentation.GetID():
+                return node
+        return None
+
+    @classmethod
+    def watchSegmentationSources(cls):
+        """Once per scene: a source volume leaves the scene with its segmentation."""
+        observers = sharedRegistry("OMEZarrSceneObservers")
+        if observers.get("segmentationSources") is not None:
+            return
+
+        def onNodeRemoved(caller, event, node):
+            if node is None or not node.IsA("vtkMRMLSegmentationNode"):
+                return
+            for source in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+                if source.GetAttribute("OMEZarr.Segmentation") == node.GetID():
+                    slicer.mrmlScene.RemoveNode(source)
+
+        # The scene survives module reloads, so the one observer is kept in a shared registry.
+        callback = lambda caller, event, calldata: onNodeRemoved(caller, event, calldata)  # noqa: E731
+        tag = slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeRemovedEvent, callback)
+        observers["segmentationSources"] = (tag, callback)
 
     @staticmethod
     def segmentEditorNode():
@@ -1484,7 +1516,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     @classmethod
     def createSegmentationFromRoi(cls, path, roiNode, level, timeIndex=0, name=None, userMessages=None, progress=None):
         """A segmentation whose reference geometry is the region of interest's box at ``level``
-        (segmentationBoxes): the box's voxels are read into the store's working volume and both
+        (segmentationBoxes): the box's voxels are read into a source volume of its own and both
         are selected in the Segment Editor. Returns {"segmentation", "sourceVolume", "box"}."""
         multiscales = cls.openMultiscales(path)
         level = int(level)
@@ -1493,24 +1525,27 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         image = multiscales.images[level]
         # The volume's origin is the box's corner; the region's voxels sit ``margin`` in from it.
         ijkToRas, orientationSource = cls.regionIjkToRas(image, box["box"], userMessages)
-        source = cls.workingVolumeNode(path)
+        segmentation = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", slicer.mrmlScene.GenerateUniqueName(name or cls.defaultNodeName(path) + "_segmentation")
+        )
+        source = cls.workingVolumeNode(segmentation)
         reader = runResponsive(lambda: cls.chunkReader(multiscales, level))
         pad = {d: (box["margin"], box["margin"]) for d in region}
-        cls.fillVolumeNode(
-            source, image, timeIndex, 0, region, ijkToRas, userMessages, progress, source.GetName(), reader=reader, pad=pad
-        )
+        try:
+            cls.fillVolumeNode(
+                source, image, timeIndex, 0, region, ijkToRas, userMessages, progress, source.GetName(), reader=reader, pad=pad
+            )
+        except BaseException:
+            slicer.mrmlScene.RemoveNode(segmentation)  # and its source, through the scene observer
+            raise
         dims = list(image.dims)
         lengthUnit = cls.lengthUnit(image)
         cls.setNodeAttributes(source, path, level, dims, timeIndex, 0, lengthUnit, orientationSource, region)
-        source.SetAttribute("OMEZarr.Role", "segmentationSource")
         source.SetAttribute("OMEZarr.Margin", str(box["margin"]))
         if source.GetDisplayNode() is None:
             source.CreateDefaultDisplayNodes()
         cls.matchDisplay(source, path)
 
-        segmentation = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLSegmentationNode", slicer.mrmlScene.GenerateUniqueName(name or cls.defaultNodeName(path) + "_segmentation")
-        )
         segmentation.CreateDefaultDisplayNodes()
         segmentation.SetReferenceImageGeometryParameterFromVolumeNode(source)
         cls.setNodeAttributes(segmentation, path, level, dims, timeIndex, 0, lengthUnit, orientationSource, region)
@@ -5735,7 +5770,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
 
         result = OMEZarrLogic.createSegmentationFromRoi(storePath, roi, 0)
         (z0, z1), (y0, y1), (x0, x1) = (region[d] for d in ("z", "y", "x"))
-        # The working volume holds the region's voxels inside a margin of zeros, on the level's grid.
+        # The source volume holds the region's voxels inside a margin of zeros, on the level's grid.
         source = result["sourceVolume"]
         array = slicer.util.arrayFromVolume(source)
         self.assertEqual(list(array.shape), dims[::-1])
@@ -5779,13 +5814,23 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         editorWidget.setMRMLSegmentEditorNode(None)
         editorWidget.deleteLater()
 
-        # Made again at level 1, the store's working volume is reused and holds the level-1 box.
-        before = len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"))
+        # A second segmentation gets a source volume of its own: the first keeps its box and voxels.
+        firstVoxels = slicer.util.arrayFromVolume(source).copy()
         again = OMEZarrLogic.createSegmentationFromRoi(storePath, roi, 1)
-        self.assertIs(again["sourceVolume"], source)
-        self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")), before)
-        self.assertEqual(list(source.GetImageData().GetDimensions()), boxes[1]["dims"])
+        second = again["sourceVolume"]
+        self.assertIsNot(second, source)
+        self.assertEqual(list(second.GetImageData().GetDimensions()), boxes[1]["dims"])
         self.assertEqual(again["segmentation"].GetAttribute("OMEZarr.Level"), "1")
+        self.assertIs(OMEZarrLogic.segmentationSource(segmentation), source)
+        self.assertIs(OMEZarrLogic.segmentationSource(again["segmentation"]), second)
+        np.testing.assert_array_equal(slicer.util.arrayFromVolume(source), firstVoxels)
+        geometryString = segmentation.GetSegmentation().GetConversionParameter("Reference image geometry")
+        self.assertTrue(slicer.vtkSegmentationConverter.DeserializeImageGeometry(geometryString, matrix, extent))
+        self.assertEqual(extent, boxExtent)
+        # Removing a segmentation removes its source volume, and only that one.
+        slicer.mrmlScene.RemoveNode(again["segmentation"])
+        self.assertIsNone(second.GetScene())
+        self.assertIsNotNone(source.GetScene())
 
         # In the panel, a selected region turns the level table into its box per level.
         if slicer.util.mainWindow() is not None:
