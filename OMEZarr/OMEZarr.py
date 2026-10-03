@@ -5998,6 +5998,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.delayDisplay("Streaming ends with the full-resolution volume and nothing else in the scene")
         mrHead, storePath = self.writeMRHeadStore(chunks=32)
         Settings.set(Settings.STREAM, True)
+        Settings.set(Settings.STREAM_3D, False)  # with a 3D view attached the streamer stays on for it
         self.centerRedViewOn(mrHead, 40.0)
         # Hold every chunk read, so the load is seen returning before any of them.
         gate = threading.Event()
