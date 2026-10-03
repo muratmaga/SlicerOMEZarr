@@ -4258,8 +4258,10 @@ class OMEZarrFileReader:
         if level is None:
             levels = OMEZarrLogic.streamingLevels(multiscales, maxBytes, timeMode)
         else:
+            # The level asked for is read whole behind the coarsest; the slice views refine beyond
+            # it as they zoom, so even the coarsest level streams (nothing to read, views only).
             coarsest = len(multiscales.images) - 1
-            levels = (coarsest, level) if OMEZarrLogic.streamable(multiscales, timeMode) and 0 <= level < coarsest else None
+            levels = (coarsest, level) if OMEZarrLogic.streamable(multiscales, timeMode) and 0 <= level <= coarsest else None
         if levels is not None:
             for index in range(len(multiscales.images)):  # the streamer then has its readers at once
                 OMEZarrLogic.chunkReader(multiscales, index)
@@ -4976,13 +4978,17 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         if node is None or streamer is None:
             if node is not None:
                 self.statusLabel.text = self.describeNodes(
-                    _("Level {level} loaded whole (nothing coarser to show first)").format(level=node.GetAttribute("OMEZarr.Level")), [node]
+                    _("Level {level} loaded whole (this store cannot be streamed)").format(level=node.GetAttribute("OMEZarr.Level")), [node]
                 )
             self.updateLevelStatus()
             return
-        text = _("Streaming: level {shown} shown now, level {target} read in the background").format(
-            shown=node.GetAttribute("OMEZarr.Level"), target=streamer.target
-        )
+        shown = node.GetAttribute("OMEZarr.Level")
+        if str(streamer.target) == shown:
+            text = _("Streaming: level {shown} shown; the slice views refine as you zoom in").format(shown=shown)
+        else:
+            text = _("Streaming: level {shown} shown now, level {target} read in the background").format(
+                shown=shown, target=streamer.target
+            )
         if streamer.volume3D is not None:
             text += _(" · 3D view follows the camera")
         elif Settings.get(Settings.STREAM_3D, False):
@@ -6100,10 +6106,17 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(OMEZarrLogic.streamer(storePath).target, 1)
         self.assertTrue(self.waitFor(lambda: picked.GetAttribute("OMEZarr.Level") == "1", 20.0))
         OMEZarrLogic.stopStreaming(storePath, wait=True)
-        # Streaming to the coarsest level has nothing to show first: loaded whole.
+        # Streaming the coarsest level reads nothing behind it, but the views still refine on zoom.
         coarse = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 2, "stream": True})
         self.assertEqual(coarse.GetAttribute("OMEZarr.Level"), "2")
-        self.assertIsNone(OMEZarrLogic.streamer(storePath))
+        streamer = OMEZarrLogic.streamer(storePath)
+        self.assertIsNotNone(streamer)
+        self.assertEqual(streamer.target, 2)
+        self.centerRedViewOn(mrHead, 40.0)
+        self.assertTrue(self.waitFor(lambda: streamer.views.get("Red", {}).get("shown", False), 20.0))
+        self.assertEqual(streamer.views["Red"]["level"], 0)
+        self.assertEqual(coarse.GetAttribute("OMEZarr.Level"), "2")  # the volume itself stays coarse
+        OMEZarrLogic.stopStreaming(storePath, wait=True)
 
         # With streaming off, the same load returns the full level straight away.
         Settings.set(Settings.STREAM, False)
