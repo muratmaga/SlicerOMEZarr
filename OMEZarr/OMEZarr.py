@@ -234,6 +234,17 @@ def samePath(a, b):
     return a is not None and b is not None and normalizeStorePath(a) == normalizeStorePath(b)
 
 
+def sharedRegistry(name):
+    """A dict kept on ``slicer.modules``, outside this module: reloading the module (Reload in the
+    panel) makes a new OMEZarrLogic class, which must still find the streamers and refiners the
+    previous one started, or they run on with no panel able to stop them."""
+    registry = getattr(slicer.modules, name, None)
+    if not isinstance(registry, dict):
+        registry = {}
+        setattr(slicer.modules, name, registry)
+    return registry
+
+
 def joinStorePath(root, *parts):
     root = str(root).rstrip("/")
     return "/".join([root, *parts]) if isRemoteUrl(root) else os.path.join(root, *parts)
@@ -1688,7 +1699,10 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
     # ---- automatic refinement ----
 
-    _autoRefiners = {}
+    @staticmethod
+    def autoRefiners():
+        """path -> AutoRefiner, shared across module reloads."""
+        return sharedRegistry("OMEZarrAutoRefiners")
 
     DEFAULT_AUTO_REFINE_VIEWS = ("Red", "Yellow", "Green")
 
@@ -1702,24 +1716,29 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         if isinstance(sliceViewNames, str):
             sliceViewNames = (sliceViewNames,)
         refiner = AutoRefiner(str(path), list(sliceViewNames), delayMs, maxBytes)
-        cls._autoRefiners[str(path)] = refiner
+        cls.autoRefiners()[str(path)] = refiner
         return refiner
 
     @classmethod
     def stopAutoRefine(cls, path=None):
-        keys = [str(path)] if path is not None else list(cls._autoRefiners)
+        refiners = cls.autoRefiners()
+        keys = [str(path)] if path is not None else list(refiners)
         for key in keys:
-            refiner = cls._autoRefiners.pop(key, None)
+            refiner = refiners.pop(key, None)
             if refiner is not None:
                 refiner.stop()
 
     @classmethod
     def autoRefiner(cls, path):
-        return cls._autoRefiners.get(str(path))
+        return cls.autoRefiners().get(str(path))
 
     # ---- streaming ----
 
-    _streamers = {}
+    @staticmethod
+    def streamers():
+        """path -> Streamer, shared across module reloads."""
+        return sharedRegistry("OMEZarrStreamers")
+
     panel = None  # the module widget, refreshed by streamers while they read
 
     @classmethod
@@ -1750,22 +1769,23 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         cls.stopStreaming(path)
         cls.stopAutoRefine(path)
         streamer = Streamer(str(path), node, cls.openMultiscales(path), int(targetLevel), sliceViewNames, timeIndex)
-        cls._streamers[str(path)] = streamer
+        cls.streamers()[str(path)] = streamer
         return streamer
 
     @classmethod
     def stopStreaming(cls, path=None, wait=False):
         """Stop streaming ``path`` (all stores without one). ``wait``: also let the reader threads
         finish the chunk they are reading, as Python must not be finalized under them."""
-        keys = [str(path)] if path is not None else list(cls._streamers)
+        streamers = cls.streamers()
+        keys = [str(path)] if path is not None else list(streamers)
         for key in keys:
-            streamer = cls._streamers.pop(key, None)
+            streamer = streamers.pop(key, None)
             if streamer is not None:
                 streamer.stop(wait)
 
     @classmethod
     def streamer(cls, path):
-        return cls._streamers.get(str(path))
+        return cls.streamers().get(str(path))
 
     NAME_CORNER = 2  # upper left of a view: the volume it shows
     LEVEL_CORNER = 3  # upper right: its level
@@ -1786,7 +1806,7 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         layoutManager = slicer.app.layoutManager()
         if layoutManager is None:
             return
-        streamers = [s for s in cls._streamers.values() if not s.stopped]
+        streamers = [s for s in cls.streamers().values() if not s.stopped]
 
         def label(node, level=None):
             level = node.GetAttribute("OMEZarr.Level") if level is None else level
@@ -5124,7 +5144,15 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             allLoaded = self.loadedVolumes() if self.path else []
             for node in allLoaded:  # every level of this store loaded whole
                 self.renderVolume(node, False)
-            self.statusLabel.text = _("3D view: rendering off") if (streamer or allLoaded) else ""
+            # And whatever else of this store is rendered (a region, a leftover of an earlier
+            # session of the panel): off means nothing of the store in the 3D view.
+            hidden = 0
+            for display in slicer.util.getNodesByClass("vtkMRMLVolumeRenderingDisplayNode"):
+                volume = display.GetVolumeNode()
+                if volume is not None and samePath(volume.GetAttribute("OMEZarr.Path"), self.path) and display.GetVisibility():
+                    display.SetVisibility(False)
+                    hidden += 1
+            self.statusLabel.text = _("3D view: rendering off") if (streamer or allLoaded or hidden) else ""
             return
         if streamer is not None:
             for other in self.loadedVolumes() + self.regionVolumes():  # one rendering at a time
@@ -5143,12 +5171,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.statusLabel.text = _("The 3D view will render the next level you load or stream")
 
     def cleanup(self):
+        # Background work first: nothing later in here may leave a streamer running unseen.
+        OMEZarrLogic.stopAutoRefine()
+        OMEZarrLogic.stopStreaming()
         self.roiTimer.stop()
         self.watchRoi(None)  # the region stays as it is shown
         if OMEZarrLogic.panel is self:
             OMEZarrLogic.panel = None
-        OMEZarrLogic.stopAutoRefine()
-        OMEZarrLogic.stopStreaming()
 
     def storeRoi(self):
         """The region of interest this store already has, when it has one: the streamed
@@ -6102,6 +6131,37 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         stopped = refiner.refreshCount
         sliceNode.JumpSliceByCentering(center[0] - 25.0, center[1], center[2])
         self.assertFalse(self.waitFor(lambda: refiner.refreshCount > stopped, timeoutSeconds=1.0))
+
+    def test_RegistriesSurviveReload(self):
+        self.delayDisplay("A reloaded module (a new logic class) still finds and stops the streamer started before it")
+        import importlib.util
+
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        Settings.set(Settings.STREAM_3D, True)
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 1, "stream": True})
+        streamer = OMEZarrLogic.streamer(storePath)
+        self.assertIsNotNone(streamer)
+        node3D = streamer.volume3D
+        self.assertIsNotNone(node3D)
+        refiner = OMEZarrLogic.startAutoRefine(storePath, ("Red",))
+        self.assertIs(OMEZarrLogic.streamer(storePath), streamer)
+        # What Reload in the panel does first: execute the module file again as a new module,
+        # whose OMEZarrLogic is a different class with no registries of its own.
+        spec = importlib.util.spec_from_file_location("OMEZarrReloaded", __file__)
+        reloaded = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reloaded)
+        newLogic = reloaded.OMEZarrLogic
+        self.assertIsNot(newLogic, OMEZarrLogic)
+        self.assertIs(newLogic.streamer(storePath), streamer)
+        self.assertIs(newLogic.autoRefiner(storePath), refiner)
+        newLogic.stopAutoRefine()
+        newLogic.stopStreaming()
+        self.assertTrue(streamer.stopped)
+        self.assertIsNone(node3D.GetScene())  # the streamed 3D node went with it
+        self.assertIsNone(OMEZarrLogic.streamer(storePath))
+        self.assertIsNone(OMEZarrLogic.autoRefiner(storePath))
+        Settings.set(Settings.STREAM_3D, False)
 
     def centerRedViewOn(self, volumeNode, fieldOfView):
         sliceNode = slicer.app.layoutManager().sliceWidget("Red").mrmlSliceNode()
