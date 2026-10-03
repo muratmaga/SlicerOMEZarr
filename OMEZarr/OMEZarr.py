@@ -4908,16 +4908,19 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         size = [(bounds[i + 1] - bounds[i]) / 2.0 for i in (0, 2, 4)]
         # While the store is volume-rendered, the region is the rendering's cropping region, so
         # the 3D view (and the texture streamed for it) shows exactly what the region holds.
+        # The cropping region starts around the whole volume (or where the user left it), to be
+        # shrunk by its handles; a plain region starts in the middle of the slice view.
         roiNode = self.cropRoi()
         if roiNode is None:
             roiNode = slicer.mrmlScene.AddNewNodeByClass(
                 "vtkMRMLMarkupsROINode", slicer.mrmlScene.GenerateUniqueName("OME-Zarr region")
             )
-        roiNode.CreateDefaultDisplayNodes()
-        roiNode.SetCenter(*center)
-        roiNode.SetSize(*size)
-        roiNode.GetDisplayNode().SetHandlesInteractive(True)
-        roiNode.GetDisplayNode().SetFillOpacity(0.1)
+            roiNode.CreateDefaultDisplayNodes()
+            roiNode.SetCenter(*center)
+            roiNode.SetSize(*size)
+            roiNode.GetDisplayNode().SetHandlesInteractive(True)
+            roiNode.GetDisplayNode().SetFillOpacity(0.1)
+        roiNode.SetDisplayVisibility(True)
         self.roiSelector.setCurrentNode(roiNode)
         self.statusLabel.text = _(
             "Drag the handles of the region in the slice views to adjust it, select a level above, "
@@ -4958,10 +4961,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(streamer.volume3D)
         if display is None:
             return None
-        if display.GetROINode() is None:
-            slicer.modules.volumerendering.logic().CreateROINode(display)
+        # Cropping first: the logic creates the region hidden unless cropping is already on.
         display.SetCroppingEnabled(True)
-        return display.GetROINode()
+        if display.GetROINode() is None:
+            slicer.modules.volumerendering.logic().CreateROINode(display)  # fitted to the volume
+        roiNode = display.GetROINode()
+        roiNode.SetDisplayVisibility(True)
+        return roiNode
 
     def onRoiChanged(self, roiNode):
         """Follow the selected region of interest: the level table shows its box at each level."""
@@ -6123,6 +6129,16 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertTrue(self.waitFor(insideRoi, 20.0))
         (z0, z1), (y0, y1), (x0, x1) = streamer.shown3D[1]
         np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), full[z0:z1, y0:y1, x0:x1])
+
+        # The panel's "New ROI in view" takes the cropping region, shown, rather than placing a new one.
+        if slicer.util.mainWindow() is not None:
+            slicer.util.selectModule("OMEZarr")
+            widget = slicer.modules.OMEZarrWidget
+            widget.pathEdit.currentPath = storePath
+            widget.onCreateRoi()
+            self.assertIs(widget.roiSelector.currentNode(), roi)
+            self.assertTrue(roi.GetDisplayVisibility())
+            widget.roiSelector.setCurrentNode(None)
 
         node3D.RemoveObserver(imageObserver)
         self.assertEqual(mismatches, [])
