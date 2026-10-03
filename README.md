@@ -78,6 +78,13 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
   on every side for dilation and smoothing to grow into, as its reference
   geometry and the editor's source volume, so editing a large store costs the
   box, not the store.
+* **One rendering, one region**: with "Volume-render in the 3D view" on, the
+  3D view shows one volume of the store, the streamed texture while
+  streaming or the level or region loaded last; each load hands the
+  rendering over rather than adding one, and when a stream ends its volume
+  keeps the rendering. The region selector crops whichever it is, None
+  shows the whole volume, and "New ROI in view" gives the store's one region,
+  starting as the rendering's cropping box.
 * **Refine view**: reloads the block shown by a slice view at the
   finest level that fits the budget, reading only the chunks it needs, and
   overlays it on the coarse volume in that view with the same window/level.
