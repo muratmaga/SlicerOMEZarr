@@ -74,9 +74,10 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
   rendering's cropping region while the store is rendered), the level table
   shows the region's size at each level and the memory the Segment Editor
   needs to edit it. "Create segmentation from the region at the selected
-  level" makes a segmentation with that box as its reference geometry and the
-  box's voxels as the editor's source volume, so editing a large store costs
-  the box, not the store.
+  level" makes a segmentation with that box, plus a margin of ten empty voxels
+  on every side for dilation and smoothing to grow into, as its reference
+  geometry and the editor's source volume, so editing a large store costs the
+  box, not the store.
 * **Refine view**: reloads the block shown by a slice view at the
   finest level that fits the budget, reading only the chunks it needs, and
   overlays it on the coarse volume in that view with the same window/level.
