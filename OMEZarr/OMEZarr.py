@@ -1668,17 +1668,22 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     panel = None  # the module widget, refreshed by streamers while they read
 
     @classmethod
-    def streamingLevels(cls, multiscales, maxBytes=None, timeMode=None):
-        """(coarsest, target) levels when the store should be streamed, else None.
-
-        Streaming covers one 3D channel and one time point: it pays off when the level the
-        budget allows is finer than the coarsest one, so there is something to wait for.
-        """
+    def streamable(cls, multiscales, timeMode=None):
+        """Streaming covers one 3D channel and one time point."""
         base = multiscales.images[0]
         dims = list(base.dims)
         if "z" not in dims or len(cls.channelDescriptions(multiscales, base)) != 1:
-            return None
+            return False
         if cls.axisLength(base, "t") > 1 and (timeMode or Settings.get(Settings.TIME_MODE, "sequence")) == "sequence":
+            return False
+        return True
+
+    @classmethod
+    def streamingLevels(cls, multiscales, maxBytes=None, timeMode=None):
+        """(coarsest, target) levels when the store should be streamed, else None: it pays off
+        when the level the budget allows is finer than the coarsest one, so there is something
+        to wait for."""
+        if not cls.streamable(multiscales, timeMode):
             return None
         coarsest = len(multiscales.images) - 1
         target = cls.selectLevel(multiscales, maxBytes or cls.maxBytesFromSettings())
@@ -4119,13 +4124,14 @@ class OMEZarrFileReader:
             maxBytes = optional("maxBytes", int)
             timeMode = optional("timeMode", str)
             asLabelMap = optional("asLabelMap", lambda v: str(v).lower() in ("true", "1"))
+            stream = optional("stream", lambda v: str(v).lower() in ("true", "1"))
             with Progress(_("Loading OME-Zarr..."), properties["fileName"]) as progress:
                 # Reading the store's metadata (and probing for a label map) goes over the network:
                 # off the GUI thread, under the progress dialog, so a slow server cannot freeze Slicer.
                 progress(0, 1, _("Reading {name}...").format(name=os.path.basename(root.rstrip("/"))))
                 DiskCache.instance()  # set up from the settings here; the readers use it from their threads
                 streaming = None
-                if self.mayStream(properties, asLabelMap):
+                if self.mayStream(properties, asLabelMap, stream, level):
                     streaming = runResponsive(
                         lambda: self.streamingLevels(root, level, maxBytes, timeMode, asLabelMap),
                         lambda: progress(0, 1) or None,
@@ -4175,33 +4181,36 @@ class OMEZarrFileReader:
         return True
 
     @staticmethod
-    def mayStream(properties, asLabelMap):
-        """The streaming conditions that need the GUI thread (settings, views)."""
-        return bool(
-            not asLabelMap
-            and properties.get("show", True)
-            and Settings.get(Settings.STREAM, True)
-            and slicer.app.layoutManager() is not None
-        )
+    def mayStream(properties, asLabelMap, stream=None, level=None):
+        """Whether this load streams: as asked (``stream``), else by the setting for a load that
+        names no level. A level asked for without a word on streaming is loaded whole: it is
+        what the caller wants in memory. Needs the GUI thread (settings, views)."""
+        if asLabelMap or not properties.get("show", True) or slicer.app.layoutManager() is None:
+            return False
+        if stream is not None:
+            return bool(stream)
+        return level is None and Settings.get(Settings.STREAM, True)
 
     @staticmethod
     def streamingLevels(root, level, maxBytes, timeMode, asLabelMap):
-        """(shown, target) when this load should show a level at once and stream a finer target:
-        the coarsest level by default, or the level asked for when the budget allows a finer one.
+        """(shown, target) when this load streams: the coarsest level is shown at once and the
+        target read behind it, the level asked for or else the one the memory budget allows.
+        None when the store cannot be streamed, or the target is the coarsest level itself.
         Reads the store over the network: run it off the GUI thread."""
         if isBioformats2rawRoot(root) or isLabelStore(root):
             return None
         multiscales = OMEZarrLogic.openMultiscales(root)
         if asLabelMap is None and OMEZarrLogic.looksLikeLabelMap(multiscales):
             return None
-        levels = OMEZarrLogic.streamingLevels(multiscales, maxBytes, timeMode)
+        if level is None:
+            levels = OMEZarrLogic.streamingLevels(multiscales, maxBytes, timeMode)
+        else:
+            coarsest = len(multiscales.images) - 1
+            levels = (coarsest, level) if OMEZarrLogic.streamable(multiscales, timeMode) and 0 <= level < coarsest else None
         if levels is not None:
             for index in range(len(multiscales.images)):  # the streamer then has its readers at once
                 OMEZarrLogic.chunkReader(multiscales, index)
-        if levels is None or level is None:
-            return levels
-        target = levels[1]
-        return (level, target) if 0 <= level < len(multiscales.images) and target < level else None
+        return levels
 
 
 #
@@ -4336,6 +4345,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
 
         self.levelTable = qt.QTableWidget(0, 4)
         self.levelTable.setHorizontalHeaderLabels([_("Level"), _("Voxels (x, y, z)"), _("Spacing"), _("Memory")])
+        self.levelTable.setToolTip(
+            _(
+                "The store's resolution levels: select one, then Load (whole), Stream, Load region or Create "
+                "segmentation. Bold: the level the memory budget would pick. With a region of interest selected, "
+                "the columns show the region's box at each level and the memory the Segment Editor needs for it."
+            )
+        )
         self.levelTable.setTextElideMode(qt.Qt.ElideRight)
         self.levelTable.setWordWrap(False)
         self.levelTable.verticalHeader().setVisible(False)
@@ -4359,13 +4375,35 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.timeIndexSpinBox = qt.QSpinBox()
         self.timeIndexSpinBox.setRange(0, 0)
         self.timeIndexSpinBox.setSpecialValueText(_("all (sequence)"))
+        self.timeIndexSpinBox.setToolTip(
+            _("Time series only: the time point to load, or all of them as a Sequence (streaming needs one time point)")
+        )
         timeRow = qt.QHBoxLayout()
         timeRow.addWidget(self.timeIndexLabel)
         timeRow.addWidget(self.timeIndexSpinBox, 1)
         storeLayout.addLayout(timeRow)
 
         self.loadButton = qt.QPushButton(_("Load selected level"))
-        storeLayout.addWidget(self.loadButton)
+        self.loadButton.setToolTip(
+            _(
+                "Download the selected level whole, as an ordinary volume that any module can use: every chunk "
+                "of the level is read (and kept in the disk cache), and the volume takes the memory shown in the "
+                "table. Nothing is streamed afterwards. With volume rendering on, the volume is rendered as it is."
+            )
+        )
+        self.streamButton = qt.QPushButton(_("Stream selected level"))
+        self.streamButton.setToolTip(
+            _(
+                "Show the store at once from its coarsest level and read the selected level in the background, "
+                "the slice views' planes first; the volume switches to that level when it is complete and takes "
+                "its memory. With volume rendering on, the 3D view follows the camera at the resolution it needs. "
+                "Use this to look around before choosing a region to work on."
+            )
+        )
+        loadRow = qt.QHBoxLayout()
+        loadRow.addWidget(self.loadButton, 1)
+        loadRow.addWidget(self.streamButton, 1)
+        storeLayout.addLayout(loadRow)
 
         # -- Full resolution --
         refineBox = ctk.ctkCollapsibleButton()
@@ -4380,7 +4418,11 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.updateViewSelector()
         self.refineButton = qt.QPushButton(_("Refine view"))
         self.refineButton.setToolTip(
-            _("Reload the block shown by the slice view at the finest level that fits the memory budget")
+            _(
+                "Reload the block the slice view shows at the finest level that fits the memory budget and lay it "
+                "over the loaded volume in that view only; nothing else changes. Zoom in first: a view that shows "
+                "the whole specimen needs no finer level."
+            )
         )
         refineRow = qt.QHBoxLayout()
         refineRow.addWidget(self.viewSelector)
@@ -4388,16 +4430,18 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         refineLayout.addRow(_("2D view:"), refineRow)
 
         self.autoRefineCheckBox = qt.QCheckBox(_("Refine the slice views automatically while browsing"))
-        self.autoRefineCheckBox.setToolTip(_("Reloads a view's block after it has been still for half a second"))
+        self.autoRefineCheckBox.setToolTip(
+            _("Each slice view reloads the block it shows at the finest fitting level once it has been still for half a second")
+        )
         refineLayout.addRow(self.autoRefineCheckBox)
 
-        self.volumeRenderingCheckBox = qt.QCheckBox(_("Volume-render in the 3D view, at the resolution it shows"))
+        self.volumeRenderingCheckBox = qt.QCheckBox(_("Volume-render in the 3D view"))
         self.volumeRenderingCheckBox.checked = Settings.get(Settings.STREAM_3D, False)
         self.volumeRenderingCheckBox.setToolTip(
             _(
-                "Can be set before loading. Streamed stores are then rendered as they load: the 3D view holds "
-                "only what is in view (and in the cropping ROI), at the level its screen resolution needs, "
-                "and sharpens after the camera stops"
+                "Applies to what is loaded now and to the next load. A level loaded whole is rendered as it is. "
+                "A streamed store is rendered from what the 3D view shows (and the cropping region), at the "
+                "level its screen resolution needs, sharpening after the camera stops."
             )
         )
         refineLayout.addRow(self.volumeRenderingCheckBox)
@@ -4411,14 +4455,27 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.roiSelector.setMRMLScene(slicer.mrmlScene)
         self.createRoiButton = qt.QPushButton(_("New ROI in view"))
         self.createRoiButton.setToolTip(
-            _("Create a region of interest covering the middle of the selected slice view; drag its handles to adjust")
+            _(
+                "Place a region of interest to work in; drag its handles in any view. While the store is "
+                "volume-rendered this is the rendering's cropping region, starting around the whole volume, and "
+                "the 3D view shows exactly what it holds. Otherwise a new region starts in the middle of the "
+                "selected slice view. With a region selected, the level table shows its size at each level."
+            )
+        )
+        self.roiSelector.setToolTip(
+            _("The region of interest that 'Load region' and 'Create segmentation' use; any region in the scene can be picked")
         )
         roiRow = qt.QHBoxLayout()
         roiRow.addWidget(self.roiSelector, 1)
         roiRow.addWidget(self.createRoiButton)
         refineLayout.addRow(_("Region of interest:"), roiRow)
         self.loadRegionButton = qt.QPushButton(_("Load region at the selected level"))
-        self.loadRegionButton.setToolTip(_("Only the chunks the region intersects are read"))
+        self.loadRegionButton.setToolTip(
+            _(
+                "Load the region of interest at the selected level as an ordinary volume: only the chunks the "
+                "region intersects are read. The table shows its size and memory at each level."
+            )
+        )
         refineLayout.addRow(self.loadRegionButton)
         self.segmentButton = qt.QPushButton(_("Create segmentation from the region at the selected level"))
         self.segmentButton.setToolTip(
@@ -4446,7 +4503,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.maxBytesSpinBox.setSuffix(" MiB")
         self.maxBytesSpinBox.setSpecialValueText(_("automatic (25% of free RAM)"))
         self.maxBytesSpinBox.setValue(Settings.get(Settings.MAX_BYTES, 0) >> 20)
-        self.maxBytesSpinBox.setToolTip(_("Budget for automatic level selection"))
+        self.maxBytesSpinBox.setToolTip(
+            _(
+                "The memory a load may take: it selects the level marked bold in the table, the level streaming "
+                "reads in the background when no level is picked, and the levels greyed out for a region. "
+                "The buttons always do what their level says; the budget never overrides a level you picked."
+            )
+        )
         settingsLayout.addRow(_("Memory budget:"), self.maxBytesSpinBox)
 
         self.orientationSelector = qt.QComboBox()
@@ -4502,12 +4565,13 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.streamCheckBox.checked = Settings.get(Settings.STREAM, True)
         self.streamCheckBox.setToolTip(
             _(
-                "Show a store at once from its coarsest level. The slice views then get the plane "
-                "they show at screen resolution first, and the level that fits the memory budget is "
-                "read in the background"
+                "How a store opened without picking a level (drag-and-drop, Add Data, the Python loader) is "
+                "loaded: streamed from its coarsest level with the level the memory budget allows read in the "
+                "background, or loaded whole at that level. The panel's own buttons say what they do and ignore "
+                "this setting."
             )
         )
-        settingsLayout.addRow(_("Stream large stores:"), self.streamCheckBox)
+        settingsLayout.addRow(_("Stream stores opened by drag-and-drop or Add Data:"), self.streamCheckBox)
 
         self.textureMemorySpinBox = qt.QSpinBox()
         self.textureMemorySpinBox.setRange(0, 1 << 20)
@@ -4570,6 +4634,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.inspectButton.connect("clicked(bool)", self.onInspect)
         self.pathEdit.connect("currentPathChanged(QString)", self.onPathChanged)
         self.loadButton.connect("clicked(bool)", self.onLoad)
+        self.streamButton.connect("clicked(bool)", self.onStream)
         self.refineButton.connect("clicked(bool)", self.onRefine)
         self.autoRefineCheckBox.connect("toggled(bool)", self.onAutoRefineToggled)
         self.volumeRenderingCheckBox.connect("toggled(bool)", self.onVolumeRenderingToggled)
@@ -4685,6 +4750,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
     def updateButtons(self):
         hasStore = self.path is not None
         self.loadButton.setEnabled(hasStore and self.selectedLevel() >= 0)
+        self.streamButton.setEnabled(hasStore and self.selectedLevel() >= 0)
         self.refineButton.setEnabled(hasStore)
         self.createRoiButton.setEnabled(hasStore)
         self.autoRefineCheckBox.setEnabled(hasStore)
@@ -4819,15 +4885,85 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
                 if column == 0:
                     item.setToolTip(". ".join(notes))
 
-    def onLoad(self):
-        if not self.path or self.selectedLevel() < 0:
-            return
-        properties = {"level": self.selectedLevel()}
+    def loadProperties(self, stream):
+        properties = {"level": self.selectedLevel(), "stream": stream}
         if self.timeIndexSpinBox.value >= 0:
             properties["timeIndex"] = self.timeIndexSpinBox.value
+        return properties
+
+    def onLoad(self):
+        """The selected level, whole, as an ordinary volume; rendered when volume rendering is on."""
+        if not self.path or self.selectedLevel() < 0:
+            return
+        node = None
         with slicer.util.tryWithErrorDisplay(_("Failed to load level"), waitCursor=True):
-            slicer.util.loadNodeFromFile(self.path, "OMEZarr", properties)
+            node = slicer.util.loadNodeFromFile(self.path, "OMEZarr", self.loadProperties(stream=False))
+        if node is None or not node.IsA("vtkMRMLScalarVolumeNode"):
+            self.updateLevelStatus()
+            return
+        text = self.describeNodes(_("Level {level} loaded whole").format(level=node.GetAttribute("OMEZarr.Level")), [node])
+        if Settings.get(Settings.STREAM_3D, False):
+            self.renderVolume(node, True)
+            text += _(" · rendered in the 3D view")
+        else:
+            text += _(" · not rendered (volume rendering is off)")
+        self.statusLabel.text = text
         self.updateLevelStatus()
+
+    def onStream(self):
+        """The coarsest level at once, the selected level read behind it."""
+        if not self.path or self.selectedLevel() < 0:
+            return
+        node = None
+        with slicer.util.tryWithErrorDisplay(_("Failed to stream"), waitCursor=True):
+            node = slicer.util.loadNodeFromFile(self.path, "OMEZarr", self.loadProperties(stream=True))
+        streamer = OMEZarrLogic.streamer(self.path)
+        if node is None or streamer is None:
+            if node is not None:
+                self.statusLabel.text = self.describeNodes(
+                    _("Level {level} loaded whole (nothing coarser to show first)").format(level=node.GetAttribute("OMEZarr.Level")), [node]
+                )
+            self.updateLevelStatus()
+            return
+        text = _("Streaming: level {shown} shown now, level {target} read in the background").format(
+            shown=node.GetAttribute("OMEZarr.Level"), target=streamer.target
+        )
+        if streamer.volume3D is not None:
+            text += _(" · 3D view follows the camera")
+        elif Settings.get(Settings.STREAM_3D, False):
+            text += _(" · no 3D view to render in")
+        else:
+            text += _(" · not rendered (volume rendering is off)")
+        self.statusLabel.text = text
+        self.updateLevelStatus()
+
+    @staticmethod
+    def renderVolume(node, enabled):
+        """Volume-render an ordinary (not streamed) volume in the 3D view, or hide its rendering."""
+        logic = slicer.modules.volumerendering.logic()
+        display = logic.GetFirstVolumeRenderingDisplayNode(node)
+        if display is None:
+            if not enabled:
+                return None
+            display = logic.CreateDefaultVolumeRenderingNodes(node)
+        display.SetVisibility(bool(enabled))
+        layoutManager = slicer.app.layoutManager()
+        if enabled and layoutManager is not None and layoutManager.threeDViewCount:
+            layoutManager.threeDWidget(0).threeDView().resetFocalPoint()
+        return display
+
+    def loadedVolume(self):
+        """The volume loaded whole from this store (the latest), if any."""
+        candidates = [
+            n
+            for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
+            if samePath(n.GetAttribute("OMEZarr.Path"), self.path)
+            and not n.GetAttribute("OMEZarr.Region")
+            and not n.GetAttribute("OMEZarr.Refined")
+            and not n.GetAttribute("OMEZarr.Streamed3D")
+            and not n.GetAttribute("OMEZarr.Role")
+        ]
+        return candidates[-1] if candidates else None
 
     def describeNodes(self, prefix, nodes):
         volumes = scalarVolumes(nodes)
@@ -4874,23 +5010,30 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             OMEZarrLogic.startAutoRefine(self.path)
 
     def onVolumeRenderingToggled(self, enabled):
-        """A preference, usable before any store is chosen: streamed stores are volume-rendered as
-        they load, and a store already streaming starts or stops at once."""
+        """A preference, usable before any store is chosen: what is loaded from this store now
+        (streamed or whole) is rendered or hidden at once, and so is the next load."""
         Settings.set(Settings.STREAM_3D, bool(enabled))
         streamer = OMEZarrLogic.streamer(self.path) if self.path else None
+        loaded = self.loadedVolume() if self.path else None
         if not enabled:
             if streamer is not None:
                 streamer.disable3D()
-            self.statusLabel.text = ""
+            if loaded is not None:
+                self.renderVolume(loaded, False)
+            self.statusLabel.text = _("3D view: rendering off") if (streamer or loaded) else ""
             return
-        if streamer is None:
-            self.statusLabel.text = _("The 3D view will render the next store you load (streamed)")
+        if streamer is not None:
+            try:
+                node = streamer.enable3D()
+                self.statusLabel.text = _("3D view: rendering {name}, following the camera").format(name=node.GetName())
+            except ValueError as e:
+                self.statusLabel.text = str(e)
             return
-        try:
-            node = streamer.enable3D()
-            self.statusLabel.text = _("3D view: rendering {name}").format(name=node.GetName())
-        except ValueError as e:
-            self.statusLabel.text = str(e)
+        if loaded is not None:
+            self.renderVolume(loaded, True)
+            self.statusLabel.text = _("3D view: rendering {name}").format(name=loaded.GetName())
+            return
+        self.statusLabel.text = _("The 3D view will render the next level you load or stream")
 
     def cleanup(self):
         self.roiTimer.stop()
@@ -5130,6 +5273,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_LevelSelection()
             self.test_RegionLoading()
             self.test_SegmentationFromRoi()
+            self.test_LoadButtonsChooseTheMode()
             self.test_MicroscopyAxes()
             self.test_Labels()
             self.test_TimeSeries()
@@ -5364,6 +5508,53 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.assertEqual(widget.levelTable.horizontalHeaderItem(1).text(), "Voxels (x, y, z)")
             self.assertFalse(widget.segmentButton.enabled)
         slicer.util.resetSliceViews()  # the editor zoomed the views on the box: later tests expect whole views
+
+    def test_LoadButtonsChooseTheMode(self):
+        self.delayDisplay("'Load selected level' loads whole and 'Stream selected level' streams, whatever the setting")
+        if slicer.util.mainWindow() is None:
+            return
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        Settings.set(Settings.STREAM, True)  # the setting is for stores opened without a level
+        Settings.set(Settings.STREAM_3D, True)
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        slicer.util.selectModule("OMEZarr")
+        widget = slicer.modules.OMEZarrWidget
+        widget.roiSelector.setCurrentNode(None)
+        widget.pathEdit.currentPath = self.tempDir
+        widget.pathEdit.currentPath = storePath
+        widget.levelTable.selectRow(1)
+        self.assertTrue(widget.loadButton.enabled and widget.streamButton.enabled)
+
+        # Load: the level whole, no streamer, rendered because volume rendering is on.
+        widget.onLoad()
+        node = widget.loadedVolume()
+        self.assertIsNotNone(node)
+        self.assertEqual(node.GetAttribute("OMEZarr.Level"), "1")
+        self.assertIsNone(OMEZarrLogic.streamer(storePath))
+        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(node)
+        self.assertIsNotNone(display)
+        self.assertTrue(display.GetVisibility())
+        self.assertIn("loaded whole", widget.statusLabel.text)
+        self.assertIn("rendered in the 3D view", widget.statusLabel.text)
+        # The checkbox acts on the loaded volume at once.
+        widget.onVolumeRenderingToggled(False)
+        self.assertFalse(display.GetVisibility())
+        widget.onVolumeRenderingToggled(True)
+        self.assertTrue(display.GetVisibility())
+        slicer.mrmlScene.RemoveNode(node)
+
+        # Stream: the coarsest level shown, the selected level the target, the 3D view following.
+        widget.onStream()
+        streamer = OMEZarrLogic.streamer(storePath)
+        self.assertIsNotNone(streamer)
+        self.assertEqual(streamer.target, 1)
+        self.assertEqual(streamer.node.GetAttribute("OMEZarr.Level"), "2")
+        self.assertIsNotNone(streamer.volume3D)
+        self.assertIn("Streaming", widget.statusLabel.text)
+        self.assertTrue(self.waitFor(lambda: streamer.node.GetAttribute("OMEZarr.Level") == "1", 20.0))
+        OMEZarrLogic.stopStreaming(storePath, wait=True)
+        Settings.set(Settings.STREAM_3D, False)
+        Settings.set(Settings.STREAM, False)
 
     def writeMicroscopyStore(self, name="cells", withTime=False):
         import ngff_zarr
@@ -5763,13 +5954,19 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         streamed = [n for n in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode") if n.GetAttribute("OMEZarr.Streamed")]
         self.assertEqual(streamed, [])
 
-        # A level picked in the module panel is shown at once, and the budget's finer level streamed in.
-        picked = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 2, "maxBytes": 1 << 30})
+        # A level asked for is loaded whole, whatever the setting: it is what the caller wants in memory.
+        direct = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 1, "maxBytes": 1 << 30})
+        self.assertEqual(direct.GetAttribute("OMEZarr.Level"), "1")
+        self.assertIsNone(OMEZarrLogic.streamer(storePath))
+        # Asked to stream, the coarsest level shows first and the level asked for is the target.
+        picked = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 1, "stream": True, "maxBytes": 1 << 30})
         self.assertEqual(picked.GetAttribute("OMEZarr.Level"), "2")
-        self.assertTrue(self.waitFor(lambda: picked.GetAttribute("OMEZarr.Level") == "0", 20.0))
-        # Picking the level the budget allows (or a finer one) loads it directly.
-        direct = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 0, "maxBytes": 1 << 30})
-        self.assertEqual(direct.GetAttribute("OMEZarr.Level"), "0")
+        self.assertEqual(OMEZarrLogic.streamer(storePath).target, 1)
+        self.assertTrue(self.waitFor(lambda: picked.GetAttribute("OMEZarr.Level") == "1", 20.0))
+        OMEZarrLogic.stopStreaming(storePath, wait=True)
+        # Streaming to the coarsest level has nothing to show first: loaded whole.
+        coarse = slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"level": 2, "stream": True})
+        self.assertEqual(coarse.GetAttribute("OMEZarr.Level"), "2")
         self.assertIsNone(OMEZarrLogic.streamer(storePath))
 
         # With streaming off, the same load returns the full level straight away.
