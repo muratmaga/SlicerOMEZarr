@@ -5574,8 +5574,9 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         widget.levelTable.selectRow(2)
         widget.onLoad()
         coarse = OMEZarrLogic.loadedWholeVolume(storePath, 2, 0, 0)
+        self.assertIsNot(coarse, node)  # another level is another node (or a refilled leftover of that level)
         self.assertTrue(coarse.GetName().endswith(" L2"))
-        self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")), volumes + 1)
+        self.assertEqual(coarse.GetAttribute("OMEZarr.Level"), "2")
         slicer.mrmlScene.RemoveNode(coarse)
         widget.levelTable.selectRow(1)
         # The checkbox acts on the loaded volume at once.
