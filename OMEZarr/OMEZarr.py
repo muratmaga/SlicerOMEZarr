@@ -1766,7 +1766,8 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
 
         def label(node, level=None):
             level = node.GetAttribute("OMEZarr.Level") if level is None else level
-            return node.GetName(), (f"L{level}" if level not in (None, "") else "")
+            name = re.sub(r" L\d+$", "", node.GetName())  # a level loaded whole carries its level in its name
+            return name, (f"L{level}" if level not in (None, "") else "")
 
         views = []
         for viewName in layoutManager.sliceViewNames():
