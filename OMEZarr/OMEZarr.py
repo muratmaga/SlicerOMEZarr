@@ -5355,6 +5355,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.assertEqual(widget.levelTable.item(0, 1).text(), "256 × 256 × 130")
             self.assertEqual(widget.levelTable.horizontalHeaderItem(1).text(), "Voxels (x, y, z)")
             self.assertFalse(widget.segmentButton.enabled)
+        slicer.util.resetSliceViews()  # the editor zoomed the views on the box: later tests expect whole views
 
     def writeMicroscopyStore(self, name="cells", withTime=False):
         import ngff_zarr
@@ -6320,7 +6321,9 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.assertTrue(reader.sharded)
             self.assertEqual(reader.perShard, (2, 2, 2))
             # One index per shard touched, then one range per non-empty chunk: never a whole shard.
-            keys = {key for r in streamer.views.values() if r["level"] == 0 for key in r["keys"]}
+            # Only the Red view was waited for: another view zoomed in by an earlier test may have
+            # asked for its level-0 chunks without their shard indexes being read yet.
+            keys = set(streamer.views["Red"]["keys"])
             shards = {tuple(k // 2 for k in key) for key in keys}
             self.assertLessEqual(shards, set(reader.indexes))
             self.assertEqual(reader.indexReads, len(reader.indexes))  # each shard's index read once, then kept
