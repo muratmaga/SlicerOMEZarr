@@ -1491,6 +1491,8 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         if observers.get("segmentationSources") is not None:
             return
 
+        # VTK hands the removed node to a Python observer only when the callback declares its type.
+        @vtk.calldata_type(vtk.VTK_OBJECT)
         def onNodeRemoved(caller, event, node):
             if node is None or not node.IsA("vtkMRMLSegmentationNode"):
                 return
@@ -1499,9 +1501,8 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                     slicer.mrmlScene.RemoveNode(source)
 
         # The scene survives module reloads, so the one observer is kept in a shared registry.
-        callback = lambda caller, event, calldata: onNodeRemoved(caller, event, calldata)  # noqa: E731
-        tag = slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeRemovedEvent, callback)
-        observers["segmentationSources"] = (tag, callback)
+        tag = slicer.mrmlScene.AddObserver(slicer.vtkMRMLScene.NodeRemovedEvent, onNodeRemoved)
+        observers["segmentationSources"] = (tag, onNodeRemoved)
 
     @staticmethod
     def segmentEditorNode():
