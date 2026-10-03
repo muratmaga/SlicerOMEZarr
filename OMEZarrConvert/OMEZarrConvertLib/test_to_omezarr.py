@@ -202,9 +202,16 @@ def test_multipage_tiff():
         out = os.path.join(tmp, "stack.ome.zarr")
         assert conv.run(path, out, levels=2, voxel_um=5.0, **QUIET)
         np.testing.assert_array_equal(zarr.open_group(out, mode="r")["scale0/stack"][:], volume)
+        assert conv.TiffFileSource(path, 5.0).raw is not None
+        big = os.path.join(tmp, "big.tif")  # big-endian, read straight from the file
+        tifffile.imwrite(big, volume, byteorder=">")
+        assert conv.run(big, os.path.join(tmp, "big.ome.zarr"), levels=2, voxel_um=5.0, **QUIET)
+        np.testing.assert_array_equal(zarr.open_group(os.path.join(tmp, "big.ome.zarr"), mode="r")["scale0/big"][:], volume)
         compressed = os.path.join(tmp, "packed.tif")  # page by page when the data is not contiguous
         tifffile.imwrite(compressed, volume, compression="zlib")
+        assert conv.TiffFileSource(compressed, 5.0).raw is None
         assert conv.run(compressed, os.path.join(tmp, "packed.ome.zarr"), levels=2, voxel_um=5.0, **QUIET)
+        np.testing.assert_array_equal(zarr.open_group(os.path.join(tmp, "packed.ome.zarr"), mode="r")["scale0/packed"][:], volume)
 
 
 def test_auto_levels():

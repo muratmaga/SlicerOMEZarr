@@ -224,14 +224,14 @@ class TiffFileSource:
         shape = tuple(n for n in series.shape if n != 1) if len(series.shape) > 3 else tuple(series.shape)
         if len(shape) != 3:
             raise ConversionError(f"{os.path.basename(path)} is not a greyscale 3D stack (shape {series.shape})")
-        self.memmap = None
-        try:
-            self.memmap = tifffile.memmap(path).reshape(shape)  # uncompressed and contiguous
-        except Exception:  # noqa: BLE001 - compressed or scattered: read page by page
-            if len(self.tif.pages) != shape[0]:
-                raise ConversionError(f"{os.path.basename(path)}: {len(self.tif.pages)} pages for {shape[0]} slices, "
-                                      "and the data is not contiguous") from None
-        self.shape, self.dtype = shape, series.dtype
+        # Uncompressed and contiguous (e.g. an ImageJ stack with one page header): read slabs straight
+        # from the file; otherwise page by page.
+        self.raw = _RawReader(path, series.dataoffset) if series.dataoffset is not None else None
+        self.file_dtype = series.dtype.newbyteorder(self.tif.byteorder)
+        if self.raw is None and len(self.tif.pages) != shape[0]:
+            raise ConversionError(f"{os.path.basename(path)}: {len(self.tif.pages)} pages for {shape[0]} slices, "
+                                  "and the data is not contiguous")
+        self.shape, self.dtype = shape, series.dtype.newbyteorder("=")
         self.name = re.sub(r"\.(ome\.)?tiff?$", "", os.path.basename(path), flags=re.I)
         self.spacing = [voxel_um / 1000.0] * 3
         self.origin = [0.0] * 3
@@ -240,8 +240,10 @@ class TiffFileSource:
         self.description = f"{voxel_um} µm isotropic"
 
     def slab(self, z0, z1):
-        if self.memmap is not None:
-            return np.asarray(self.memmap[z0:z1])
+        if self.raw is not None:
+            out = np.empty((z1 - z0, *self.shape[1:]), dtype=self.file_dtype)
+            self.raw.read(z0 * self.shape[1] * self.shape[2] * self.file_dtype.itemsize, out)
+            return out.astype(self.dtype, copy=False)
         return self.tif.asarray(key=range(z0, z1)).reshape(z1 - z0, *self.shape[1:])
 
     def reference(self, z):
@@ -311,6 +313,26 @@ def _vectors(text):
     return out
 
 
+class _RawReader:
+    """Reads of uncompressed data at any offset, into the caller's buffer. Not a memory map: the
+    pages of a mapped file count toward the process's memory as they are read (5.9 GB peak for a
+    5.3 GB file against 1.4 GB for the same data read from gzip)."""
+
+    def __init__(self, path, start):
+        self.path, self.start = path, start
+
+    def read(self, offset, out):
+        view = memoryview(out.reshape(-1).view(np.uint8))
+        with open(self.path, "rb") as f:
+            f.seek(self.start + offset)
+            filled = 0
+            while filled < len(view):
+                n = f.readinto(view[filled:])
+                if not n:
+                    raise ConversionError("the NRRD data ends early")
+                filled += n
+
+
 class _CompressedReader:
     """Sequential reads of the decompressed data; a read behind the current position starts over."""
 
@@ -352,8 +374,8 @@ class _CompressedReader:
 
 class NrrdFile:
     """A 3D scalar NRRD in its own index order: ``shape`` (k, j, i), slowest axis first; ``directions``
-    the LPS step in mm of each of those axes; ``origin`` the LPS position of voxel 0; ``array`` a
-    memory map for raw data, None for compressed data, which ``block`` reads front to back."""
+    the LPS step in mm of each of those axes; ``origin`` the LPS position of voxel 0;
+    ``random_access`` whether slabs can be read in any order (raw data) or only front to back."""
 
     def __init__(self, path):
         fields, header_end = read_nrrd_header(path)
@@ -417,8 +439,6 @@ class NrrdFile:
         self.shape = (sizes[2], sizes[1], sizes[0])
         self.directions = [steps[2], steps[1], steps[0]]  # k, j, i
         self.origin = origin
-        self.array = None
-        self.reader = None
         if encoding == "raw":
             if byte_skip == -1:
                 start = os.path.getsize(data_path) - nbytes
@@ -426,17 +446,16 @@ class NrrdFile:
                 start += byte_skip
             if os.path.getsize(data_path) < start + nbytes:
                 raise ConversionError(f"{name}: the data file is shorter than the header says")
-            self.array = np.memmap(data_path, dtype=dtype, mode="r", offset=start, shape=self.shape)
+            self.reader = _RawReader(data_path, start)
         else:
             if byte_skip < 0:
                 raise ConversionError(f"{name}: byte skip {byte_skip} with {encoding} data")
             self.reader = _CompressedReader(data_path, start, encoding, byte_skip)
         self.file_dtype = dtype
+        self.random_access = encoding == "raw"
 
     def block(self, k0, k1):
         """Slices k0..k1-1 along the slowest axis, native order."""
-        if self.array is not None:
-            return np.asarray(self.array[k0:k1]).astype(self.dtype, copy=False)
         out = np.empty((k1 - k0, *self.shape[1:]), dtype=self.file_dtype)
         self.reader.read(k0 * self.shape[1] * self.shape[2] * self.file_dtype.itemsize, out)
         return out.astype(self.dtype, copy=False)
@@ -488,7 +507,7 @@ class NrrdSource:
         self.axes = identity_axes()
         self.attributes = {"source_file": self.nrrd.file}
         z_native, z_sign, _ = self.plan[0]
-        self.needs_native_copy = z_native != 0 or (z_sign < 0 and self.nrrd.array is None)
+        self.needs_native_copy = z_native != 0 or (z_sign < 0 and not self.nrrd.random_access)
         self.store = None  # level 0 of the native copy, once made
         self.kept = {}
         self.wanted = set()
