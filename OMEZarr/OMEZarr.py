@@ -3634,7 +3634,13 @@ class Streamer:
         ijk = np.stack([i.ravel(), j.ravel(), k.ravel(), np.ones(i.size)])
         ras = self.ijkToRas[self.contextLevel] @ ijk
         inside = (sides @ ras >= 0).all(axis=0)
-        display = self.volume3D.GetDisplayNode() if self.volume3D is not None else None
+        # The volume rendering display node, not the node's first display node: a scalar display
+        # node can come first (seen when another module shows the node in the slice views).
+        display = (
+            slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(self.volume3D)
+            if self.volume3D is not None
+            else None
+        )
         roi = display.GetROINode() if display is not None and display.GetCroppingEnabled() else None
         roiBounds = None
         if roi is not None:
