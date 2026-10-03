@@ -6712,7 +6712,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(len(bioformats2rawSeries(root)), 2)
         self.assertEqual(str(slicer.app.coreIOManager().fileType(root)), "OMEZarr")
         nodes = OMEZarrLogic.loadImage(root, level=0)
-        self.assertEqual([n.GetName() for n in nodes], ["converted_0 L0", "converted_1 L0"])
+        self.assertEqual([n.GetName() for n in nodes], ["converted_0", "converted_1"])  # label maps: no level suffix
         for node, array in zip(nodes, arrays, strict=True):
             np.testing.assert_array_equal(slicer.util.arrayFromVolume(node), array)
         first = slicer.util.loadNodeFromFile(root, "OMEZarr", {"level": 0})
