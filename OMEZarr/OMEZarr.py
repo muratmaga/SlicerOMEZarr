@@ -5264,9 +5264,10 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertIs(again["sourceVolume"], source)
         self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")), before)
 
-        # A budget too small for level 0 moves the box to the level whose working set fits.
+        # A budget too small for level 0 moves the box to a coarser level whose working set fits
+        # (a box is at least one chunk per axis at every level, so a small one may skip a level).
         small = OMEZarrLogic.segmentationBoxForView(storePath, maxBytes=geometry["bytes"] // 2)
-        self.assertEqual(small["level"], 1)
+        self.assertGreater(small["level"], 0)
         self.assertLessEqual(small["bytes"], geometry["bytes"] // 2)
 
     def writeMicroscopyStore(self, name="cells", withTime=False):
