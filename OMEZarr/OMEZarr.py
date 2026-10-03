@@ -1743,6 +1743,68 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     def streamer(cls, path):
         return cls._streamers.get(str(path))
 
+    LEVEL_CORNER = 3  # upper right of a view; Slicer's own slice annotations use the other corners
+
+    @staticmethod
+    def renderedVolume():
+        """The volume the 3D view volume-renders, if one is visible."""
+        for display in slicer.util.getNodesByClass("vtkMRMLVolumeRenderingDisplayNode"):
+            if display.GetVisibility() and display.GetVolumeNode() is not None:
+                return display.GetVolumeNode()
+        return None
+
+    @classmethod
+    def updateViewLabels(cls, clear=False):
+        """Each view's corner names the volume it shows and its level, "name · L1". A slice view
+        over a streamed volume shows the level of the plane laid on it and "(loading L0)" while
+        that plane is read; the 3D view names the volume it renders."""
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return
+        streamers = [s for s in cls._streamers.values() if not s.stopped]
+
+        def label(node, level=None):
+            level = node.GetAttribute("OMEZarr.Level") if level is None else level
+            return node.GetName() + (f" · L{level}" if level not in (None, "") else "")
+
+        views = []
+        for viewName in layoutManager.sliceViewNames():
+            sliceWidget = layoutManager.sliceWidget(viewName)
+            if sliceWidget is None:
+                continue
+            background = sliceWidget.sliceLogic().GetBackgroundLayer().GetVolumeNode()
+            text = ""
+            if background is not None:
+                text = label(background)
+                for streamer in streamers:
+                    if streamer.node is not background:
+                        continue
+                    overlay, request = streamer.overlays.get(viewName), streamer.views.get(viewName)
+                    if overlay is not None and overlay.GetScene() is not None:
+                        text = label(background, overlay.GetAttribute("OMEZarr.Level"))
+                    if request is not None and not request["shown"]:
+                        text += _(" (loading L{level})").format(level=request["level"])
+            views.append((sliceWidget.sliceView(), text))
+        if layoutManager.threeDViewCount:
+            rendered = cls.renderedVolume()
+            text = ""
+            if rendered is not None:
+                text = label(rendered)
+                for streamer in streamers:
+                    if streamer.volume3D is rendered and streamer.shown3D:
+                        text = label(streamer.node, streamer.shown3D[0])
+            views.append((layoutManager.threeDWidget(0).threeDView(), text))
+        for view, text in views:
+            if clear:
+                text = ""
+            try:
+                annotation = view.cornerAnnotation()
+            except AttributeError:
+                continue
+            if annotation.GetText(cls.LEVEL_CORNER) != text:
+                annotation.SetText(cls.LEVEL_CORNER, text)
+                view.scheduleRender()
+
     @classmethod
     def onAboutToQuit(cls):
         HttpClient.shutdown.set()  # readers waiting out a busy server give up at once
@@ -2738,7 +2800,6 @@ class Streamer:
         self.displayEdited = False  # the 3D display (its transfer function) changed since the last update3D
         self.reusedChunks = 0  # chunks copied from the previous 3D texture instead of read again
         self.opacityCache = None  # (MTimes, opacity per value bin, low value, bins per value, unit distance mm)
-        self.unfit3D = None  # (level, dims z y x, bytes) the view wanted but no texture holds: shown in its label
         self.reads = collections.deque(maxlen=4096)  # (end time, decoded bytes, seconds, from disk) per chunk read
         self.lastStatus = 0.0
         self.idleShown = False
@@ -3396,42 +3457,9 @@ class Streamer:
 
     LEVEL_CORNER = 3  # upper right; Slicer's own slice annotations use the other corners
 
-    def levelText(self, level):
-        return _("OME-Zarr level {level} · {size:g} µm").format(level=level, size=round(self.spacing[level] * 1000, 1))
-
-    def viewWidgets(self):
-        layoutManager = slicer.app.layoutManager()
-        if layoutManager is None:
-            return []
-        widgets = []
-        for viewName in self.sliceViewNames:
-            sliceWidget = layoutManager.sliceWidget(viewName)
-            if sliceWidget is not None:
-                widgets.append((viewName, sliceWidget.sliceView()))
-        if layoutManager.threeDViewCount:
-            widgets.append(("3D", layoutManager.threeDWidget(0).threeDView()))
-        return widgets
-
     def updateLevelLabels(self, clear=False):
-        """Show, in each view's corner, the resolution level it displays."""
-        for viewName, view in self.viewWidgets():
-            if viewName == "3D":
-                text = self.levelText(self.shown3D[0]) + self.unfitText() if (self.volume3D is not None and self.shown3D) else ""
-            else:
-                request, overlay = self.views.get(viewName), self.overlays.get(viewName)
-                shown = int(overlay.GetAttribute("OMEZarr.Level")) if overlay is not None and overlay.GetScene() else None
-                text = self.levelText(shown if shown is not None else self.shownLevel)
-                if request is not None and not request["shown"]:
-                    text += _(" (loading level {level})").format(level=request["level"])
-            if clear:
-                text = ""
-            try:
-                annotation = view.cornerAnnotation()
-            except AttributeError:
-                continue
-            if annotation.GetText(self.LEVEL_CORNER) != text:
-                annotation.SetText(self.LEVEL_CORNER, text)
-                view.scheduleRender()
+        """Each view's corner names the volume it shows and its level (OMEZarrLogic.updateViewLabels)."""
+        OMEZarrLogic.updateViewLabels(clear)
 
     def levelState(self, level):
         """(mark, description) of a level for the module's level table."""
@@ -3691,7 +3719,6 @@ class Streamer:
         level = next((lv for lv in reversed(range(len(self.levels))) if self.spacing[lv] <= pixel * 1.001), 0)
         level = max(level, finest)
         itemSize = np.dtype(self.dtype).itemsize
-        self.unfit3D = None
         for level in range(level, self.contextLevel):
             region = self.regionAtLevel(points, level)
             dims = [stop - start for start, stop in region]
@@ -3701,25 +3728,7 @@ class Streamer:
             # the specimen at its face, so a box too big for one texture is shown one level coarser.
             if max(dims) <= self.maxTextureDim and int(np.prod(dims)) * itemSize <= self.maxTextureBytes:
                 return {"level": level, "region": region, "keys": self.levels[level].keys(region), "shown": False}
-            if self.unfit3D is None:
-                self.unfit3D = (level, dims, int(np.prod(dims)) * itemSize)
         return None
-
-    def unfitText(self):
-        """Why the 3D view shows no finer level, for its label; empty when it shows what it wants."""
-        if self.unfit3D is None:
-            return ""
-        level, dims, nbytes = self.unfit3D
-        shown = self.shown3D[0] if self.shown3D else self.contextLevel
-        if level >= shown:
-            return ""
-        if max(dims) > self.maxTextureDim:
-            limit = _("{side} per side").format(side=self.maxTextureDim)
-        else:
-            limit = _("{gib:.1f} GiB").format(gib=self.maxTextureBytes / 2**30)
-        return _(" · level {level} would need {x}×{y}×{z} voxels ({gib:.1f} GiB), over the 3D texture limit of {limit}").format(
-            level=level, x=dims[2], y=dims[1], z=dims[0], gib=nbytes / 2**30, limit=limit
-        )
 
     def opacityLookup(self):
         """(opacity per value bin, low value, bins per value unit, opacity unit distance in mm) of the
@@ -4088,10 +4097,10 @@ class Streamer:
                 self.joinReaders()
             return
         self.disable3D(stopWhenDone=False)
-        self.updateLevelLabels(clear=not self.complete or self.node.GetScene() is None)
         if not self.complete and slicer.util.mainWindow():
             slicer.util.showStatusMessage("", 1)  # the streaming line does not time out by itself
         self.stopped = True
+        self.updateLevelLabels()  # the views keep naming what they show, without this streamer's planes
         self.viewTimer.stop()
         self.pollTimer.stop()
         self.yieldTimer.stop()
@@ -4212,6 +4221,7 @@ class OMEZarrFileReader:
                         streamer.enable3D()
             elif coarse and Settings.get(Settings.AUTO_REFINE, False) and slicer.util.mainWindow():
                 OMEZarrLogic.startAutoRefine(root)
+            OMEZarrLogic.updateViewLabels()
         self.parent.loadedNodes = [node.GetID() for node in nodes]
         return True
 
@@ -4944,6 +4954,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             text += _(" · not rendered (volume rendering is off)")
         self.statusLabel.text = text
         self.updateLevelStatus()
+        OMEZarrLogic.updateViewLabels()
 
     def onStream(self):
         """The coarsest level at once, the selected level read behind it."""
@@ -4985,6 +4996,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         layoutManager = slicer.app.layoutManager()
         if enabled and layoutManager is not None and layoutManager.threeDViewCount:
             layoutManager.threeDWidget(0).threeDView().resetFocalPoint()
+        OMEZarrLogic.updateViewLabels()
         return display
 
     def loadedVolume(self):
@@ -5139,6 +5151,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             slicer.util.setSliceViewerLayers(background=scalars[0], fit=True)
         self.statusLabel.text = self.describeNodes(roiNode.GetName(), nodes)
         self.updateLevelStatus()
+        OMEZarrLogic.updateViewLabels()
 
     def cropRoi(self):
         """The cropping region of the streamed 3D node of this store, when it is rendered."""
@@ -6331,9 +6344,9 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertIsNone(streamer.request3D)
         self.assertEqual(node3D.GetAttribute("OMEZarr.Level"), "1")
         streamer.updateLevelLabels()
-        self.assertIn("level 1", widget.threeDView().cornerAnnotation().GetText(Streamer.LEVEL_CORNER))
+        self.assertEqual(widget.threeDView().cornerAnnotation().GetText(Streamer.LEVEL_CORNER), f"{streamer.node.GetName()} · L1")
         redLabel = slicer.app.layoutManager().sliceWidget("Red").sliceView().cornerAnnotation()
-        self.assertIn("OME-Zarr level", redLabel.GetText(Streamer.LEVEL_CORNER))
+        self.assertTrue(redLabel.GetText(Streamer.LEVEL_CORNER).startswith(streamer.node.GetName() + " · L"))
 
         # Close up, the view needs level 0, but only the part of the volume in front of the camera.
         lookFrom(60.0)
