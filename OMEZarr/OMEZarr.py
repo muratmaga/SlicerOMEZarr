@@ -4145,11 +4145,33 @@ class Streamer:
         self.setVolume3D(image, ijkToRas, level)
         self.shown3D = (level, region)
 
+    def handOver3D(self):
+        """The volume node takes the 3D view over from the streamed texture when streaming ends,
+        with the same cropping and transfer function: the store keeps its one rendering."""
+        if self.volume3D is None or self.volume3D.GetScene() is None or self.node.GetScene() is None:
+            return
+        if slicer.mrmlScene.IsClosing() or slicer.mrmlScene.IsBatchProcessing():
+            return
+        logic = slicer.modules.volumerendering.logic()
+        old = logic.GetFirstVolumeRenderingDisplayNode(self.volume3D)
+        if old is None or not old.GetVisibility():
+            return
+        display = logic.GetFirstVolumeRenderingDisplayNode(self.node) or logic.CreateDefaultVolumeRenderingNodes(self.node)
+        if old.GetVolumePropertyNode() is not None and display.GetVolumePropertyNode() is not None:
+            display.GetVolumePropertyNode().Copy(old.GetVolumePropertyNode())
+        display.SetAndObserveROINodeID(old.GetROINodeID())
+        display.SetCroppingEnabled(old.GetCroppingEnabled())
+        display.SetVisibility(True)
+
     def stop(self, wait=False):
+        """``wait``: the application is shutting down (or a test is done), so the reader threads
+        are joined and the 3D view is not handed over."""
         if self.stopped:
             if wait:
                 self.joinReaders()
             return
+        if not wait:
+            self.handOver3D()
         self.disable3D(stopWhenDone=False)
         if not self.complete and slicer.util.mainWindow():
             slicer.util.showStatusMessage("", 1)  # the streaming line does not time out by itself
@@ -5012,7 +5034,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             return
         text = self.describeNodes(_("Level {level} loaded whole").format(level=node.GetAttribute("OMEZarr.Level")), [node])
         if Settings.get(Settings.STREAM_3D, False):
-            self.renderVolume(node, True)
+            self.showInThreeD(node)
             text += _(" · rendered in the 3D view")
         else:
             text += _(" · not rendered (volume rendering is off)")
@@ -5043,6 +5065,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
                 shown=shown, target=streamer.target
             )
         if streamer.volume3D is not None:
+            self.renderStreamed(streamer)  # the store's one rendering, cropped to the selected region
             text += _(" · 3D view follows the camera")
         elif Settings.get(Settings.STREAM_3D, False):
             text += _(" · no 3D view to render in")
@@ -5050,6 +5073,64 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             text += _(" · not rendered (volume rendering is off)")
         self.statusLabel.text = text
         self.updateLevelStatus()
+
+    # -- the store's one rendering: the 3D view shows at most one volume of the store, the
+    # streamed texture while streaming with 3D on, else the level or region loaded last, and the
+    # selected region crops whichever it is --
+
+    def storeDisplays(self):
+        """Every volume rendering display of a volume of this store."""
+        return [
+            display
+            for display in slicer.util.getNodesByClass("vtkMRMLVolumeRenderingDisplayNode")
+            if display.GetVolumeNode() is not None
+            and samePath(display.GetVolumeNode().GetAttribute("OMEZarr.Path"), self.path)
+        ]
+
+    def storeRendering(self):
+        """The visible volume rendering display of this store, if any."""
+        for display in self.storeDisplays():
+            if display.GetVisibility():
+                return display
+        return None
+
+    def hideStoreRenderings(self, keep=None):
+        """Nothing of the store in the 3D view but ``keep`` (a volume node): the streamed texture
+        is dropped unless it is the one kept."""
+        streamer = OMEZarrLogic.streamer(self.path) if self.path else None
+        if streamer is not None and streamer.volume3D is not None and streamer.volume3D is not keep:
+            streamer.disable3D(stopWhenDone=False)
+        for display in self.storeDisplays():
+            if display.GetVolumeNode() is not keep and display.GetVisibility():
+                display.SetVisibility(False)
+
+    def applyCrop(self, display, roiNode):
+        """Crop ``display`` to the region (none: uncropped). The region's box is shown."""
+        if roiNode is None:
+            display.SetCroppingEnabled(False)
+            return
+        if display.GetROINode() is not roiNode:
+            display.SetAndObserveROINodeID(roiNode.GetID())
+        display.SetCroppingEnabled(True)
+        roiNode.SetDisplayVisibility(True)
+
+    def showInThreeD(self, node):
+        """``node`` (a level or region loaded as an ordinary volume) becomes the store's rendering,
+        cropped to the selected region."""
+        self.hideStoreRenderings(keep=node)
+        display = self.renderVolume(node, True)
+        if display is not None:
+            self.applyCrop(display, self.roiSelector.currentNode())
+        return display
+
+    def renderStreamed(self, streamer):
+        """The streamed texture becomes the store's rendering, cropped to the selected region."""
+        node = streamer.enable3D()
+        self.hideStoreRenderings(keep=node)
+        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(node)
+        if display is not None:
+            self.applyCrop(display, self.roiSelector.currentNode())
+        return node
 
     @staticmethod
     def renderVolume(node, enabled):
@@ -5137,38 +5218,45 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         (streamed or whole) is rendered or hidden at once, and so is the next load."""
         Settings.set(Settings.STREAM_3D, bool(enabled))
         streamer = OMEZarrLogic.streamer(self.path) if self.path else None
-        loaded = self.loadedVolume() if self.path else None
         if not enabled:
-            if streamer is not None:
-                streamer.disable3D()
-            allLoaded = self.loadedVolumes() if self.path else []
-            for node in allLoaded:  # every level of this store loaded whole
-                self.renderVolume(node, False)
-            # And whatever else of this store is rendered (a region, a leftover of an earlier
-            # session of the panel): off means nothing of the store in the 3D view.
-            hidden = 0
-            for display in slicer.util.getNodesByClass("vtkMRMLVolumeRenderingDisplayNode"):
-                volume = display.GetVolumeNode()
-                if volume is not None and samePath(volume.GetAttribute("OMEZarr.Path"), self.path) and display.GetVisibility():
-                    display.SetVisibility(False)
-                    hidden += 1
-            self.statusLabel.text = _("3D view: rendering off") if (streamer or allLoaded or hidden) else ""
+            # Off means nothing of the store in the 3D view: the streamed texture, every level
+            # loaded whole, every region, a leftover of an earlier session of the panel.
+            had = (streamer is not None and streamer.volume3D is not None) or self.storeRendering() is not None
+            if self.path:
+                self.hideStoreRenderings()
+            self.statusLabel.text = _("3D view: rendering off") if had else ""
+            OMEZarrLogic.updateViewLabels()
             return
         if streamer is not None:
-            for other in self.loadedVolumes() + self.regionVolumes():  # one rendering at a time
-                self.renderVolume(other, False)
             try:
-                node = streamer.enable3D()
-                self.cropTo(self.roiSelector.currentNode())
+                node = self.renderStreamed(streamer)
                 self.statusLabel.text = _("3D view: rendering {name}, following the camera").format(name=node.GetName())
             except ValueError as e:
                 self.statusLabel.text = str(e)
             return
-        if loaded is not None:
-            self.renderVolume(loaded, True)
-            self.statusLabel.text = _("3D view: rendering {name}").format(name=loaded.GetName())
+        shown = self.shownVolume() if self.path else None
+        if shown is not None:
+            self.showInThreeD(shown)
+            self.statusLabel.text = _("3D view: rendering {name}").format(name=shown.GetName())
             return
         self.statusLabel.text = _("The 3D view will render the next level you load or stream")
+
+    def shownVolume(self):
+        """The volume of this store to render when volume rendering is turned on: the one the
+        selected slice view shows (a level or a region), else the level loaded whole last."""
+        sliceWidget = slicer.app.layoutManager().sliceWidget(self.viewSelector.currentData or "Red")
+        if sliceWidget is not None:
+            background = sliceWidget.sliceLogic().GetBackgroundLayer().GetVolumeNode()
+            if (
+                background is not None
+                and background.IsA("vtkMRMLScalarVolumeNode")
+                and not background.IsA("vtkMRMLLabelMapVolumeNode")
+                and samePath(background.GetAttribute("OMEZarr.Path"), self.path)
+                and not background.GetAttribute("OMEZarr.Refined")
+                and not background.GetAttribute("OMEZarr.Role")
+            ):
+                return background
+        return self.loadedVolume()
 
     def cleanup(self):
         # Background work first: nothing later in here may leave a streamer running unseen.
@@ -5180,8 +5268,8 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             OMEZarrLogic.panel = None
 
     def storeRoi(self):
-        """The region of interest this store already has, when it has one: the streamed
-        rendering's cropping region, else the selected region, else the region made for it."""
+        """The region of interest this store already has, when it has one: its rendering's
+        cropping region, else the selected region, else the region made for it."""
         roiNode = self.cropRoi()
         if roiNode is not None:
             return roiNode
@@ -5197,10 +5285,10 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         """The store's region of interest, shown and selected; made when the store has none yet,
         placed in the middle half of what the slice view shows. Clicking again brings the same
         region back rather than adding another."""
-        # While the store is volume-rendered, the region is the rendering's cropping region, so
-        # the 3D view (and the texture streamed for it) shows exactly what the region holds.
-        # The cropping region starts around the whole volume (or where the user left it), to be
-        # shrunk by its handles; a plain region starts in the middle of the slice view.
+        # While the store is volume-rendered (streamed or not), the region is the rendering's
+        # cropping region, so the 3D view (and the texture streamed for it) shows exactly what the
+        # region holds. The cropping region starts around the whole volume (or where the user left
+        # it), to be shrunk by its handles; a plain region starts in the middle of the slice view.
         roiNode = self.storeRoi()
         if roiNode is None:
             view = self.viewSelector.currentData
@@ -5256,21 +5344,16 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             text += _(" · the axis-aligned box around the rotated region")
         text += _(" · shown in the slice views")
         if scalars and Settings.get(Settings.STREAM_3D, False):
-            streamer = OMEZarrLogic.streamer(self.path)
-            if streamer is not None and streamer.volume3D is not None:
-                streamer.disable3D(stopWhenDone=False)  # the loaded region takes the 3D view
-            self.renderVolume(scalars[0], True)
+            self.showInThreeD(scalars[0])  # the loaded region takes the 3D view
             text += _(" and rendered in the 3D view")
         self.statusLabel.text = text
         self.updateLevelStatus()
         OMEZarrLogic.updateViewLabels()
 
     def cropRoi(self):
-        """The cropping region of the streamed 3D node of this store, when it is rendered."""
-        streamer = OMEZarrLogic.streamer(self.path) if self.path else None
-        if streamer is None or streamer.volume3D is None:
-            return None
-        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(streamer.volume3D)
+        """The cropping region of the store's rendering (streamed or not), when it has one:
+        made fitted to the rendered volume when the rendering has none yet."""
+        display = self.storeRendering() if self.path else None
         if display is None:
             return None
         # Cropping first: the logic creates the region hidden unless cropping is already on.
@@ -5278,6 +5361,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         if display.GetROINode() is None:
             slicer.modules.volumerendering.logic().CreateROINode(display)  # fitted to the volume
         roiNode = display.GetROINode()
+        roiNode.SetAttribute("OMEZarr.Path", normalizeStorePath(self.path))
         roiNode.SetDisplayVisibility(True)
         return roiNode
 
@@ -5309,21 +5393,11 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.updateButtons()
 
     def cropTo(self, roiNode):
-        """The streamed 3D view shows what the selected region holds: its cropping follows the
-        selection, and no region means the whole volume. The region's box stays where it is."""
-        streamer = OMEZarrLogic.streamer(self.path) if self.path else None
-        if streamer is None or streamer.volume3D is None:
-            return
-        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(streamer.volume3D)
-        if display is None:
-            return
-        if roiNode is None:
-            display.SetCroppingEnabled(False)
-            return
-        if display.GetROINode() is not roiNode:
-            display.SetAndObserveROINodeID(roiNode.GetID())
-        display.SetCroppingEnabled(True)
-        roiNode.SetDisplayVisibility(True)
+        """The store's rendering, streamed or not, shows what the selected region holds: its
+        cropping follows the selection, and no region means the whole volume."""
+        display = self.storeRendering() if self.path else None
+        if display is not None:
+            self.applyCrop(display, roiNode)
 
     @staticmethod
     def roiRotated(roiNode):
@@ -5799,6 +5873,87 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         OMEZarrLogic.stopStreaming(storePath, wait=True)
         Settings.set(Settings.STREAM_3D, False)
         Settings.set(Settings.STREAM, False)
+
+    def test_OneRenderingAcrossModes(self):
+        self.delayDisplay("The 3D view holds one rendering of the store, cropped to the selected region, whatever is loaded")
+        if slicer.util.mainWindow() is None:
+            return
+        OMEZarrLogic.stopStreaming(wait=True)
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        Settings.set(Settings.STREAM, True)
+        Settings.set(Settings.STREAM_3D, True)
+        slicer.app.layoutManager().setLayout(slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        slicer.util.selectModule("OMEZarr")
+        widget = slicer.modules.OMEZarrWidget
+        widget.roiSelector.setCurrentNode(None)
+        widget.pathEdit.currentPath = self.tempDir
+        widget.pathEdit.currentPath = storePath
+        logic = slicer.modules.volumerendering.logic()
+
+        def rendered():
+            return [d.GetVolumeNode() for d in widget.storeDisplays() if d.GetVisibility()]
+
+        def cropped(node):
+            display = logic.GetFirstVolumeRenderingDisplayNode(node)
+            return display is not None and display.GetCroppingEnabled() and display.GetROINode() is roi
+
+        # A level loaded whole is rendered; "New ROI in view" gives that rendering's cropping box.
+        widget.levelTable.selectRow(2)
+        widget.onLoad()
+        level2 = OMEZarrLogic.loadedWholeVolume(storePath, 2, 0, 0)
+        self.assertEqual(rendered(), [level2])
+        widget.onCreateRoi()
+        roi = widget.roiSelector.currentNode()
+        self.assertIsNotNone(roi)
+        self.assertTrue(cropped(level2))
+        self.assertTrue(samePath(roi.GetAttribute("OMEZarr.Path"), storePath))
+        roi.SetSize(20.0, 20.0, 20.0)  # a box inside the volume
+
+        # A region loaded takes the rendering over, cropped to the same box; the level is hidden.
+        widget.levelTable.selectRow(1)
+        widget.onLoadRegion()
+        region = widget.regionVolumes()[-1]
+        self.assertEqual(rendered(), [region])
+        self.assertTrue(cropped(region))
+
+        # Streaming takes it over: the streamed texture, cropped to the same box, nothing else.
+        widget.onStream()
+        streamer = OMEZarrLogic.streamer(storePath)
+        self.assertIsNotNone(streamer)
+        node3D = streamer.volume3D
+        self.assertIsNotNone(node3D)
+        self.assertEqual(rendered(), [node3D])
+        self.assertTrue(cropped(node3D))
+        # The selector crops whichever rendering it is, and the checkbox shows or hides it.
+        widget.roiSelector.setCurrentNode(None)
+        self.assertFalse(logic.GetFirstVolumeRenderingDisplayNode(node3D).GetCroppingEnabled())
+        widget.roiSelector.setCurrentNode(roi)
+        self.assertTrue(cropped(node3D))
+        widget.onVolumeRenderingToggled(False)
+        self.assertEqual(rendered(), [])
+        self.assertIsNone(streamer.volume3D)
+        widget.onVolumeRenderingToggled(True)
+        self.assertIsNotNone(streamer.volume3D)
+        self.assertEqual(rendered(), [streamer.volume3D])
+        self.assertTrue(cropped(streamer.volume3D))
+
+        # When streaming ends, the streamed volume takes the rendering over with the same crop.
+        self.assertTrue(self.waitFor(lambda: streamer.complete, 20.0))
+        base = streamer.node
+        OMEZarrLogic.stopStreaming(storePath)
+        self.assertEqual(rendered(), [base])
+        self.assertTrue(cropped(base))
+        # And a level loaded whole takes over from that.
+        widget.levelTable.selectRow(2)
+        widget.onLoad()
+        self.assertEqual(rendered(), [OMEZarrLogic.loadedWholeVolume(storePath, 2, 0, 0)])
+        self.assertTrue(cropped(rendered()[0]))
+        widget.onVolumeRenderingToggled(False)
+        self.assertEqual(rendered(), [])
+        widget.roiSelector.setCurrentNode(None)
+        Settings.set(Settings.STREAM_3D, False)
+        Settings.set(Settings.STREAM, False)
+        slicer.util.resetSliceViews()
 
     def test_ViewsFollowThePan(self):
         self.delayDisplay("A panned slice view gets the plane where it is, not where it started")
