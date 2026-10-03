@@ -5346,6 +5346,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         if slicer.util.mainWindow() is not None:
             slicer.util.selectModule("OMEZarr")
             widget = slicer.modules.OMEZarrWidget
+            widget.roiSelector.setCurrentNode(None)  # a region left selected by an earlier test
             widget.pathEdit.currentPath = storePath
             self.assertEqual(widget.levelTable.item(0, 1).text(), "256 × 256 × 130")
             widget.roiSelector.setCurrentNode(roi)
