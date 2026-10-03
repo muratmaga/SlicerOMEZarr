@@ -3527,6 +3527,10 @@ class Streamer:
         self.detectGpuLimits(widget)
         self.showContext3D()
         self.planContext()
+        # The default transfer function is derived from the node's window and level, so give the 3D
+        # node the streamed volume's display first (without it the rendering is a solid block).
+        node.CreateDefaultDisplayNodes()
+        self.copyDisplay(node)
         volumeRenderingLogic = slicer.modules.volumerendering.logic()
         display = volumeRenderingLogic.CreateDefaultVolumeRenderingNodes(node)
         display.SetVisibility(True)
@@ -5660,7 +5664,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.delayDisplay("c,z,y,x microscopy store in micrometres, two channels")
         data, storePath = self.writeMicroscopyStore()
         nodes = OMEZarrLogic.loadImage(storePath, level=0)
-        self.assertEqual([n.GetName() for n in nodes], ["cells_DAPI", "cells_GFP"])
+        self.assertEqual([n.GetName() for n in nodes], ["cells_DAPI L0", "cells_GFP L0"])
         self.assertEqual(nodes[0].GetDisplayNode().GetColorNodeID(), "vtkMRMLColorTableNodeBlue")
         self.assertEqual(nodes[1].GetDisplayNode().GetColorNodeID(), "vtkMRMLColorTableNodeGreen")
         self.assertAlmostEqual(nodes[1].GetDisplayNode().GetWindow(), 2300.0)
@@ -6283,8 +6287,13 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         if node3D.GetAttribute("OMEZarr.Level") == "1":
             self.assertIs(node3D.GetImageData(), streamer.targetImageData)
             np.testing.assert_array_equal(slicer.util.arrayFromVolume(node3D), np.asarray(multiscales.images[1].data))
-        display = node3D.GetDisplayNode()
-        self.assertTrue(display.IsA("vtkMRMLVolumeRenderingDisplayNode") and display.GetVisibility())
+        display = slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(node3D)
+        self.assertTrue(display is not None and display.GetVisibility())
+        # Its transfer function came from the streamed volume's window and level, as for a plain load.
+        sourceDisplay = streamer.node.GetDisplayNode()
+        scalarDisplay = node3D.GetVolumeDisplayNode()
+        self.assertIsNotNone(scalarDisplay)
+        self.assertEqual((scalarDisplay.GetWindow(), scalarDisplay.GetLevel()), (sourceDisplay.GetWindow(), sourceDisplay.GetLevel()))
 
         widget = slicer.app.layoutManager().threeDWidget(0)
         cameraNode = slicer.modules.cameras.logic().GetViewActiveCameraNode(widget.mrmlViewNode())
@@ -6703,7 +6712,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertEqual(len(bioformats2rawSeries(root)), 2)
         self.assertEqual(str(slicer.app.coreIOManager().fileType(root)), "OMEZarr")
         nodes = OMEZarrLogic.loadImage(root, level=0)
-        self.assertEqual([n.GetName() for n in nodes], ["converted_0", "converted_1"])
+        self.assertEqual([n.GetName() for n in nodes], ["converted_0 L0", "converted_1 L0"])
         for node, array in zip(nodes, arrays, strict=True):
             np.testing.assert_array_equal(slicer.util.arrayFromVolume(node), array)
         first = slicer.util.loadNodeFromFile(root, "OMEZarr", {"level": 0})
