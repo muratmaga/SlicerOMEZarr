@@ -1502,18 +1502,16 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
         if sliceWidget is None:
             raise ValueError(f"No slice view named '{sliceViewName}'")
         sliceNode = sliceWidget.mrmlSliceNode()
-        sliceToRas = slicer.util.arrayFromVTKMatrix(sliceNode.GetSliceToRAS())
         width, height, _depth = sliceNode.GetFieldOfView()
         thickness = min(width, height) / 2.0
-        corners = np.array(
-            [
-                [x, y, z, 1.0]
-                for x in (-width / 2, width / 2)
-                for y in (-height / 2, height / 2)
-                for z in (-thickness / 2, thickness / 2)
-            ]
-        )
-        ras = (sliceToRas @ corners.T).T[:, :3]
+        # The view's pixel-to-RAS mapping carries the pan, which SliceToRAS does not; the slab
+        # extends along the plane's normal (SliceToRAS's third column).
+        xyToRas = slicer.util.arrayFromVTKMatrix(sliceNode.GetXYToRAS())
+        normal = slicer.util.arrayFromVTKMatrix(sliceNode.GetSliceToRAS())[:3, 2]
+        normal = normal / (np.linalg.norm(normal) or 1.0)
+        dims = sliceNode.GetDimensions()
+        plane = (xyToRas @ np.array([[x, y, 0.0, 1.0] for x in (0.0, dims[0]) for y in (0.0, dims[1])]).T).T[:, :3]
+        ras = np.concatenate([plane + normal * (thickness / 2.0), plane - normal * (thickness / 2.0)])
         return [ras[:, 0].min(), ras[:, 0].max(), ras[:, 1].min(), ras[:, 1].max(), ras[:, 2].min(), ras[:, 2].max()]
 
     @staticmethod
@@ -3101,9 +3099,11 @@ class Streamer:
             return None
         pixel = min(fov[0] / dims[0], fov[1] / dims[1])
         level = next((lv for lv in reversed(range(len(self.levels))) if self.spacing[lv] <= pixel * 1.001), 0)
-        sliceToRas = slicer.util.arrayFromVTKMatrix(sliceNode.GetSliceToRAS())
-        corners = np.array([[x, y, 0.0, 1.0] for x in (-fov[0] / 2, fov[0] / 2) for y in (-fov[1] / 2, fov[1] / 2)])
-        ras = sliceToRas @ corners.T
+        # The view's own pixel-to-RAS mapping: it carries the pan (an in-plane offset on the slice
+        # node that SliceToRAS does not), so the plane is where the view is, not where it started.
+        xyToRas = slicer.util.arrayFromVTKMatrix(sliceNode.GetXYToRAS())
+        corners = np.array([[x, y, 0.0, 1.0] for x in (0.0, dims[0]) for y in (0.0, dims[1])])
+        ras = xyToRas @ corners.T
         while level < self.shownLevel:
             region = self.planeRegion(level, ras)
             if region is None:
@@ -5399,6 +5399,7 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             self.test_RegionLoading()
             self.test_SegmentationFromRoi()
             self.test_LoadButtonsChooseTheMode()
+            self.test_ViewsFollowThePan()
             self.test_MicroscopyAxes()
             self.test_Labels()
             self.test_TimeSeries()
@@ -5695,6 +5696,44 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertTrue(self.waitFor(lambda: streamer.node.GetAttribute("OMEZarr.Level") == "1", 20.0))
         OMEZarrLogic.stopStreaming(storePath, wait=True)
         Settings.set(Settings.STREAM_3D, False)
+        Settings.set(Settings.STREAM, False)
+
+    def test_ViewsFollowThePan(self):
+        self.delayDisplay("A panned slice view gets the plane where it is, not where it started")
+        OMEZarrLogic.stopStreaming(wait=True)
+        mrHead, storePath = self.writeMRHeadStore(chunks=32)
+        multiscales = OMEZarrLogic.openMultiscales(storePath)
+        Settings.set(Settings.STREAM, True)
+        Settings.set(Settings.STREAM_3D, False)
+        budget = OMEZarrLogic.volumeBytes(multiscales.images[0]) // 4  # level 1: the streamer keeps serving the views
+        slicer.util.loadNodeFromFile(storePath, "OMEZarr", {"maxBytes": budget})
+        streamer = OMEZarrLogic.streamer(storePath)
+        sliceNode = self.centerRedViewOn(mrHead, 40.0)
+        self.assertTrue(self.waitFor(lambda: streamer.views.get("Red", {}).get("shown", False), 30.0))
+        before = streamer.views["Red"]["region"]
+
+        def centerIndex():
+            dims = sliceNode.GetDimensions()
+            center = slicer.util.arrayFromVTKMatrix(sliceNode.GetXYToRAS()) @ np.array([dims[0] / 2.0, dims[1] / 2.0, 0.0, 1.0])
+            return np.linalg.inv(streamer.ijkToRas[0]) @ center
+
+        def contains(region, index):
+            return all(start <= index[2 - axis] < stop for axis, (start, stop) in enumerate(region))
+
+        self.assertTrue(contains(before, centerIndex()))
+        # Pan: Slicer moves an in-plane offset on the slice node, not its SliceToRAS origin.
+        sliceNode.SetXYZOrigin(25.0, 15.0, 0.0)
+        self.assertTrue(self.waitFor(lambda: streamer.views.get("Red", {}).get("shown", False) and streamer.views["Red"]["region"] != before, 30.0))
+        self.assertTrue(contains(streamer.views["Red"]["region"], centerIndex()))
+        # The bounds the panel uses for 'Refine view' and 'New ROI in view' follow the pan too.
+        bounds = OMEZarrLogic.sliceViewRasBounds("Red")
+        dims = sliceNode.GetDimensions()
+        center = slicer.util.arrayFromVTKMatrix(sliceNode.GetXYToRAS()) @ np.array([dims[0] / 2.0, dims[1] / 2.0, 0.0, 1.0])
+        for axis in range(3):
+            self.assertLessEqual(bounds[2 * axis], center[axis])
+            self.assertGreaterEqual(bounds[2 * axis + 1], center[axis])
+        sliceNode.SetXYZOrigin(0.0, 0.0, 0.0)
+        OMEZarrLogic.stopStreaming(storePath, wait=True)
         Settings.set(Settings.STREAM, False)
 
     def writeMicroscopyStore(self, name="cells", withTime=False):
