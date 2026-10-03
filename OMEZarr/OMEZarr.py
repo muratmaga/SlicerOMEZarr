@@ -4537,14 +4537,20 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         self.createRoiButton = qt.QPushButton(_("New ROI in view"))
         self.createRoiButton.setToolTip(
             _(
-                "Place a region of interest to work in; drag its handles in any view. While the store is "
-                "volume-rendered this is the rendering's cropping region, starting around the whole volume, and "
-                "the 3D view shows exactly what it holds. Otherwise a new region starts in the middle of the "
-                "selected slice view. With a region selected, the level table shows its size at each level."
+                "The region of interest to work in, shown and selected; drag its handles in any view. The store "
+                "has one: while it is volume-rendered, the rendering's cropping region (starting around the whole "
+                "volume, and the 3D view shows exactly what it holds); otherwise a region placed in the middle of "
+                "the selected slice view. Clicking again brings that region back rather than adding another. "
+                "With a region selected, the level table shows its size at each level."
             )
         )
         self.roiSelector.setToolTip(
-            _("The region of interest that 'Load region' and 'Create segmentation' use; any region in the scene can be picked")
+            _(
+                "The region of interest that 'Load region' and 'Create segmentation' use. None: the whole "
+                "volume, the region's box hidden and the rendering uncropped. Pick a region to show its box, "
+                "crop the rendering to it and see its size per level in the table. The last entry of the list "
+                "deletes the current region."
+            )
         )
         roiRow = qt.QHBoxLayout()
         roiRow.addWidget(self.roiSelector, 1)
@@ -5138,24 +5144,40 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
 
     def cleanup(self):
         self.roiTimer.stop()
-        self.onRoiChanged(None)
+        self.watchRoi(None)  # the region stays as it is shown
         if OMEZarrLogic.panel is self:
             OMEZarrLogic.panel = None
         OMEZarrLogic.stopAutoRefine()
         OMEZarrLogic.stopStreaming()
 
+    def storeRoi(self):
+        """The region of interest this store already has, when it has one: the streamed
+        rendering's cropping region, else the selected region, else the region made for it."""
+        roiNode = self.cropRoi()
+        if roiNode is not None:
+            return roiNode
+        roiNode = self.roiSelector.currentNode()
+        if roiNode is not None:
+            return roiNode
+        for node in slicer.util.getNodesByClass("vtkMRMLMarkupsROINode"):
+            if samePath(node.GetAttribute("OMEZarr.Path"), self.path):
+                return node
+        return None
+
     def onCreateRoi(self):
-        """A region of interest already placed: the middle half of what the slice view shows."""
-        view = self.viewSelector.currentData
-        bounds = self.logic.sliceViewRasBounds(view)
-        center = [(bounds[i] + bounds[i + 1]) / 2.0 for i in (0, 2, 4)]
-        size = [(bounds[i + 1] - bounds[i]) / 2.0 for i in (0, 2, 4)]
+        """The store's region of interest, shown and selected; made when the store has none yet,
+        placed in the middle half of what the slice view shows. Clicking again brings the same
+        region back rather than adding another."""
         # While the store is volume-rendered, the region is the rendering's cropping region, so
         # the 3D view (and the texture streamed for it) shows exactly what the region holds.
         # The cropping region starts around the whole volume (or where the user left it), to be
         # shrunk by its handles; a plain region starts in the middle of the slice view.
-        roiNode = self.cropRoi()
+        roiNode = self.storeRoi()
         if roiNode is None:
+            view = self.viewSelector.currentData
+            bounds = self.logic.sliceViewRasBounds(view)
+            center = [(bounds[i] + bounds[i + 1]) / 2.0 for i in (0, 2, 4)]
+            size = [(bounds[i + 1] - bounds[i]) / 2.0 for i in (0, 2, 4)]
             roiNode = slicer.mrmlScene.AddNewNodeByClass(
                 "vtkMRMLMarkupsROINode", slicer.mrmlScene.GenerateUniqueName("OME-Zarr region")
             )
@@ -5164,6 +5186,7 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
             roiNode.SetSize(*size)
             roiNode.GetDisplayNode().SetHandlesInteractive(True)
             roiNode.GetDisplayNode().SetFillOpacity(0.1)
+            roiNode.SetAttribute("OMEZarr.Path", normalizeStorePath(self.path))
         roiNode.SetDisplayVisibility(True)
         self.roiSelector.setCurrentNode(roiNode)
         self.statusLabel.text = _(
@@ -5229,16 +5252,28 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
         roiNode.SetDisplayVisibility(True)
         return roiNode
 
-    def onRoiChanged(self, roiNode):
-        """Follow the selected region of interest: the level table shows its box at each level."""
+    def watchRoi(self, roiNode):
+        """Observe the selected region's handles (none: stop observing). Returns the region observed before."""
+        previous = None
         if self.roiObserver is not None:
-            node, tags = self.roiObserver
+            previous, tags = self.roiObserver
             for tag in tags:
-                node.RemoveObserver(tag)
+                previous.RemoveObserver(tag)
             self.roiObserver = None
         if roiNode is not None:
             events = (vtk.vtkCommand.ModifiedEvent, slicer.vtkMRMLMarkupsNode.PointModifiedEvent)
             self.roiObserver = (roiNode, [roiNode.AddObserver(event, self.onRoiModified) for event in events])
+        return previous
+
+    def onRoiChanged(self, roiNode):
+        """Follow the selected region of interest: its box is the one shown, the rendering is cropped
+        to it and the level table shows its box at each level. None: the box of the region selected
+        before is hidden, the rendering uncropped, the table back to the whole levels."""
+        previous = self.watchRoi(roiNode)
+        if previous is not None and previous is not roiNode and previous.GetScene() is not None:
+            previous.SetDisplayVisibility(False)
+        if roiNode is not None:
+            roiNode.SetDisplayVisibility(True)
         self.cropTo(roiNode)
         self.showRoiBoxes()
         self.updateLevelStatus()
@@ -6571,11 +6606,18 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
             widget.onCreateRoi()
             self.assertIs(widget.roiSelector.currentNode(), roi)
             self.assertTrue(roi.GetDisplayVisibility())
-            # The selection drives the cropping: none means the whole volume.
+            # The selection drives the cropping and the box: none means the whole volume, box hidden.
             widget.roiSelector.setCurrentNode(None)
             self.assertFalse(display.GetCroppingEnabled())
+            self.assertFalse(roi.GetDisplayVisibility())
             widget.roiSelector.setCurrentNode(roi)
             self.assertTrue(display.GetCroppingEnabled())
+            self.assertTrue(roi.GetDisplayVisibility())
+            # Clicking "New ROI in view" again brings the same region back, not another one.
+            rois = len(slicer.util.getNodesByClass("vtkMRMLMarkupsROINode"))
+            widget.onCreateRoi()
+            self.assertIs(widget.roiSelector.currentNode(), roi)
+            self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLMarkupsROINode")), rois)
             widget.roiSelector.setCurrentNode(None)
 
         node3D.RemoveObserver(imageObserver)
@@ -7041,6 +7083,13 @@ class OMEZarrTest(ScriptedLoadableModuleTest):
         self.assertIsNotNone(roiNode)
         self.assertTrue(widget.loadRegionButton.enabled)
         self.assertGreater(min(roiNode.GetSize()), 0.0)
+        # Deselected, the region's box is hidden; "New ROI in view" brings the same one back.
+        widget.roiSelector.setCurrentNode(None)
+        self.assertFalse(roiNode.GetDisplayVisibility())
+        self.assertFalse(widget.loadRegionButton.enabled)
+        widget.onCreateRoi()
+        self.assertIs(widget.roiSelector.currentNode(), roiNode)
+        self.assertTrue(roiNode.GetDisplayVisibility())
 
         def regionNodes():
             nodes = slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode")
