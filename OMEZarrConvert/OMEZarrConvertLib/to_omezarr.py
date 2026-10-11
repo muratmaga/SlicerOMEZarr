@@ -7,7 +7,7 @@ larger than the memory converts. Inputs:
 * an NRRD file (.nrrd, or a .nhdr header with its data file; raw, gzip or bzip2 data),
 * an existing OME-Zarr store, whose coarser levels are rebuilt from its level 0.
 
-    to_omezarr.py <input> <out.ome.zarr> [--levels N] [--voxel-size UM] [--shard 128]
+    to_omezarr.py <input> <out.ome.zarr> [--levels N] [--voxel-size UM] [--shard 384]
 
 Slices and TIFF files carry no geometry: give --voxel-size in micrometres (an NRecon log gives
 it), the origin is 0 and the axes are taken as identity LPS. An NRRD keeps its voxel size, origin
@@ -19,8 +19,8 @@ compressed file, or comes from another axis of the file, level 0 is first copied
 order into a temporary store beside the output (as much disk as the compressed level 0).
 
 The store is OME-Zarr 0.5 (Zarr v3): one array per level at scale{k}/<name>, 128^3 chunks, zstd,
-millimetre units. --shard N groups the chunks into N^3 shards (N a multiple of 128); the default,
-128, writes every chunk as its own file. Without --levels, levels are added until the coarsest is
+millimetre units. --shard N groups the chunks into N^3 shards (N a multiple of 128); the default is
+384 (see DEFAULT_SHARD for why), and 128 writes every chunk as its own file. Without --levels, levels are added until the coarsest is
 at most 512 voxels on its longest side.
 
 Every level is the block mean of the SOURCE voxels it covers (2^k per axis), summed exactly and
@@ -50,6 +50,15 @@ import zarr
 from zarr.codecs import ZstdCodec
 
 CHUNK = 128
+# Default shard size, set by the OSN allocation the MorphoDepot stores go to: 50 TB and at most
+# 1.6 million files. An average volume (12 GB at full resolution, 4 levels = 13.7 GB) fills the
+# 50 TB at about 3,650 volumes. Files per such volume (16-bit / 8-bit): 3,964 / 6,718 with plain
+# 128^3 chunks (the file cap is reached at about 400 / 240 volumes), 590 / 894 with 256^3 shards
+# (2,700 / 1,800 volumes), 166 / 257 with 384^3 shards (9,600 / 6,200 volumes). 384 is the smallest
+# shard at which the storage, not the file cap, runs out first; conversion memory grows with the
+# shard (one shard's depth per slab: Scan_0006 needs 1.18 GB at 128, 3.45 GB at 384), so the
+# smallest such shard is the default. Streaming reads single chunks by byte range either way.
+DEFAULT_SHARD = 384
 COARSEST_SIDE = 512  # automatic levels: the coarsest level is at most this many voxels on its longest side
 ORIENTATION = {"x": "right-to-left", "y": "anterior-to-posterior", "z": "inferior-to-superior"}
 SLICE_EXTENSIONS = (".tif", ".tiff", ".png", ".bmp", ".jpg", ".jpeg")
@@ -627,7 +636,7 @@ def check_output(out, source_path=None):
         raise ConversionError(f"{out} exists and is not an OME-Zarr store: choose a new folder")
 
 
-def convert(source, out, levels=None, shard=CHUNK, log=print, progress=None):
+def convert(source, out, levels=None, shard=DEFAULT_SHARD, log=print, progress=None):
     """Write ``source`` to ``out`` with ``levels`` levels (automatic when None), chunks grouped in
     ``shard``^3 shards (``shard`` == CHUNK: no shards, one file per chunk). ``progress(done, total)``
     is called after each slab, in source slices."""
@@ -757,7 +766,7 @@ def verify(out, source, levels, log=print, samples=SAMPLE_SLICES, seed=0):
     return ok
 
 
-def run(input_path, out, levels=None, voxel_um=None, shard=CHUNK, threads=8, check=True, log=print, progress=None):
+def run(input_path, out, levels=None, voxel_um=None, shard=DEFAULT_SHARD, threads=8, check=True, log=print, progress=None):
     """Convert ``input_path`` to ``out``: the whole job, including the temporary native copy an
     NRRD may need and the check against the source. Returns True when the check passes (or is skipped).
     ``progress(done, total, step)`` reports slices of the current step ("copy", "convert")."""
@@ -792,8 +801,9 @@ def main():
                                                    f"(default: until the coarsest is at most {COARSEST_SIDE} voxels)")
     parser.add_argument("--voxel-size", type=float, help="voxel size in micrometres (slices and TIFF; overrides an NRecon log)")
     parser.add_argument("--threads", type=int, default=8, help="threads reading slices (default 8)")
-    parser.add_argument("--shard", type=int, default=CHUNK,
-                        help=f"shard size in voxels per side, a multiple of {CHUNK} (default {CHUNK}: no shards, one file per chunk)")
+    parser.add_argument("--shard", type=int, default=DEFAULT_SHARD,
+                        help=f"shard size in voxels per side, a multiple of {CHUNK} (default {DEFAULT_SHARD}; "
+                             f"{CHUNK}: no shards, one file per chunk)")
     parser.add_argument("--no-verify", action="store_true", help="skip the check against the source")
     parser.add_argument("--progress", action="store_true", help="print 'PROGRESS <step> <done> <total>' lines")
     args = parser.parse_args()
