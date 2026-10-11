@@ -68,9 +68,9 @@ LENGTH_UNIT_TO_MM = {
 UNIT_SYMBOLS = {"micrometer": "µm", "micron": "µm", "nanometer": "nm", "millimeter": "mm", "centimeter": "cm"}
 
 # Shown in the module until another store has been used: a public 36 GiB (uint16, 6.1 µm, 4 levels)
-# microCT of a dry skull on JS2, for testing streaming of a large store on a new system.
+# microCT of a dry skull on OSN, for testing streaming of a large store on a new system.
 SAMPLE_STORE_URL = (
-    "https://js2.jetstream-cloud.org:8001/swift/v1/MorphoDepot-volumes/large-sample-data/dry_skull_4K_12.5micron.ome.zarr"
+    "https://caltech1.osn.mghpcc.org/slicer-morph-js2/large-sample-data/dry_skull_4K_12.5micron.ome.zarr"
 )
 
 DEFAULT_BUDGET_FRACTION = 0.25  # of available RAM when the budget setting is "auto"
