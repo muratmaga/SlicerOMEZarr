@@ -1831,12 +1831,27 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
     LEVEL_CORNER = 3  # upper right: its level
 
     @staticmethod
-    def renderedVolume():
-        """The volume the 3D view volume-renders, if one is visible."""
+    def renderedVolume(viewNode=None):
+        """The volume a 3D view (``viewNode``, else any) volume-renders, if one is visible."""
         for display in slicer.util.getNodesByClass("vtkMRMLVolumeRenderingDisplayNode"):
+            if viewNode is not None and not display.IsDisplayableInView(viewNode.GetID()):
+                continue
             if display.GetVisibility() and display.GetVolumeNode() is not None:
                 return display.GetVolumeNode()
         return None
+
+    @staticmethod
+    def threeDWidgetsShowing(display):
+        """The 3D views a volume rendering display node renders in, those on screen first: the
+        views it names in its view list, or every 3D view when it names none."""
+        layoutManager = slicer.app.layoutManager()
+        if layoutManager is None:
+            return []
+        widgets = [layoutManager.threeDWidget(index) for index in range(layoutManager.threeDViewCount)]
+        widgets = [w for w in widgets if w is not None]
+        if display is not None:
+            widgets = [w for w in widgets if display.IsDisplayableInView(w.mrmlViewNode().GetID())]
+        return sorted(widgets, key=lambda w: not w.isVisible())
 
     @classmethod
     def updateViewLabels(cls, clear=False):
@@ -1871,15 +1886,16 @@ class OMEZarrLogic(ScriptedLoadableModuleLogic):
                     if request is not None and not request["shown"]:
                         level += _(" (loading L{level})").format(level=request["level"])
             views.append((sliceWidget.sliceView(), name, level))
-        if layoutManager.threeDViewCount:
-            rendered = cls.renderedVolume()
+        for index in range(layoutManager.threeDViewCount):
+            view = layoutManager.threeDWidget(index).threeDView()
+            rendered = cls.renderedVolume(view.mrmlViewNode())
             name, level = "", ""
             if rendered is not None:
                 name, level = label(rendered)
                 for streamer in streamers:
                     if streamer.volume3D is rendered and streamer.shown3D:
                         name, level = label(streamer.node, streamer.shown3D[0])
-            views.append((layoutManager.threeDWidget(0).threeDView(), name, level))
+            views.append((view, name, level))
         for view, name, level in views:
             if clear:
                 name, level = "", ""
@@ -3626,12 +3642,36 @@ class Streamer:
 
     # -- 3D view (main thread) --
 
+    def display3D(self):
+        """The volume rendering display node of the 3D node, if it has one."""
+        if self.volume3D is None or self.volume3D.GetScene() is None:
+            return None
+        return slicer.modules.volumerendering.logic().GetFirstVolumeRenderingDisplayNode(self.volume3D)
+
     def cameraNode3D(self):
-        layoutManager = slicer.app.layoutManager()
-        widget = layoutManager.threeDWidget(0) if layoutManager and layoutManager.threeDViewCount else None
-        if widget is None:
+        """The 3D view the 3D node is rendered in (the one on screen when its display node renders
+        in several) and that view's camera."""
+        widgets = OMEZarrLogic.threeDWidgetsShowing(self.display3D())
+        if not widgets:
             return None, None
-        return widget, slicer.modules.cameras.logic().GetViewActiveCameraNode(widget.mrmlViewNode())
+        return widgets[0], slicer.modules.cameras.logic().GetViewActiveCameraNode(widgets[0].mrmlViewNode())
+
+    def bindCamera(self):
+        """Observe the camera of the view the 3D node is rendered in, and its display node; the
+        camera again whenever the display node is moved to another view."""
+        widget, cameraNode = self.cameraNode3D()
+        display = self.display3D()
+        kept = []
+        for caller, tag in self.cameraObservers:
+            if caller is cameraNode or caller is display:
+                kept.append((caller, tag))
+            else:
+                caller.RemoveObserver(tag)
+        for caller in (cameraNode, display):
+            if caller is not None and all(observed is not caller for observed, tag in kept):
+                kept.append((caller, caller.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onCameraChanged)))
+        self.cameraObservers = kept
+        return widget, cameraNode
 
     def enable3D(self):
         """Render the store in the first 3D view from a node that holds only what that view needs."""
@@ -3656,9 +3696,8 @@ class Streamer:
         volumeRenderingLogic = slicer.modules.volumerendering.logic()
         display = volumeRenderingLogic.CreateDefaultVolumeRenderingNodes(node)
         display.SetVisibility(True)
+        widget, cameraNode = self.bindCamera()
         self.frameCamera(cameraNode)
-        self.cameraObservers = [(cameraNode, cameraNode.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onCameraChanged))]
-        self.cameraObservers.append((display, display.AddObserver(vtk.vtkCommand.ModifiedEvent, self.onCameraChanged)))
         self.cameraTimer.start()
         return node
 
@@ -3706,6 +3745,7 @@ class Streamer:
         if not self.stopped and self.volume3D is not None:
             if caller is not None and not isinstance(caller, slicer.vtkMRMLCameraNode):
                 self.displayEdited = True  # the display node: its transfer function, mostly
+                self.bindCamera()  # or its views
             self.cameraTimer.start()
 
     @staticmethod
@@ -5182,9 +5222,9 @@ class OMEZarrWidget(ScriptedLoadableModuleWidget):
                 return None
             display = logic.CreateDefaultVolumeRenderingNodes(node)
         display.SetVisibility(bool(enabled))
-        layoutManager = slicer.app.layoutManager()
-        if enabled and layoutManager is not None and layoutManager.threeDViewCount:
-            layoutManager.threeDWidget(0).threeDView().resetFocalPoint()
+        if enabled:
+            for widget in OMEZarrLogic.threeDWidgetsShowing(display)[:1]:
+                widget.threeDView().resetFocalPoint()
         OMEZarrLogic.updateViewLabels()
         return display
 
