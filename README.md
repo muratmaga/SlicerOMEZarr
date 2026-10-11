@@ -135,11 +135,33 @@ Requires Slicer 5.12 or newer. The `ngff-zarr[remote]` Python package, version
   and Slicer stays responsive. An NRRD keeps its voxel size, origin and
   orientation; oblique NRRDs are refused, because OME-Zarr 0.5 stores no
   rotation. Every level is the exact block mean of the full-resolution voxels.
-  Shard size is an option: the default, 128, writes every 128³ chunk as its own
-  file, which suits a local disk; larger shards mean fewer files (network
-  drives, synced folders, object storage) and more memory while converting.
-  The converter also runs on its own:
+  Shard size is an option, 384 by default (see below); 128 writes every 128³
+  chunk as its own file, which is simpler on a local disk. Larger shards mean
+  fewer files and more memory while converting. The converter also runs on its
+  own:
   `PythonSlicer OMEZarrConvert/OMEZarrConvertLib/to_omezarr.py <input> <out.ome.zarr> [--shard 384]`.
+
+### Why the default shard size is 384
+
+MorphoDepot's stores go to an Open Storage Network (OSN) allocation of 50 TB
+and at most 1.6 million files. The shard size decides which of the two runs
+out first. For an average volume of 12 GB at full resolution, stored with 4
+levels (13.7 GB in all), 50 TB holds about 3,650 volumes. The number of files
+per volume (cube-shaped estimate; real stores match it within a few percent):
+
+| Shard | Files per volume, 16-bit / 8-bit | Volumes before 1.6 M files |
+|---|---|---|
+| 128 (no shards) | 3,964 / 6,718 | about 400 / 240 |
+| 256 | 590 / 894 | about 2,700 / 1,800 |
+| **384** | **166 / 257** | **about 9,600 / 6,200** |
+| 512 | 79 / 166 | about 20,000 / 9,600 |
+
+384 is the smallest shard at which the storage, not the file limit, runs out
+first (3,600 volumes are about 600,000 to 925,000 files). The conversion reads
+one shard's depth of the input at a time, so the smallest such shard needs the
+least memory: Scan_0006 (1288 × 1332 × 1545, 16-bit) needs 1.18 GB at 128 and
+3.45 GB at 384. Streaming reads single chunks out of a shard by byte range, so
+the shard size does not change how much is downloaded.
 
 ## Still to do
 

@@ -26,6 +26,7 @@ from slicer.ScriptedLoadableModule import (
 
 REQUIREMENTS = ("zarr>=3", "tifffile", "imagecodecs")
 SHARD_MAX = 2048
+SHARD_DEFAULT = 384  # to_omezarr.DEFAULT_SHARD, which explains it (that module needs zarr, maybe not installed yet)
 
 
 class OMEZarrConvert(ScriptedLoadableModule):
@@ -110,7 +111,7 @@ class OMEZarrConvertLogic(ScriptedLoadableModuleLogic):
         return os.path.join(os.path.dirname(base), name)
 
     @classmethod
-    def arguments(cls, inputPath, outputPath, levels=0, voxelUm=None, shard=128):
+    def arguments(cls, inputPath, outputPath, levels=0, voxelUm=None, shard=SHARD_DEFAULT):
         args = [cls.scriptPath(), inputPath, outputPath, "--shard", str(shard), "--progress"]
         if levels:
             args += ["--levels", str(levels)]
@@ -128,7 +129,7 @@ class OMEZarrConvertLogic(ScriptedLoadableModuleLogic):
             return None
 
     @classmethod
-    def convertBlocking(cls, inputPath, outputPath, levels=0, voxelUm=None, shard=128, timeoutS=600):
+    def convertBlocking(cls, inputPath, outputPath, levels=0, voxelUm=None, shard=SHARD_DEFAULT, timeoutS=600):
         """Run the conversion process and wait for it (tests, scripts). Returns (exit code, output)."""
         process = qt.QProcess()
         process.setProcessChannelMode(qt.QProcess.MergedChannels)
@@ -200,13 +201,13 @@ class OMEZarrConvertWidget(ScriptedLoadableModuleWidget):
         self.shardSpinBox = qt.QSpinBox()
         self.shardSpinBox.setRange(128, SHARD_MAX)
         self.shardSpinBox.setSingleStep(128)
-        self.shardSpinBox.setValue(128)
+        self.shardSpinBox.setValue(SHARD_DEFAULT)
         self.shardSpinBox.setSuffix(" voxels")
         self.shardSpinBox.setToolTip(_(
-            "Voxels per side of a shard, a multiple of 128. At 128 every 128-voxel chunk is its own file, the simplest "
-            "choice on a local disk. Larger shards group the chunks into fewer, bigger files: use them for very large "
-            "volumes, network drives, synced folders or a store going to object storage. The conversion reads one "
-            "shard's depth of the input at a time, so larger shards need more memory."))
+            "Voxels per side of a shard, a multiple of 128. The default, 384, keeps the number of files within the "
+            "file limit of MorphoDepot's object storage. At 128 every 128-voxel chunk is its own file, which is "
+            "simpler on a local disk but makes about 20 times as many files. The conversion reads one shard's depth "
+            "of the input at a time, so larger shards need more memory."))
         form.addRow(_("Shard size:"), self.shardSpinBox)
 
         self.openCheckBox = qt.QCheckBox(_("Open the store when done"))

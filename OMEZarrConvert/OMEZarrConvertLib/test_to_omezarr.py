@@ -181,16 +181,16 @@ def test_slice_folder_and_store_rebuild():
         for i, image in enumerate(volume):
             tifffile.imwrite(os.path.join(folder, f"s{i:04d}.tif"), image)
         out = os.path.join(tmp, "slices.ome.zarr")
-        assert conv.run(folder, out, voxel_um=10.0, **QUIET)
+        assert conv.run(folder, out, voxel_um=10.0, shard=conv.CHUNK, **QUIET)
         group = zarr.open_group(out, mode="r")
         np.testing.assert_array_equal(group["scale0/slices"][:], volume)
         levels = len(group.attrs["ome"]["multiscales"][0]["datasets"])
         assert levels == conv.auto_levels(volume.shape) == 2
         check_levels(out, "slices", levels)
         again = os.path.join(tmp, "again.ome.zarr")
-        assert conv.run(out, again, levels=levels, shard=384, **QUIET)
+        assert conv.run(out, again, levels=levels, **QUIET)  # the default shard
         rebuilt = zarr.open_group(again, mode="r")
-        assert rebuilt["scale0/slices"].shards == (384,) * 3
+        assert rebuilt["scale0/slices"].shards == (conv.DEFAULT_SHARD,) * 3 == (384,) * 3
         np.testing.assert_array_equal(rebuilt["scale1/slices"][:], group["scale1/slices"][:])
 
 
